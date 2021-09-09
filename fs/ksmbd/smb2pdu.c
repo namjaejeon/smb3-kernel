@@ -5951,7 +5951,7 @@ static noinline int smb2_read_pipe(struct ksmbd_work *work)
 	rsp->Reserved = 0;
 	rsp->DataLength = cpu_to_le32(nbytes);
 	rsp->DataRemaining = 0;
-	rsp->Reserved2 = 0;
+	rsp->Flags = 0;
 	inc_rfc1001_len(work->response_buf, nbytes);
 	return 0;
 
@@ -6089,7 +6089,7 @@ int smb2_read(struct ksmbd_work *work)
 	rsp->Reserved = 0;
 	rsp->DataLength = cpu_to_le32(nbytes);
 	rsp->DataRemaining = cpu_to_le32(remain_bytes);
-	rsp->Reserved2 = 0;
+	rsp->Flags = 0;
 	inc_rfc1001_len(work->response_buf, 16);
 	work->resp_hdr_sz = get_rfc1002_len(work->response_buf) + 4;
 	work->aux_payload_sz = nbytes;
@@ -7940,8 +7940,8 @@ int smb2_oplock_break(struct ksmbd_work *work)
  */
 int smb2_notify(struct ksmbd_work *work)
 {
-	struct smb2_notify_req *req;
-	struct smb2_notify_rsp *rsp;
+	struct smb2_change_notify_req *req;
+	struct smb2_change_notify_rsp *rsp;
 
 	WORK_BUFFERS(work, req, rsp);
 
