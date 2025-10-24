@@ -2375,7 +2375,7 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 		seq_printf(sf, ",fmask=0%o", vol->fmask);
 		seq_printf(sf, ",dmask=0%o", vol->dmask);
 	}
-	seq_printf(sf, ",nls=%s", vol->nls_map->charset);
+	seq_printf(sf, ",iocharset=%s", vol->nls_map->charset);
 	if (NVolCaseSensitive(vol))
 		seq_puts(sf, ",case_sensitive");
 	if (NVolShowSystemFiles(vol))

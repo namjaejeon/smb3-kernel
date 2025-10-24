@@ -52,6 +52,7 @@ enum {
 	Opt_fmask,
 	Opt_errors,
 	Opt_nls,
+	Opt_charset,
 	Opt_show_sys_files,
 	Opt_case_sensitive,
 	Opt_disable_sparse,
@@ -66,6 +67,7 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_u32oct("dmask",			Opt_dmask),
 	fsparam_u32oct("fmask",			Opt_fmask),
 	fsparam_string("nls",			Opt_nls),
+	fsparam_string("iocharset",		Opt_charset),
 	fsparam_enum("errors",			Opt_errors, ntfs_param_enums),
 	fsparam_flag("show_sys_files",		Opt_show_sys_files),
 	fsparam_flag("case_sensitive",		Opt_case_sensitive),
@@ -106,6 +108,7 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		vol->on_errors = result.uint_32;
 		break;
 	case Opt_nls:
+	case Opt_charset:
 		if (nls_name && nls_name != param->string)
 			kfree(nls_name);
 		nls_name = param->string;
