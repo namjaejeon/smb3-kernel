@@ -2092,10 +2092,8 @@ struct index_entry *ntfs_index_next(struct index_entry *ie, struct ntfs_index_co
 
 		/* walk down if it has a subnode */
 		if (flags & INDEX_ENTRY_NODE) {
-			if (!ictx->ia_ni) {
+			if (!ictx->ia_ni)
 				ictx->ia_ni = ntfs_ia_open(ictx, ictx->idx_ni);
-				BUG_ON(!ictx->ia_ni);
-			}
 
 			next = ntfs_index_walk_down(next, ictx);
 		} else {

@@ -37,14 +37,14 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
 
-	BUG_ON(!vi);
 	ntfs_debug("Entering for i_ino 0x%lx, start_bit 0x%llx, count 0x%llx, value %u.%s",
 			vi->i_ino, (unsigned long long)start_bit,
 			(unsigned long long)cnt, (unsigned int)value,
 			is_rollback ? " (rollback)" : "");
-	BUG_ON(start_bit < 0);
-	BUG_ON(cnt < 0);
-	BUG_ON(value > 1);
+
+	if (start_bit < 0 || cnt < 0 || value > 1)
+		return -EINVAL;
+
 	/*
 	 * Calculate the indices for the pages containing the first and last
 	 * bits, i.e. @start_bit and @start_bit + @cnt - 1, respectively.
@@ -108,7 +108,8 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 
 	/* If we are not in the last page, deal with all subsequent pages. */
 	while (index < end_index) {
-		BUG_ON(cnt <= 0);
+		if (cnt <= 0)
+			goto rollback;
 
 		/* Update @index and get the next folio. */
 		flush_dcache_folio(folio);
@@ -143,7 +144,7 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 	if (cnt) {
 		u8 *byte;
 
-		BUG_ON(cnt > 7);
+		WARN_ON(cnt > 7);
 
 		bit = cnt;
 		byte = kaddr + len;

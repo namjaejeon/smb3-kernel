@@ -88,7 +88,7 @@ int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_sea
 	} else {
 		s64 allocated_size_vcn;
 
-		BUG_ON(IS_ERR(ctx->mrec));
+		WARN_ON(IS_ERR(ctx->mrec));
 		a = ctx->attr;
 		if (!a->non_resident) {
 			err = -EIO;
@@ -148,7 +148,7 @@ int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_sea
 				err = -EIO;
 			goto err_out;
 		}
-		BUG_ON(!ctx->attr->non_resident);
+		WARN_ON(!ctx->attr->non_resident);
 	}
 	a = ctx->attr;
 	/*
@@ -197,7 +197,7 @@ err_out:
 						ctx->base_ntfs_ino) {
 					unmap_extent_mft_record(ctx->ntfs_ino);
 					ctx->mrec = ctx->base_mrec;
-					BUG_ON(!ctx->mrec);
+					WARN_ON(!ctx->mrec);
 				}
 				/*
 				 * If the old mapped inode is not the base
@@ -344,12 +344,9 @@ s64 ntfs_attr_vcn_to_lcn_nolock(struct ntfs_inode *ni, const s64 vcn,
 	unsigned long flags;
 	bool is_retry = false;
 
-	BUG_ON(!ni);
 	ntfs_debug("Entering for i_ino 0x%lx, vcn 0x%llx, %s_locked.",
 			ni->mft_no, (unsigned long long)vcn,
 			write_locked ? "write" : "read");
-	BUG_ON(!NInoNonResident(ni));
-	BUG_ON(vcn < 0);
 	if (!ni->runlist.rl) {
 		read_lock_irqsave(&ni->size_lock, flags);
 		if (!ni->allocated_size) {
@@ -481,11 +478,8 @@ struct runlist_element *ntfs_attr_find_vcn_nolock(struct ntfs_inode *ni, const s
 	int err = 0;
 	bool is_retry = false;
 
-	BUG_ON(!ni);
 	ntfs_debug("Entering for i_ino 0x%lx, vcn 0x%llx, with%s ctx.",
 			ni->mft_no, (unsigned long long)vcn, ctx ? "" : "out");
-	BUG_ON(!NInoNonResident(ni));
-	BUG_ON(vcn < 0);
 	if (!ni->runlist.rl) {
 		read_lock_irqsave(&ni->size_lock, flags);
 		if (!ni->allocated_size) {
@@ -1267,7 +1261,6 @@ int ntfs_attr_lookup(const __le32 type, const __le16 *name,
 	struct ntfs_inode *base_ni;
 
 	ntfs_debug("Entering.");
-	BUG_ON(IS_ERR(ctx->mrec));
 	if (ctx->base_ntfs_ino)
 		base_ni = ctx->base_ntfs_ino;
 	else
@@ -1407,8 +1400,7 @@ static struct attr_def *ntfs_attr_find_in_attrdef(const struct ntfs_volume *vol,
 {
 	struct attr_def *ad;
 
-	BUG_ON(!vol->attrdef);
-	BUG_ON(!type);
+	WARN_ON(!type);
 	for (ad = vol->attrdef; (u8 *)ad - (u8 *)vol->attrdef <
 			vol->attrdef_size && ad->type; ++ad) {
 		/* We have not found it yet, carry on searching. */
@@ -1440,7 +1432,9 @@ int ntfs_attr_size_bounds_check(const struct ntfs_volume *vol, const __le32 type
 {
 	struct attr_def *ad;
 
-	BUG_ON(size < 0);
+	if (size < 0)
+		return -EINVAL;
+
 	/*
 	 * $ATTRIBUTE_LIST has a maximum size of 256kiB, but this is not
 	 * listed in $AttrDef.
@@ -1638,7 +1632,8 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 		return err;
 	}
 
-	BUG_ON(NInoEncrypted(ni));
+	if (NInoEncrypted(ni))
+		return -EIO;
 
 	if (!NInoAttr(ni))
 		base_ni = ni;
@@ -1745,7 +1740,7 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 	 * attribute value.
 	 */
 	attr_size = le32_to_cpu(a->data.resident.value_length);
-	BUG_ON(attr_size != data_size);
+	WARN_ON(attr_size != data_size);
 	if (folio && !folio_test_uptodate(folio)) {
 		kaddr = kmap_local_folio(folio, 0);
 		memcpy(kaddr, (u8 *)a +
@@ -4653,8 +4648,6 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 	int err = 0;
 	size_t new_rl_count;
 
-	BUG_ON(!NInoNonResident(ni));
-
 	err = ntfs_attr_map_whole_runlist(ni);
 	if (err)
 		return err;
@@ -4695,7 +4688,7 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 			goto out;
 		}
 	} else {
-		BUG_ON(lcn == LCN_RL_NOT_MAPPED);
+		WARN_ON(lcn == LCN_RL_NOT_MAPPED);
 		if (lcn == LCN_ENOENT)
 			err = -ENOENT;
 		else
@@ -4748,7 +4741,7 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 		goto out;
 	}
 
-	BUG_ON(rlc->vcn != vcn);
+	WARN_ON(rlc->vcn != vcn);
 	lcn = rlc->lcn;
 	clu_count = rlc->length;
 

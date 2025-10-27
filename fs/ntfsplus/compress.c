@@ -508,8 +508,10 @@ int ntfs_read_compressed_block(struct folio *folio)
 	 * Bad things happen if we get here for anything that is not an
 	 * unnamed $DATA attribute.
 	 */
-	BUG_ON(ni->type != AT_DATA);
-	BUG_ON(ni->name_len);
+	if (ni->type != AT_DATA || ni->name_len) {
+		unlock_page(page);
+		return -EIO;
+	}
 
 	pages = kmalloc_array(nr_pages, sizeof(struct page *), GFP_NOFS);
 	completed_pages = kmalloc_array(nr_pages + 1, sizeof(int), GFP_NOFS);
@@ -591,9 +593,6 @@ do_next_cb:
 
 
 	cb = ntfs_compression_buffer;
-
-	BUG_ON(!cb);
-
 	cb_pos = cb;
 	cb_end = cb + cb_size;
 

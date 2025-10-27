@@ -70,7 +70,6 @@ static inline int write_mft_record(struct ntfs_inode *ni, struct mft_record *m, 
 	struct folio *folio = ni->folio;
 	int err;
 
-	BUG_ON(!folio);
 	folio_lock(folio);
 	err = write_mft_record_nolock(ni, m, sync);
 	folio_unlock(folio);

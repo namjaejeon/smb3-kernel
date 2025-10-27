@@ -194,17 +194,14 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 	ntfs_debug("Entering for start_vcn 0x%llx, count 0x%llx, start_lcn 0x%llx, zone %s_ZONE.",
 			start_vcn, count, start_lcn,
 			zone == MFT_ZONE ? "MFT" : "DATA");
-	BUG_ON(!vol);
+
 	lcnbmp_vi = vol->lcnbmp_ino;
-	BUG_ON(!lcnbmp_vi);
-	BUG_ON(start_vcn < 0);
-	BUG_ON(count < 0);
-	BUG_ON(start_lcn < LCN_HOLE);
-	BUG_ON(zone < FIRST_ZONE);
-	BUG_ON(zone > LAST_ZONE);
+	if (start_vcn < 0 || start_lcn < LCN_HOLE ||
+	    zone < FIRST_ZONE || zone > LAST_ZONE)
+		return ERR_PTR(-EINVAL);
 
 	/* Return NULL if @count is zero. */
-	if (!count)
+	if (count < 0 || !count)
 		return ERR_PTR(-EINVAL);
 
 	memalloc_flags = memalloc_nofs_save();
@@ -493,7 +490,7 @@ done:
 							vol->data2_zone_pos);
 					break;
 				default:
-					BUG();
+					WARN_ON(1);
 				}
 				ntfs_debug("Finished.  Going to out.");
 				goto out;
@@ -529,7 +526,7 @@ zone_pass_done:	/* Finished with the current zone pass. */
 				zone_start = 0;
 				break;
 			default:
-				BUG();
+				WARN_ON(1);
 			}
 			/* Sanity check. */
 			if (zone_end < zone_start)
@@ -641,7 +638,7 @@ switch_to_data1_zone:		search_zone = 2;
 				/* Switch from data2 zone to data1 zone. */
 				goto switch_to_data1_zone;
 			default:
-				BUG();
+				WARN_ON(1);
 			}
 			ntfs_debug("After zone switch, search_zone %i, pass %i, bmp_initial_pos 0x%llx, zone_start 0x%llx, zone_end 0x%llx.",
 					search_zone, pass,
@@ -823,15 +820,13 @@ s64 __ntfs_cluster_free(struct ntfs_inode *ni, const s64 start_vcn, s64 count,
 	int err;
 	unsigned int memalloc_flags;
 
-	BUG_ON(!ni);
 	ntfs_debug("Entering for i_ino 0x%lx, start_vcn 0x%llx, count 0x%llx.%s",
 			ni->mft_no, start_vcn, count,
 			is_rollback ? " (rollback)" : "");
 	vol = ni->vol;
 	lcnbmp_vi = vol->lcnbmp_ino;
-	BUG_ON(!lcnbmp_vi);
-	BUG_ON(start_vcn < 0);
-	BUG_ON(count < -1);
+	if (start_vcn < 0 || count < -1)
+		return -EINVAL;
 
 	if (!NVolFreeClusterKnown(vol))
 		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
@@ -959,7 +954,7 @@ s64 __ntfs_cluster_free(struct ntfs_inode *ni, const s64 start_vcn, s64 count,
 		memalloc_nofs_restore(memalloc_flags);
 	}
 
-	BUG_ON(count > 0);
+	WARN_ON(count > 0);
 
 	/* We are done.  Return the number of actually freed clusters. */
 	ntfs_debug("Done.");

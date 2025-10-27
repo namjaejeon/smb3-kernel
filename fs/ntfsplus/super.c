@@ -359,16 +359,18 @@ static int ntfs_write_volume_flags(struct ntfs_volume *vol, const __le16 flags)
 	mutex_lock(&ni->mrec_lock);
 	if (vol->vol_flags == flags)
 		goto done;
-	BUG_ON(!ni);
+
 	ctx = ntfs_attr_get_search_ctx(ni, NULL);
 	if (!ctx) {
 		err = -ENOMEM;
 		goto put_unm_err_out;
 	}
+
 	err = ntfs_attr_lookup(AT_VOLUME_INFORMATION, NULL, 0, 0, 0, NULL, 0,
 			ctx);
 	if (err)
 		goto put_unm_err_out;
+
 	vi = (struct volume_information *)((u8 *)ctx->attr +
 			le16_to_cpu(ctx->attr->data.resident.value_offset));
 	vol->vol_flags = vi->flags = flags;
@@ -882,8 +884,6 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
 	ntfs_debug("Entering.");
 	/* Compare contents of $MFT and $MFTMirr. */
 	mrecs_per_page = PAGE_SIZE / vol->mft_record_size;
-	BUG_ON(!mrecs_per_page);
-	BUG_ON(!vol->mftmirr_size);
 	index = i = 0;
 	do {
 		u32 bytes;
@@ -2255,7 +2255,6 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto err_out_now;
 	}
 
-	BUG_ON(blocksize != sb->s_blocksize);
 	ntfs_debug("Set device block size to %i bytes (block size bits %i).",
 			blocksize, sb->s_blocksize_bits);
 	/* Determine the size of the device in units of block_size bytes. */
@@ -2294,7 +2293,6 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 					   vol->sector_size);
 			goto err_out_now;
 		}
-		BUG_ON(blocksize != sb->s_blocksize);
 		vol->nr_blocks = bdev_nr_bytes(sb->s_bdev) >>
 				sb->s_blocksize_bits;
 		ntfs_debug("Changed device block size to %i bytes (block size bits %i) to match volume sector size.",

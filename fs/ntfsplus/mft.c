@@ -99,7 +99,7 @@ static inline struct mft_record *map_mft_record_folio(struct ntfs_inode *ni)
 	unsigned long index, end_index;
 	unsigned int ofs;
 
-	BUG_ON(ni->folio);
+	WARN_ON(ni->folio);
 	/*
 	 * The index into the page cache and the offset within the page cache
 	 * page of the wanted mft record.
@@ -256,7 +256,7 @@ void unmap_mft_record(struct ntfs_inode *ni)
 	folio = ni->folio;
 	if (atomic_dec_return(&ni->count) > 1)
 		return;
-	BUG_ON(!folio);
+	WARN_ON(!folio);
 }
 
 /**
@@ -369,7 +369,7 @@ map_err_out:
 			goto unm_err_out;
 		}
 		if (base_ni->nr_extents) {
-			BUG_ON(!base_ni->ext.extent_ntfs_inos);
+			WARN_ON(!base_ni->ext.extent_ntfs_inos);
 			memcpy(tmp, base_ni->ext.extent_ntfs_inos, new_size -
 					4 * sizeof(struct ntfs_inode *));
 			ntfs_free(base_ni->ext.extent_ntfs_inos);
@@ -423,7 +423,7 @@ void __mark_mft_record_dirty(struct ntfs_inode *ni)
 	struct ntfs_inode *base_ni;
 
 	ntfs_debug("Entering for inode 0x%lx.", ni->mft_no);
-	BUG_ON(NInoAttr(ni));
+	WARN_ON(NInoAttr(ni));
 	/* Determine the base vfs inode and mark it dirty, too. */
 	if (likely(ni->nr_extents >= 0))
 		base_ni = ni;
@@ -472,7 +472,6 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const unsigned long mft_no,
 	}
 
 	folio_lock(folio);
-	BUG_ON(!folio_test_uptodate(folio));
 	folio_clear_uptodate(folio);
 	/* Offset of the mft mirror record inside the page. */
 	folio_ofs = (mft_no << vol->mft_record_size_bits) & ~PAGE_MASK;
@@ -562,8 +561,8 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 
 	ntfs_debug("Entering for inode 0x%lx.", ni->mft_no);
 
-	BUG_ON(NInoAttr(ni));
-	BUG_ON(!folio_test_locked(folio));
+	WARN_ON(NInoAttr(ni));
+	WARN_ON(!folio_test_locked(folio));
 
 	/*
 	 * If the struct ntfs_inode is clean no need to do anything.  If it is dirty,
@@ -585,7 +584,6 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 
 		down_read(&NTFS_I(vol->mft_ino)->runlist.lock);
 		rl = NTFS_I(vol->mft_ino)->runlist.rl;
-		BUG_ON(!rl);
 
 		/* Seek to element containing target vcn. */
 		while (rl->length && rl[1].vcn <= vcn)
@@ -805,7 +803,6 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 	/*
 	 * Normally we do not return a locked inode so set @locked_ni to NULL.
 	 */
-	BUG_ON(!locked_ni);
 	*locked_ni = NULL;
 	/*
 	 * Check if the inode corresponding to this mft record is in the VFS
@@ -821,7 +818,7 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 	if (!mft_no) {
 		/* Balance the below iput(). */
 		vi = igrab(mft_vi);
-		BUG_ON(vi != mft_vi);
+		WARN_ON(vi != mft_vi);
 	} else {
 		/*
 		 * Have to use find_inode_nowait() since ilookup5_nowait()
@@ -889,7 +886,7 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 	if (!na.mft_no) {
 		/* Balance the below iput(). */
 		vi = igrab(mft_vi);
-		BUG_ON(vi != mft_vi);
+		WARN_ON(vi != mft_vi);
 	} else {
 		vi = find_inode_nowait(sb, mft_no, ntfs_test_inode_wb, &na);
 		if (na.state == NI_BeingDeleted || na.state == NI_BeingCreated)
@@ -1279,8 +1276,8 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 		if (ll >= rl2->vcn)
 			break;
 	}
-	BUG_ON(ll < rl2->vcn);
-	BUG_ON(ll >= rl2->vcn + rl2->length);
+	WARN_ON(ll < rl2->vcn);
+	WARN_ON(ll >= rl2->vcn + rl2->length);
 	/* Get the size for the new mapping pairs array for this extent. */
 	mp_size = ntfs_get_size_for_mapping_pairs(vol, rl2, ll, -1, -1);
 	if (unlikely(mp_size <= 0)) {
@@ -1717,8 +1714,8 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 		if (ll >= rl2->vcn)
 			break;
 	}
-	BUG_ON(ll < rl2->vcn);
-	BUG_ON(ll >= rl2->vcn + rl2->length);
+	WARN_ON(ll < rl2->vcn);
+	WARN_ON(ll >= rl2->vcn + rl2->length);
 	/* Get the size for the new mapping pairs array for this extent. */
 	mp_size = ntfs_get_size_for_mapping_pairs(vol, rl2, ll, -1, -1);
 	if (unlikely(mp_size <= 0)) {
@@ -1982,7 +1979,6 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 		return PTR_ERR(folio);
 	}
 	folio_lock(folio);
-	BUG_ON(!folio_test_uptodate(folio));
 	folio_clear_uptodate(folio);
 	m = (struct mft_record *)((u8 *)kmap_local_folio(folio, 0) + ofs);
 	err = ntfs_mft_record_layout(vol, mft_no, m);
@@ -2120,17 +2116,15 @@ int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
 	if (base_ni && *ni)
 		return -EINVAL;
 
-	if (base_ni) {
+	/* @mode and @base_ni are mutually exclusive. */
+	if (mode && base_ni)
+		return -EINVAL;
+
+	if (base_ni)
 		ntfs_debug("Entering (allocating an extent mft record for base mft record 0x%llx).",
 				(long long)base_ni->mft_no);
-		/* @mode and @base_ni are mutually exclusive. */
-		BUG_ON(mode);
-	} else
+	else
 		ntfs_debug("Entering (allocating a base mft record).");
-	if (mode) {
-		/* @mode and @base_ni are mutually exclusive. */
-		BUG_ON(base_ni);
-	}
 
 	memalloc_flags = memalloc_nofs_save();
 
@@ -2345,8 +2339,8 @@ have_alloc_rec:
 	ntfs_debug("Status of mft data after mft record initialization: allocated_size 0x%llx, data_size 0x%llx, initialized_size 0x%llx.",
 			mft_ni->allocated_size,	i_size_read(vol->mft_ino),
 			mft_ni->initialized_size);
-	BUG_ON(i_size_read(vol->mft_ino) > mft_ni->allocated_size);
-	BUG_ON(mft_ni->initialized_size > i_size_read(vol->mft_ino));
+	WARN_ON(i_size_read(vol->mft_ino) > mft_ni->allocated_size);
+	WARN_ON(mft_ni->initialized_size > i_size_read(vol->mft_ino));
 	read_unlock_irqrestore(&mft_ni->size_lock, flags);
 mft_rec_already_initialized:
 	/*
@@ -2374,7 +2368,6 @@ mft_rec_already_initialized:
 		goto undo_mftbmp_alloc;
 	}
 	folio_lock(folio);
-	BUG_ON(!folio_test_uptodate(folio));
 	folio_clear_uptodate(folio);
 	m = (struct mft_record *)((u8 *)kmap_local_folio(folio, 0) + ofs);
 	/* If we just formatted the mft record no need to do it again. */

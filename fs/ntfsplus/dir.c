@@ -82,8 +82,6 @@ u64 ntfs_lookup_inode_by_name(struct ntfs_inode *dir_ni, const __le16 *uname,
 	u8 *kaddr = NULL;
 	struct ntfs_name *name = NULL;
 
-	BUG_ON(!S_ISDIR(VFS_I(dir_ni)->i_mode));
-	BUG_ON(NInoAttr(dir_ni));
 	/* Get hold of the mft record for the directory. */
 	m = map_mft_record(dir_ni);
 	if (IS_ERR(m)) {
@@ -706,7 +704,7 @@ static void ntfs_insert_rb(struct ntfs_index_ra *nir, struct rb_root *root)
 		else {
 			pr_err("nir start index : %ld, count : %d, cnir start_index : %ld, count : %d\n",
 				nir->start_index, nir->count, cnir->start_index, cnir->count);
-			BUG_ON(1);
+			return;
 		}
 	}
 
@@ -1178,7 +1176,6 @@ static int ntfs_dir_fsync(struct file *filp, loff_t start, loff_t end,
 		return err;
 	inode_lock(vi);
 
-	BUG_ON(!S_ISDIR(vi->i_mode));
 	/* If the bitmap attribute inode is in memory sync it, too. */
 	na.mft_no = vi->i_ino;
 	na.type = AT_BITMAP;

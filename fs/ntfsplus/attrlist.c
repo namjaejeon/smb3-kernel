@@ -57,8 +57,6 @@ int ntfs_attrlist_update(struct ntfs_inode *base_ni)
 	struct ntfs_inode *attr_ni;
 	int err;
 
-	BUG_ON(!NInoAttrList(base_ni));
-
 	attr_vi = ntfs_attr_iget(VFS_I(base_ni), AT_ATTRIBUTE_LIST, AT_UNNAMED, 0);
 	if (IS_ERR(attr_vi)) {
 		err = PTR_ERR(attr_vi);

@@ -111,7 +111,6 @@ static inline struct runlist_element *ntfs_rl_realloc_nofail(struct runlist_elem
 		return rl;
 
 	new_rl = ntfs_malloc_nofs_nofail(new_size);
-	BUG_ON(!new_rl);
 
 	if (likely(rl != NULL)) {
 		if (unlikely(old_size > new_size))
@@ -138,9 +137,6 @@ static inline struct runlist_element *ntfs_rl_realloc_nofail(struct runlist_elem
 static inline bool ntfs_are_rl_mergeable(struct runlist_element *dst,
 		struct runlist_element *src)
 {
-	BUG_ON(!dst);
-	BUG_ON(!src);
-
 	/* We can merge unmapped regions even if they are misaligned. */
 	if ((dst->lcn == LCN_RL_NOT_MAPPED) && (src->lcn == LCN_RL_NOT_MAPPED))
 		return true;
@@ -197,9 +193,6 @@ static inline struct runlist_element *ntfs_rl_append(struct runlist_element *dst
 {
 	bool right = false;	/* Right end of @src needs merging. */
 	int marker;		/* End of the inserted runs. */
-
-	BUG_ON(!dst);
-	BUG_ON(!src);
 
 	/* First, check if the right hand end needs merging. */
 	if ((loc + 1) < dsize)
@@ -258,9 +251,6 @@ static inline struct runlist_element *ntfs_rl_insert(struct runlist_element *dst
 	bool left = false;	/* Left end of @src needs merging. */
 	bool disc = false;	/* Discontinuity between @dst and @src. */
 	int marker;		/* End of the inserted runs. */
-
-	BUG_ON(!dst);
-	BUG_ON(!src);
 
 	/*
 	 * disc => Discontinuity between the end of @dst and the start of @src.
@@ -351,9 +341,6 @@ static inline struct runlist_element *ntfs_rl_replace(struct runlist_element *ds
 	int tail;		/* Start of tail of @dst. */
 	int marker;		/* End of the inserted runs. */
 
-	BUG_ON(!dst);
-	BUG_ON(!src);
-
 	/* First, see if the left and right ends need merging. */
 	if ((loc + 1) < dsize)
 		right = ntfs_are_rl_mergeable(src + ssize - 1, dst + loc + 1);
@@ -427,9 +414,6 @@ static inline struct runlist_element *ntfs_rl_split(struct runlist_element *dst,
 		struct runlist_element *src, int ssize, int loc,
 		size_t *new_size)
 {
-	BUG_ON(!dst);
-	BUG_ON(!src);
-
 	/* Space required: @dst size + @src size + one new hole. */
 	dst = ntfs_rl_realloc(dst, dsize, dsize + ssize + 1);
 	if (IS_ERR(dst))
@@ -542,7 +526,7 @@ struct runlist_element *ntfs_runlists_merge(struct runlist *d_runlist,
 		si++;
 
 	/* Can't have an entirely unmapped source runlist. */
-	BUG_ON(!srl[si].length);
+	WARN_ON(!srl[si].length);
 
 	/* Record the starting points. */
 	sstart = si;
@@ -943,7 +927,6 @@ s64 ntfs_rl_vcn_to_lcn(const struct runlist_element *rl, const s64 vcn)
 {
 	int i;
 
-	BUG_ON(vcn < 0);
 	/*
 	 * If rl is NULL, assume that we have found an unmapped runlist. The
 	 * caller can then attempt to map it and fail appropriately if
@@ -988,7 +971,6 @@ s64 ntfs_rl_vcn_to_lcn(const struct runlist_element *rl, const s64 vcn)
  */
 struct runlist_element *ntfs_rl_find_vcn_nolock(struct runlist_element *rl, const s64 vcn)
 {
-	BUG_ON(vcn < 0);
 	if (unlikely(!rl || vcn < rl[0].vcn))
 		return NULL;
 	while (likely(rl->length)) {
@@ -1061,12 +1043,15 @@ int ntfs_get_size_for_mapping_pairs(const struct ntfs_volume *vol,
 	int rls;
 	bool the_end = false;
 
-	BUG_ON(first_vcn < 0);
-	BUG_ON(last_vcn < -1);
-	BUG_ON(last_vcn >= 0 && first_vcn > last_vcn);
+	if (first_vcn < 0 || last_vcn < -1)
+		return -EINVAL;
+
+	if (last_vcn >= 0 && first_vcn > last_vcn)
+		return -EINVAL;
+
 	if (!rl) {
-		BUG_ON(first_vcn);
-		BUG_ON(last_vcn > 0);
+		WARN_ON(first_vcn);
+		WARN_ON(last_vcn > 0);
 		return 1;
 	}
 	if (max_mp_size <= 0)
@@ -1247,13 +1232,13 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 	s8 len_len, lcn_len;
 	unsigned int de_cnt = 0;
 
-	BUG_ON(first_vcn < 0);
-	BUG_ON(last_vcn < -1);
-	BUG_ON(last_vcn >= 0 && first_vcn > last_vcn);
-	BUG_ON(dst_len < 1);
+	if (first_vcn < 0 || last_vcn < -1 || dst_len < 1)
+		return -EINVAL;
+	if (last_vcn >= 0 && first_vcn > last_vcn)
+		return -EINVAL;
+
 	if (!rl) {
-		BUG_ON(first_vcn);
-		BUG_ON(last_vcn > 0);
+		WARN_ON(first_vcn || last_vcn > 0);
 		if (stop_vcn)
 			*stop_vcn = 0;
 		/* Terminator byte. */
@@ -1421,11 +1406,14 @@ int ntfs_rl_truncate_nolock(const struct ntfs_volume *vol, struct runlist *const
 	int old_size;
 
 	ntfs_debug("Entering for new_length 0x%llx.", (long long)new_length);
-	BUG_ON(!runlist);
-	BUG_ON(new_length < 0);
-	rl = runlist->rl;
 
-	BUG_ON(new_length < rl->vcn);
+	if (!runlist || new_length < 0)
+		return -EINVAL;
+
+	rl = runlist->rl;
+	if (new_length < rl->vcn)
+		return -EINVAL;
+
 	/* Find @new_length in the runlist. */
 	while (likely(rl->length && new_length >= rl[1].vcn))
 		rl++;
@@ -1642,7 +1630,7 @@ merge_src_rle:
 		dst_rle = &dst_rl[new_1st_cnt - 1];
 		src_rle = &src_rl[0];
 		if (new_1st_cnt > 0 && ntfs_rle_lcn_contiguous(dst_rle, src_rle)) {
-			BUG_ON(dst_rle->vcn + dst_rle->length != src_rle->vcn);
+			WARN_ON(dst_rle->vcn + dst_rle->length != src_rle->vcn);
 			dst_rle->length += src_rle->length;
 			src_rl++;
 			src_cnt--;

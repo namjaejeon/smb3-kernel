@@ -206,12 +206,10 @@ static struct ctl_table_header *sysctls_root_table;
 int ntfs_sysctl(int add)
 {
 	if (add) {
-		BUG_ON(sysctls_root_table);
 		sysctls_root_table = register_sysctl("fs", ntfs_sysctls);
 		if (!sysctls_root_table)
 			return -ENOMEM;
 	} else {
-		BUG_ON(!sysctls_root_table);
 		unregister_sysctl_table(sysctls_root_table);
 		sysctls_root_table = NULL;
 	}

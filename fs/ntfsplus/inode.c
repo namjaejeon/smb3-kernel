@@ -103,11 +103,8 @@ static int ntfs_init_locked_inode(struct inode *vi, void *data)
 	atomic_set(&ni->count, 1);
 
 	/* If initializing a normal inode, we are done. */
-	if (likely(na->type == AT_UNUSED)) {
-		BUG_ON(na->name);
-		BUG_ON(na->name_len);
+	if (likely(na->type == AT_UNUSED))
 		return 0;
-	}
 
 	/* It is a fake inode. */
 	NInoSetAttr(ni);
@@ -122,7 +119,6 @@ static int ntfs_init_locked_inode(struct inode *vi, void *data)
 	if (na->name_len && na->name != I30) {
 		unsigned int i;
 
-		BUG_ON(!na->name);
 		i = na->name_len * sizeof(__le16);
 		ni->name = kmalloc(i + sizeof(__le16), GFP_ATOMIC);
 		if (!ni->name)
@@ -219,7 +215,7 @@ struct inode *ntfs_attr_iget(struct inode *base_vi, __le32 type,
 	struct ntfs_attr na;
 
 	/* Make sure no one calls ntfs_attr_iget() for indices. */
-	BUG_ON(type == AT_INDEX_ALLOCATION);
+	WARN_ON(type == AT_INDEX_ALLOCATION);
 
 	na.mft_no = base_vi->i_ino;
 	na.type = type;
@@ -334,7 +330,7 @@ static int ntfs_non_resident_dealloc_clusters(struct ntfs_inode *ni)
 	actx = ntfs_attr_get_search_ctx(ni, NULL);
 	if (!actx)
 		return -ENOMEM;
-	BUG_ON(actx->mrec->link_count != 0);
+	WARN_ON(actx->mrec->link_count != 0);
 
 	/**
 	 * ntfs_truncate_vfs cannot be called in evict() context due
@@ -432,7 +428,7 @@ static void ntfs_destroy_extent_inode(struct ntfs_inode *ni)
 	ntfs_debug("Entering.");
 
 	if (!atomic_dec_and_test(&ni->count))
-		BUG();
+		WARN_ON(1);
 	if (ni->folio)
 		ntfs_unmap_folio(ni->folio, NULL);
 	kfree(ni->mrec);
@@ -2236,8 +2232,7 @@ static void __ntfs_clear_inode(struct ntfs_inode *ni)
 	if (ni->name_len && ni->name != I30 &&
 	    ni->name != reparse_index_name &&
 	    ni->name != R) {
-		/* Catch bugs... */
-		BUG_ON(!ni->name);
+		WARN_ON(!ni->name);
 		kfree(ni->name);
 	}
 }
@@ -2246,8 +2241,8 @@ void ntfs_clear_extent_inode(struct ntfs_inode *ni)
 {
 	ntfs_debug("Entering for inode 0x%lx.", ni->mft_no);
 
-	BUG_ON(NInoAttr(ni));
-	BUG_ON(ni->nr_extents != -1);
+	WARN_ON(NInoAttr(ni));
+	WARN_ON(ni->nr_extents != -1);
 
 	__ntfs_clear_inode(ni);
 	ntfs_destroy_extent_inode(ni);
@@ -2301,7 +2296,7 @@ void ntfs_evict_big_inode(struct inode *vi)
 	if (!vi->i_nlink) {
 		if (!NInoAttr(ni)) {
 			/* Never called with extent inodes */
-			BUG_ON(ni->nr_extents == -1);
+			WARN_ON(ni->nr_extents == -1);
 			ntfs_delete_base_inode(ni);
 		}
 		goto release;
@@ -2345,7 +2340,7 @@ release:
 	}
 
 	if (!atomic_dec_and_test(&ni->count))
-		BUG();
+		WARN_ON(1);
 	if (ni->folio)
 		ntfs_unmap_folio(ni->folio, NULL);
 	kfree(ni->mrec);
@@ -2716,7 +2711,6 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 	}
 
 	if (NInoNonResident(ni) && NInoRunlistDirty(ni)) {
-		BUG_ON(!NInoFullyMapped(ni));
 		down_write(&ni->runlist.lock);
 		err = ntfs_attr_update_mapping_pairs(ni, 0);
 		if (!err)
@@ -3395,8 +3389,7 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 	u32 attr_len, total = 0, offset, index;
 	int err = 0;
 
-	BUG_ON(!ni);
-	BUG_ON(!NInoAttr(ni));
+	WARN_ON(!NInoAttr(ni));
 	if (!count)
 		return 0;
 
@@ -3521,7 +3514,7 @@ static s64 __ntfs_inode_resident_attr_pwrite(struct inode *vi,
 	u8 *addr;
 	int err = 0;
 
-	BUG_ON(NInoNonResident(ni));
+	WARN_ON(NInoNonResident(ni));
 	if (pos + count > PAGE_SIZE) {
 		ntfs_error(vi->i_sb, "Out of write into resident attr %#x", ni->type);
 		return -EINVAL;
@@ -3570,7 +3563,7 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 	size_t attr_len;
 	s64 ret = 0, written = 0;
 
-	BUG_ON(!NInoNonResident(ni));
+	WARN_ON(!NInoNonResident(ni));
 
 	index = pos >> PAGE_SHIFT;
 	while (count) {
@@ -3673,7 +3666,7 @@ s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf, bool s
 	struct ntfs_attr_search_ctx *ctx;
 	s64 ret;
 
-	BUG_ON(!NInoAttr(ni));
+	WARN_ON(!NInoAttr(ni));
 
 	ctx = ntfs_attr_get_search_ctx(ni->ext.base_ntfs_ino, NULL);
 	if (!ctx) {

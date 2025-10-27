@@ -163,8 +163,6 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 	if (err)
 		return err;
 
-	BUG_ON(S_ISDIR(vi->i_mode));
-
 	if (!datasync || !NInoNonResident(NTFS_I(vi)))
 		ret = __ntfs_write_inode(vi, 1);
 	write_inode_now(vi, !datasync);
@@ -414,7 +412,6 @@ static loff_t ntfs_file_llseek(struct file *file, loff_t offset, int whence)
 		rl = ni->runlist.rl;
 		i = 0;
 
-		BUG_ON(rl && rl[0].vcn > vcn);
 #ifdef DEBUG
 		ntfs_debug("init:");
 		ntfs_debug_dump_runlist(rl);
@@ -457,7 +454,7 @@ static loff_t ntfs_file_llseek(struct file *file, loff_t offset, int whence)
 		}
 		up_read(&ni->runlist.lock);
 		inode_unlock_shared(vi);
-		BUG();
+		return -EIO;
 found:
 		up_read(&ni->runlist.lock);
 found_no_runlist_lock:

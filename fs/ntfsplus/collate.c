@@ -40,8 +40,10 @@ static int ntfs_collate_ntofs_ulong(struct ntfs_volume *vol,
 	u32 d1, d2;
 
 	ntfs_debug("Entering.");
-	BUG_ON(data1_len != data2_len);
-	BUG_ON(data1_len != 4);
+	
+	if (data1_len != data2_len || data1_len != 4)
+		return -EINVAL;
+
 	d1 = le32_to_cpup(data1);
 	d2 = le32_to_cpup(data2);
 	if (d1 < d2)
@@ -156,18 +158,21 @@ int ntfs_collate(struct ntfs_volume *vol, __le32 cr,
 
 	ntfs_debug("Entering.");
 
-	BUG_ON(cr != COLLATION_BINARY && cr != COLLATION_NTOFS_ULONG &&
-	       cr != COLLATION_FILE_NAME && cr != COLLATION_NTOFS_ULONGS);
+	if (cr != COLLATION_BINARY && cr != COLLATION_NTOFS_ULONG &&
+	    cr != COLLATION_FILE_NAME && cr != COLLATION_NTOFS_ULONGS)
+		return -EINVAL;
+
 	i = le32_to_cpu(cr);
-	BUG_ON(i < 0);
+	if (i < 0)
+		return -1;
 	if (i <= 0x02)
 		return ntfs_do_collate0x0[i](vol, data1, data1_len,
 				data2, data2_len);
-	BUG_ON(i < 0x10);
+	if (i < 0x10)
+		return -1;
 	i -= 0x10;
 	if (likely(i <= 3))
 		return ntfs_do_collate0x1[i](vol, data1, data1_len,
 				data2, data2_len);
-	BUG();
 	return 0;
 }

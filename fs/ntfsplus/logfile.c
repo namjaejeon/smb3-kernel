@@ -368,7 +368,6 @@ static int ntfs_check_and_load_restart_page(struct inode *vi,
 		have_read = size;
 		to_read = le32_to_cpu(rp->system_page_size) - size;
 		idx = (pos + size) >> PAGE_SHIFT;
-		BUG_ON((pos + size) & ~PAGE_MASK);
 		do {
 			folio = ntfs_read_mapping_folio(vi->i_mapping, idx);
 			if (IS_ERR(folio)) {
@@ -591,7 +590,6 @@ is_empty:
 		return true;
 	}
 	if (!rstr1_ph) {
-		BUG_ON(rstr2_ph);
 		ntfs_error(vol->sb,
 			"Did not find any restart pages in LogFile and it was not empty.");
 		return false;
@@ -679,7 +677,6 @@ map_vcn:
 			goto err;
 		}
 		rl = log_ni->runlist.rl;
-		BUG_ON(!rl || vcn < rl->vcn || !rl->length);
 	}
 	/* Seek to the runlist element containing @vcn. */
 	while (rl->length && vcn >= rl[1].vcn)
