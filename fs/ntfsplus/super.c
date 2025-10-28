@@ -58,6 +58,7 @@ enum {
 	Opt_disable_sparse,
 	Opt_mft_zone_multiplier,
 	Opt_preallocated_size,
+	Opt_sys_immutable,
 };
 
 static const struct fs_parameter_spec ntfs_parameters[] = {
@@ -74,6 +75,7 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_flag("disable_sparse",		Opt_disable_sparse),
 	fsparam_s32("mft_zone_multiplier",	Opt_mft_zone_multiplier),
 	fsparam_u64("preallocated_size",	Opt_preallocated_size),
+	fsparam_flag("sys_immutable",		Opt_sys_immutable),
 	{}
 };
 
@@ -142,6 +144,12 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_preallocated_size:
 		vol->preallocated_size = (loff_t)result.uint_64;
+		break;
+	case Opt_sys_immutable:
+		if (result.boolean)
+			NVolSetSysImmutable(vol);
+		else
+			NVolClearSysImmutable(vol);
 		break;
 	default:
 		return -EINVAL;
