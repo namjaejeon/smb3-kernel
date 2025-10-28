@@ -149,6 +149,7 @@ enum {
 	NV_Compression,
 	NV_FreeClusterKnown,
 	NV_Shutdown,
+	NV_SysImmutable,	/* 1: Protect system files from deletion. */
 };
 
 /*
@@ -180,6 +181,7 @@ DEFINE_NVOL_BIT_OPS(ReadOnly)
 DEFINE_NVOL_BIT_OPS(Compression)
 DEFINE_NVOL_BIT_OPS(FreeClusterKnown)
 DEFINE_NVOL_BIT_OPS(Shutdown)
+DEFINE_NVOL_BIT_OPS(SysImmutable)
 
 static inline void ntfs_inc_free_clusters(struct ntfs_volume *vol, s64 nr)
 {

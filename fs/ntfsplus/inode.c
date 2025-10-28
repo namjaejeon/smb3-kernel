@@ -1191,6 +1191,11 @@ no_data_attr_special_case:
 		/* Setup the operations for this inode. */
 		ntfs_set_vfs_operations(vi, vi->i_mode, dev);
 	}
+
+	if (NVolSysImmutable(vol) && (ni->flags & FILE_ATTR_SYSTEM) &&
+	    !S_ISFIFO(vi->i_mode) && !S_ISSOCK(vi->i_mode) && !S_ISLNK(vi->i_mode))
+		vi->i_flags |= S_IMMUTABLE;
+
 	/*
 	 * The number of 512-byte blocks used on disk (for stat). This is in so
 	 * far inaccurate as it doesn't account for any named streams or other
@@ -2382,6 +2387,8 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 			seq_printf(sf, ",errors=%s", on_errors_arr[i].str);
 	}
 	seq_printf(sf, ",mft_zone_multiplier=%i", vol->mft_zone_multiplier);
+	if (NVolSysImmutable(vol))
+		seq_puts(sf, ",sys_immutable");
 	return 0;
 }
 
