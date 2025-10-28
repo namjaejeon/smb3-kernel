@@ -1115,6 +1115,35 @@ static int ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 	return -ENOSPC;
 }
 
+static int ntfs_mft_attr_extend(struct ntfs_inode *ni)
+{
+	int ret = 0;
+	struct ntfs_inode *base_ni;
+
+	if (NInoAttr(ni))
+		base_ni = ni->ext.base_ntfs_ino;
+	else
+		base_ni = ni;
+
+	if (!NInoAttrList(base_ni)) {
+		ret = ntfs_inode_add_attrlist(base_ni);
+		if (ret) {
+			pr_err("Can not add attrlist\n");
+			goto out;
+		} else {
+			ret = -EAGAIN;
+			goto out;
+		}
+	}
+
+	ret = ntfs_attr_update_mapping_pairs(ni, 0);
+	if (ret)
+		pr_err("MP update failed\n");
+
+out:
+	return ret;
+}
+
 /**
  * ntfs_mft_bitmap_extend_allocation_nolock - extend mft bitmap by a cluster
  * @vol:	volume on which to extend the mft bitmap attribute
@@ -1293,18 +1322,9 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 	ret = ntfs_attr_record_resize(ctx->mrec, a, mp_size +
 			le16_to_cpu(a->data.non_resident.mapping_pairs_offset));
 	if (unlikely(ret)) {
-		if (ret != -ENOSPC) {
-			ntfs_error(vol->sb,
-				"Failed to resize attribute record for mft bitmap attribute.");
-			goto undo_alloc;
-		}
-		/*
-		 * Note: It will need to be a special mft record and if none of
-		 * those are available it gets rather complicated...
-		 */
-		ntfs_error(vol->sb,
-			"Not enough space in this mft record to accommodate extended mft bitmap attribute extent.  Cannot handle this yet.");
-		ret = -EOPNOTSUPP;
+		ret = ntfs_mft_attr_extend(mftbmp_ni);
+		if (!ret)
+			goto extended_ok;
 		goto undo_alloc;
 	}
 	status.mp_rebuilt = 1;
@@ -1340,6 +1360,8 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 		}
 		a = ctx->attr;
 	}
+
+extended_ok:
 	write_lock_irqsave(&mftbmp_ni->size_lock, flags);
 	mftbmp_ni->allocated_size += vol->cluster_size;
 	a->data.non_resident.allocated_size =
@@ -1731,23 +1753,9 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 	ret = ntfs_attr_record_resize(ctx->mrec, a, mp_size +
 			le16_to_cpu(a->data.non_resident.mapping_pairs_offset));
 	if (unlikely(ret)) {
-		if (ret != -ENOSPC) {
-			ntfs_error(vol->sb,
-				"Failed to resize attribute record for mft data attribute.");
-			goto undo_alloc;
-		}
-		/*
-		 * Note: Use the special reserved mft records and ensure that
-		 * this extent is not required to find the mft record in
-		 * question.  If no free special records left we would need to
-		 * move an existing record away, insert ours in its place, and
-		 * then place the moved record into the newly allocated space
-		 * and we would then need to update all references to this mft
-		 * record appropriately.  This is rather complicated...
-		 */
-		ntfs_error(vol->sb,
-			"Not enough space in this mft record to accommodate extended mft data attribute extent.  Cannot handle this yet.");
-		ret = -EOPNOTSUPP;
+		ret = ntfs_mft_attr_extend(mft_ni);
+		if (!ret)
+			goto extended_ok;
 		goto undo_alloc;
 	}
 	mp_rebuilt = true;
@@ -1785,6 +1793,8 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 		}
 		a = ctx->attr;
 	}
+
+extended_ok:
 	write_lock_irqsave(&mft_ni->size_lock, flags);
 	mft_ni->allocated_size += nr << vol->cluster_size_bits;
 	a->data.non_resident.allocated_size =
@@ -2188,6 +2198,9 @@ search_free_rec:
 		/* Need to extend bitmap by one more cluster. */
 		ntfs_debug("mftbmp: initialized_size + 8 > allocated_size.");
 		err = ntfs_mft_bitmap_extend_allocation_nolock(vol);
+		if (err == -EAGAIN)
+			err = ntfs_mft_bitmap_extend_allocation_nolock(vol);
+
 		if (unlikely(err)) {
 			up_write(&vol->mftbmp_lock);
 			goto err_out;
@@ -2261,6 +2274,9 @@ have_alloc_rec:
 	while (ll > mft_ni->allocated_size) {
 		read_unlock_irqrestore(&mft_ni->size_lock, flags);
 		err = ntfs_mft_data_extend_allocation_nolock(vol);
+		if (err == -EAGAIN)
+			err = ntfs_mft_data_extend_allocation_nolock(vol);
+
 		if (unlikely(err)) {
 			ntfs_error(vol->sb, "Failed to extend mft data allocation.");
 			goto undo_mftbmp_alloc_nolock;
