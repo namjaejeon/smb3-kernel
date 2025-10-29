@@ -82,7 +82,6 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	struct ntfs_volume *vol = fc->s_fs_info;
 	struct fs_parse_result result;
 	int opt;
-	char *nls_name = NULL;
 
 	opt = fs_parse(fc, ntfs_parameters, param, &result);
 	if (opt < 0)
@@ -109,11 +108,12 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_nls:
 	case Opt_charset:
-		if (nls_name && nls_name != param->string)
-			kfree(nls_name);
-		nls_name = param->string;
-		vol->nls_map = load_nls(nls_name);
-		param->string = NULL;
+		vol->nls_map = load_nls(param->string);
+		if (!vol->nls_map) {
+			ntfs_error(vol->sb, "Failed to load NLS table '%s'.",
+				   param->string);
+			return -EINVAL;
+		}
 		break;
 	case Opt_mft_zone_multiplier:
 		if (vol->mft_zone_multiplier && vol->mft_zone_multiplier !=
