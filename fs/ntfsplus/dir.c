@@ -641,6 +641,11 @@ static inline int ntfs_filldir(struct ntfs_volume *vol,
 		ntfs_debug("Skipping system file.");
 		return 0;
 	}
+	if (!NVolShowHiddenFiles(vol) &&
+	    (ie->key.file_name.file_attributes & FILE_ATTR_HIDDEN)) {
+		ntfs_debug("Skipping hidden file.");
+		return 0;
+	}
 
 	name_len = ntfs_ucstonls(vol, (__le16 *)&ie->key.file_name.file_name,
 			ie->key.file_name.file_name_length, &name,
