@@ -2362,8 +2362,10 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 	struct ntfs_volume *vol = NTFS_SB(root->d_sb);
 	int i;
 
-	seq_printf(sf, ",uid=%i", from_kuid_munged(&init_user_ns, vol->uid));
-	seq_printf(sf, ",gid=%i", from_kgid_munged(&init_user_ns, vol->gid));
+	if (uid_valid(vol->uid))
+		seq_printf(sf, ",uid=%i", from_kuid_munged(&init_user_ns, vol->uid));
+	if (gid_valid(vol->gid))
+		seq_printf(sf, ",gid=%i", from_kgid_munged(&init_user_ns, vol->gid));
 	if (vol->fmask == vol->dmask)
 		seq_printf(sf, ",umask=0%o", vol->fmask);
 	else {
