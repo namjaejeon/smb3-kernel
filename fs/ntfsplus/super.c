@@ -59,6 +59,7 @@ enum {
 	Opt_mft_zone_multiplier,
 	Opt_preallocated_size,
 	Opt_sys_immutable,
+	Opt_nohidden,
 };
 
 static const struct fs_parameter_spec ntfs_parameters[] = {
@@ -76,6 +77,7 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_s32("mft_zone_multiplier",	Opt_mft_zone_multiplier),
 	fsparam_u64("preallocated_size",	Opt_preallocated_size),
 	fsparam_flag("sys_immutable",		Opt_sys_immutable),
+	fsparam_flag("nohidden",		Opt_nohidden),
 	{}
 };
 
@@ -150,6 +152,12 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			NVolSetSysImmutable(vol);
 		else
 			NVolClearSysImmutable(vol);
+		break;
+	case Opt_nohidden:
+		if (result.boolean)
+			NVolClearShowHiddenFiles(vol);
+		else
+			NVolSetShowHiddenFiles(vol);
 		break;
 	default:
 		return -EINVAL;
@@ -2568,6 +2576,8 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 		.nls_map = load_nls_default(),
 		.preallocated_size = NTFS_DEF_PREALLOC_SIZE,
 	};
+
+	NVolSetShowHiddenFiles(vol);
 	init_rwsem(&vol->mftbmp_lock);
 	init_rwsem(&vol->lcnbmp_lock);
 

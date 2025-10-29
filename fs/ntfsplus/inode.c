@@ -2389,6 +2389,8 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 	seq_printf(sf, ",mft_zone_multiplier=%i", vol->mft_zone_multiplier);
 	if (NVolSysImmutable(vol))
 		seq_puts(sf, ",sys_immutable");
+	if (!NVolShowHiddenFiles(vol))
+		seq_puts(sf, ",nohidden");
 	return 0;
 }
 
