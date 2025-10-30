@@ -21,7 +21,7 @@
 #include "misc.h"
 
 static int ntfs_write_ea(struct ntfs_inode *ni, int type, char *value, s64 ea_off,
-		s64 ea_size)
+		s64 ea_size, bool need_truncate)
 {
 	struct inode *ea_vi;
 	int err = 0;
@@ -34,8 +34,13 @@ static int ntfs_write_ea(struct ntfs_inode *ni, int type, char *value, s64 ea_of
 	written = ntfs_inode_attr_pwrite(ea_vi, ea_off, ea_size, value, false);
 	if (written != ea_size)
 		err = -EIO;
-	else
+	else {
+		struct ntfs_inode *ea_ni = NTFS_I(ea_vi);
+
+		if (need_truncate && ea_ni->data_size > ea_off + ea_size)
+			ntfs_attr_truncate(ea_ni, ea_off + ea_size);
 		mark_mft_record_dirty(ni);
+	}
 
 	iput(ea_vi);
 	return err;
@@ -207,7 +212,7 @@ static int ntfs_set_ea(struct inode *inode, const char *name, size_t name_len,
 			goto create_ea_info;
 		}
 
-		ea_info_qsize = le16_to_cpu(p_ea_info->ea_query_length);
+		ea_info_qsize = le32_to_cpu(p_ea_info->ea_query_length);
 	} else {
 create_ea_info:
 		p_ea_info = ntfs_malloc_nofs(sizeof(struct ea_information));
@@ -257,15 +262,14 @@ create_ea_info:
 
 		memmove((char *)p_ea, (char *)p_ea + ea_size, ea_info_qsize - (ea_off + ea_size));
 		ea_info_qsize -= ea_size;
-		memset(ea_buf + ea_info_qsize, 0, ea_size);
 		p_ea_info->ea_query_length = cpu_to_le16(ea_info_qsize);
 
 		err = ntfs_write_ea(ni, AT_EA_INFORMATION, (char *)p_ea_info, 0,
-				sizeof(struct ea_information));
+				sizeof(struct ea_information), false);
 		if (err)
 			goto out;
 
-		err = ntfs_write_ea(ni, AT_EA, ea_buf, 0, all_ea_size);
+		err = ntfs_write_ea(ni, AT_EA, ea_buf, 0, ea_info_qsize, true);
 		if (err)
 			goto out;
 
@@ -321,13 +325,13 @@ alloc_new_ea:
 			goto out;
 	} else {
 		err = ntfs_write_ea(ni, AT_EA, (char *)p_ea, ea_info_qsize,
-				new_ea_size);
+				new_ea_size, false);
 		if (err)
 			goto out;
 	}
 
 	err = ntfs_write_ea(ni, AT_EA_INFORMATION, (char *)p_ea_info, 0,
-			sizeof(struct ea_information));
+			sizeof(struct ea_information), false);
 	if (err)
 		goto out;
 
