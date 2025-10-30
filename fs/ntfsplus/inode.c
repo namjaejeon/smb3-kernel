@@ -2391,6 +2391,8 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 		seq_puts(sf, ",sys_immutable");
 	if (!NVolShowHiddenFiles(vol))
 		seq_puts(sf, ",nohidden");
+	if (NVolHideDotFiles(vol))
+		seq_puts(sf, ",hide_dot_files");
 	return 0;
 }
 
@@ -2476,7 +2478,10 @@ static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_rec
 	}
 	si = (struct standard_information *)((u8 *)ctx->attr +
 			le16_to_cpu(ctx->attr->data.resident.value_offset));
-	si->file_attributes = ni->flags;
+	if (si->file_attributes != ni->flags) {
+		si->file_attributes = ni->flags;
+		modified = true;
+	}
 
 	/* Update the creation times if they have changed. */
 	nt = utc2ntfs(ni->i_crtime);

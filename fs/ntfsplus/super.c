@@ -60,6 +60,7 @@ enum {
 	Opt_preallocated_size,
 	Opt_sys_immutable,
 	Opt_nohidden,
+	Opt_hide_dot_files,
 };
 
 static const struct fs_parameter_spec ntfs_parameters[] = {
@@ -78,6 +79,7 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_u64("preallocated_size",	Opt_preallocated_size),
 	fsparam_flag("sys_immutable",		Opt_sys_immutable),
 	fsparam_flag("nohidden",		Opt_nohidden),
+	fsparam_flag("hide_dot_files",		Opt_hide_dot_files),
 	{}
 };
 
@@ -158,6 +160,12 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			NVolClearShowHiddenFiles(vol);
 		else
 			NVolSetShowHiddenFiles(vol);
+		break;
+	case Opt_hide_dot_files:
+		if (result.boolean)
+			NVolSetHideDotFiles(vol);
+		else
+			NVolClearHideDotFiles(vol);
 		break;
 	default:
 		return -EINVAL;

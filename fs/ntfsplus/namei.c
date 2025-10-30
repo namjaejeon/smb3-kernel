@@ -578,6 +578,8 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	}
 	if (!S_ISREG(mode) && !S_ISDIR(mode))
 		fn->file_attributes = FILE_ATTR_SYSTEM;
+	if (NVolHideDotFiles(vol) && (name_len > 0 && name[0] == '.'))
+		fn->file_attributes |= FILE_ATTR_HIDDEN;
 	fn->creation_time = fn->last_data_change_time = utc2ntfs(ni->i_crtime);
 	fn->last_mft_change_time = fn->last_access_time = fn->creation_time;
 	memcpy(fn->file_name, name, name_len * sizeof(__le16));
@@ -606,6 +608,7 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	mutex_unlock(&dir_ni->mrec_lock);
 	mutex_unlock(&ni->mrec_lock);
 
+	ni->flags = fn->file_attributes;
 	/* Set the sequence number. */
 	vi->i_generation = ni->seq_no;
 	set_nlink(vi, 1);
@@ -1118,6 +1121,8 @@ static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 			fn->allocated_size = cpu_to_le64(ni->allocated_size);
 		fn->data_size = cpu_to_le64(ni->data_size);
 	}
+	if (NVolHideDotFiles(dir_ni->vol) && (name_len > 0 && name[0] == '.'))
+		fn->file_attributes |= FILE_ATTR_HIDDEN;
 
 	fn->creation_time = utc2ntfs(ni->i_crtime);
 	fn->last_data_change_time = utc2ntfs(inode_get_mtime(vi));

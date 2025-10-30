@@ -151,6 +151,7 @@ enum {
 	NV_Shutdown,
 	NV_SysImmutable,	/* 1: Protect system files from deletion. */
 	NV_ShowHiddenFiles,	/* 1: Return hidden files in ntfs_readdir(). */
+	NV_HideDotFiles,
 };
 
 /*
@@ -184,6 +185,7 @@ DEFINE_NVOL_BIT_OPS(FreeClusterKnown)
 DEFINE_NVOL_BIT_OPS(Shutdown)
 DEFINE_NVOL_BIT_OPS(SysImmutable)
 DEFINE_NVOL_BIT_OPS(ShowHiddenFiles)
+DEFINE_NVOL_BIT_OPS(HideDotFiles)
 
 static inline void ntfs_inc_free_clusters(struct ntfs_volume *vol, s64 nr)
 {
