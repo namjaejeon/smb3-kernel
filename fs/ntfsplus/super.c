@@ -54,6 +54,7 @@ enum {
 	Opt_nls,
 	Opt_charset,
 	Opt_show_sys_files,
+	Opt_show_meta,
 	Opt_case_sensitive,
 	Opt_disable_sparse,
 	Opt_mft_zone_multiplier,
@@ -73,6 +74,7 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_string("iocharset",		Opt_charset),
 	fsparam_enum("errors",			Opt_errors, ntfs_param_enums),
 	fsparam_flag("show_sys_files",		Opt_show_sys_files),
+	fsparam_flag("showmeta",		Opt_show_meta),
 	fsparam_flag("case_sensitive",		Opt_case_sensitive),
 	fsparam_flag("disable_sparse",		Opt_disable_sparse),
 	fsparam_s32("mft_zone_multiplier",	Opt_mft_zone_multiplier),
@@ -135,6 +137,7 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			vol->mft_zone_multiplier = result.int_32;
 		break;
 	case Opt_show_sys_files:
+	case Opt_show_meta:
 		if (result.boolean)
 			NVolSetShowSystemFiles(vol);
 		else
