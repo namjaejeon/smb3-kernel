@@ -2381,7 +2381,7 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 	if (NVolCaseSensitive(vol))
 		seq_puts(sf, ",case_sensitive");
 	if (NVolShowSystemFiles(vol))
-		seq_puts(sf, ",show_sys_files");
+		seq_puts(sf, ",show_sys_files,showmeta");
 	for (i = 0; on_errors_arr[i].val; i++) {
 		if (on_errors_arr[i].val == vol->on_errors)
 			seq_printf(sf, ",errors=%s", on_errors_arr[i].str);
