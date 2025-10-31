@@ -761,13 +761,53 @@ static int ntfs_ioctl_shutdown(struct super_block *sb, unsigned long arg)
 	return ntfs_force_shutdown(sb, flags);
 }
 
+static int ntfs_ioctl_get_volume_label(struct file *filp, unsigned long arg)
+{
+	struct ntfs_volume *vol = NTFS_SB(file_inode(filp)->i_sb);
+	char __user *buf = (char __user *)arg;
+
+	if (!vol->volume_label) {
+		if (copy_to_user(buf, "", 1))
+			return -EFAULT;
+	} else if (copy_to_user(buf, vol->volume_label,
+				MIN(FSLABEL_MAX, strlen(vol->volume_label) + 1)))
+		return -EFAULT;
+	return 0;
+}
+
+static int ntfs_ioctl_set_volume_label(struct file *filp, unsigned long arg)
+{
+	struct ntfs_volume *vol = NTFS_SB(file_inode(filp)->i_sb);
+	char *label;
+	int ret;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	label = strndup_user((const char __user *)arg, FSLABEL_MAX);
+	if (IS_ERR(label))
+		return PTR_ERR(label);
+
+	ret = mnt_want_write_file(filp);
+	if (ret)
+		goto out;
+
+	ret = ntfs_write_volume_label(vol, label);
+	mnt_drop_write_file(filp);
+out:
+	kfree(label);
+	return ret;
+}
+
 long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-	struct inode *inode = file_inode(filp);
-
 	switch (cmd) {
 	case NTFS_IOC_SHUTDOWN:
-		return ntfs_ioctl_shutdown(inode->i_sb, arg);
+		return ntfs_ioctl_shutdown(file_inode(filp)->i_sb, arg);
+	case FS_IOC_GETFSLABEL:
+		return ntfs_ioctl_get_volume_label(filp, arg);
+	case FS_IOC_SETFSLABEL:
+		return ntfs_ioctl_set_volume_label(filp, arg);
 	default:
 		return -ENOTTY;
 	}

@@ -104,6 +104,7 @@ struct ntfs_volume {
 	__le16 vol_flags;			/* Volume flags. */
 	u8 major_ver;			/* Ntfs major version of volume. */
 	u8 minor_ver;			/* Ntfs minor version of volume. */
+	unsigned char *volume_label;
 
 	struct inode *root_ino;		/* The VFS inode of the root directory. */
 	struct inode *secure_ino;	/*

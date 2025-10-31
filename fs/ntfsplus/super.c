@@ -443,6 +443,57 @@ int ntfs_clear_volume_flags(struct ntfs_volume *vol, __le16 flags)
 	return ntfs_write_volume_flags(vol, flags);
 }
 
+int ntfs_write_volume_label(struct ntfs_volume *vol, char *label)
+{
+	struct ntfs_inode *vol_ni = NTFS_I(vol->vol_ino);
+	struct ntfs_attr_search_ctx *ctx;
+	__le16 *uname;
+	int uname_len, ret;
+
+	uname_len = ntfs_nlstoucs(vol, label, strlen(label),
+				  &uname, FSLABEL_MAX);
+	if (uname_len < 0) {
+		ntfs_error(vol->sb,
+			"Failed to convert volume label '%s' to Unicode.",
+			label);
+		return uname_len;
+	}
+
+	if (uname_len  > NTFS_MAX_LABEL_LEN) {
+		ntfs_error(vol->sb,
+			   "Volume label is too long (max %d characters).",
+			   NTFS_MAX_LABEL_LEN);
+		kvfree(uname);
+		return -EINVAL;
+	}
+
+	mutex_lock(&vol_ni->mrec_lock);
+	ctx = ntfs_attr_get_search_ctx(vol_ni, NULL);
+	if (!ctx) {
+		ret = -ENOMEM;
+		goto  out;
+	}
+
+	if (!ntfs_attr_lookup(AT_VOLUME_NAME, NULL, 0, 0, 0, NULL, 0,
+			     ctx))
+		ntfs_attr_record_rm(ctx);
+	ntfs_attr_put_search_ctx(ctx);
+
+	ret = ntfs_resident_attr_record_add(vol_ni, AT_VOLUME_NAME, AT_UNNAMED, 0,
+					    (u8 *)uname, uname_len * sizeof(__le16), 0);
+out:
+	mutex_unlock(&vol_ni->mrec_lock);
+	kvfree(uname);
+	mark_inode_dirty_sync(vol->vol_ino);
+
+	if (ret >= 0) {
+		kfree(vol->volume_label);
+		vol->volume_label = kstrdup(label, GFP_KERNEL);
+		ret = 0;
+	}
+	return ret;
+}
+
 /**
  * is_boot_sector_ntfs - check whether a boot sector is a valid NTFS boot sector
  * @sb:		Super block of the device to which @b belongs.
@@ -1482,6 +1533,19 @@ iput_volume_failed:
 		ntfs_error(sb, "Failed to get attribute search context.");
 		goto get_ctx_vol_failed;
 	}
+
+	if (!ntfs_attr_lookup(AT_VOLUME_NAME, NULL, 0, 0, 0, NULL, 0, ctx) &&
+	    !ctx->attr->non_resident &&
+	    !(ctx->attr->flags & (ATTR_IS_SPARSE | ATTR_IS_COMPRESSED)) &&
+	    le32_to_cpu(ctx->attr->data.resident.value_length) > 0) {
+		err = ntfs_ucstonls(vol, (__le16 *)((u8 *)ctx->attr +
+				    le16_to_cpu(ctx->attr->data.resident.value_offset)),
+				    le32_to_cpu(ctx->attr->data.resident.value_length) / 2,
+				    &vol->volume_label, NTFS_MAX_LABEL_LEN);
+		if (err < 0)
+			vol->volume_label = NULL;
+	}
+
 	if (ntfs_attr_lookup(AT_VOLUME_INFORMATION, NULL, 0, 0, 0, NULL, 0,
 			ctx) || ctx->attr->non_resident || ctx->attr->flags) {
 err_put_vol:
@@ -1701,6 +1765,7 @@ static void ntfs_volume_free(struct ntfs_volume *vol)
 
 	if (vol->lcn_empty_bits_per_page)
 		kvfree(vol->lcn_empty_bits_per_page);
+	kfree(vol->volume_label);
 	kfree(vol);
 }
 
