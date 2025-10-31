@@ -36,6 +36,7 @@ enum {
 	NTFS_BLOCK_SIZE_BITS	= 9,
 	NTFS_SB_MAGIC		= 0x5346544e,	/* 'NTFS' */
 	NTFS_MAX_NAME_LEN	= 255,
+	NTFS_MAX_LABEL_LEN	= 128,
 };
 
 enum {
@@ -101,6 +102,7 @@ struct option_t {
 extern const struct option_t on_errors_arr[];
 int ntfs_set_volume_flags(struct ntfs_volume *vol, __le16 flags);
 int ntfs_clear_volume_flags(struct ntfs_volume *vol, __le16 flags);
+int ntfs_write_volume_label(struct ntfs_volume *vol, char *label);
 
 /* From fs/ntfs/mst.c */
 int post_read_mst_fixup(struct ntfs_record *b, const u32 size);
