@@ -16,6 +16,30 @@
 #include "reparse.h"
 #include "ea.h"
 
+static const __le16 aux_name_le[3] = {
+	cpu_to_le16('A'), cpu_to_le16('U'), cpu_to_le16('X')
+};
+
+static const __le16 con_name_le[3] = {
+	cpu_to_le16('C'), cpu_to_le16('O'), cpu_to_le16('N')
+};
+
+static const __le16 com_name_le[3] = {
+	cpu_to_le16('C'), cpu_to_le16('O'), cpu_to_le16('M')
+};
+
+static const __le16 lpt_name_le[3] = {
+	cpu_to_le16('L'), cpu_to_le16('P'), cpu_to_le16('T')
+};
+
+static const __le16 nul_name_le[3] = {
+	cpu_to_le16('N'), cpu_to_le16('U'), cpu_to_le16('L')
+};
+
+static const __le16 prn_name_le[3] = {
+	cpu_to_le16('P'), cpu_to_le16('R'), cpu_to_le16('N')
+};
+
 static inline int ntfs_check_bad_char(const unsigned short *wc,
 		unsigned int wc_len)
 {
@@ -29,6 +53,47 @@ static inline int ntfs_check_bad_char(const unsigned short *wc,
 			return -EINVAL;
 	}
 
+	return 0;
+}
+
+static int ntfs_check_bad_windows_name(struct ntfs_volume *vol,
+				       const unsigned short *wc,
+				       unsigned int wc_len)
+{
+	if (ntfs_check_bad_char(wc, wc_len))
+		return -EINVAL;
+
+	if (!NVolCheckWindowsNames(vol))
+		return 0;
+
+	/* Check for trailing space or dot. */
+	if (wc_len > 0 &&
+	    (wc[wc_len - 1] == cpu_to_le16(' ') ||
+	    wc[wc_len - 1] == cpu_to_le16('.')))
+	    return -EINVAL;
+
+	if (wc_len == 3 || (wc_len > 3 && wc[3] == cpu_to_le16('.'))) {
+		__le16 *upcase = vol->upcase;
+		u32 size = vol->upcase_len;
+
+		if (ntfs_are_names_equal(wc, 3, aux_name_le, 3, IGNORE_CASE, upcase, size) ||
+		    ntfs_are_names_equal(wc, 3, con_name_le, 3, IGNORE_CASE, upcase, size) ||
+		    ntfs_are_names_equal(wc, 3, nul_name_le, 3, IGNORE_CASE, upcase, size) ||
+		    ntfs_are_names_equal(wc, 3, prn_name_le, 3, IGNORE_CASE, upcase, size))
+			return -EINVAL;
+	}
+
+	if (wc_len == 4 || (wc_len > 4 && wc[4] == cpu_to_le16('.'))) {
+		__le16 *upcase = vol->upcase;
+		u32 size = vol->upcase_len, port;
+
+		if (ntfs_are_names_equal(wc, 3, com_name_le, 3, IGNORE_CASE, upcase, size) ||
+		    ntfs_are_names_equal(wc, 3, lpt_name_le, 3, IGNORE_CASE, upcase, size)) {
+			port = le16_to_cpu(wc[3]);
+			if (port >= '1' && port <= '9')
+				return -EINVAL;
+		}
+	}
 	return 0;
 }
 
@@ -688,7 +753,7 @@ static int ntfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		return uname_len;
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return err;
@@ -948,7 +1013,7 @@ static int ntfs_unlink(struct inode *dir, struct dentry *dentry)
 		return -ENOMEM;
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return err;
@@ -992,7 +1057,7 @@ static struct dentry *ntfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		return ERR_PTR(-ENOMEM);
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return ERR_PTR(err);
@@ -1034,7 +1099,7 @@ static int ntfs_rmdir(struct inode *dir, struct dentry *dentry)
 		return -ENOMEM;
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return err;
@@ -1198,7 +1263,7 @@ static int ntfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		return -ENOMEM;
 	}
 
-	err = ntfs_check_bad_char(uname_new, new_name_len);
+	err = ntfs_check_bad_windows_name(vol, uname_new, new_name_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname_new);
 		return err;
@@ -1344,7 +1409,7 @@ static int ntfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		goto out;
 	}
 
-	err = ntfs_check_bad_char(usrc, usrc_len);
+	err = ntfs_check_bad_windows_name(vol, usrc, usrc_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, usrc);
 		goto out;
@@ -1400,7 +1465,7 @@ static int ntfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 		return -ENOMEM;
 	}
 
-	err = ntfs_check_bad_char(uname, uname_len);
+	err = ntfs_check_bad_windows_name(vol, uname, uname_len);
 	if (err) {
 		kmem_cache_free(ntfs_name_cache, uname);
 		return err;
