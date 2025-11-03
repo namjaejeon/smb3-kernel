@@ -2393,6 +2393,8 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 		seq_puts(sf, ",nohidden");
 	if (NVolHideDotFiles(vol))
 		seq_puts(sf, ",hide_dot_files");
+	if (NVolCheckWindowsNames(vol))
+		seq_puts(sf, ",windows_names");
 	return 0;
 }
 

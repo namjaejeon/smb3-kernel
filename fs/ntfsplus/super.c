@@ -62,6 +62,7 @@ enum {
 	Opt_sys_immutable,
 	Opt_nohidden,
 	Opt_hide_dot_files,
+	Opt_check_windows_names,
 };
 
 static const struct fs_parameter_spec ntfs_parameters[] = {
@@ -82,6 +83,7 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_flag("sys_immutable",		Opt_sys_immutable),
 	fsparam_flag("nohidden",		Opt_nohidden),
 	fsparam_flag("hide_dot_files",		Opt_hide_dot_files),
+	fsparam_flag("windows_names",		Opt_check_windows_names),
 	{}
 };
 
@@ -169,6 +171,12 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			NVolSetHideDotFiles(vol);
 		else
 			NVolClearHideDotFiles(vol);
+		break;
+	case Opt_check_windows_names:
+		if (result.boolean)
+			NVolSetCheckWindowsNames(vol);
+		else
+			NVolClearCheckWindowsNames(vol);
 		break;
 	default:
 		return -EINVAL;
