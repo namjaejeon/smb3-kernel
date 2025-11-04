@@ -63,6 +63,7 @@ enum {
 	Opt_nohidden,
 	Opt_hide_dot_files,
 	Opt_check_windows_names,
+	Opt_acl,
 };
 
 static const struct fs_parameter_spec ntfs_parameters[] = {
@@ -84,6 +85,7 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_flag("nohidden",		Opt_nohidden),
 	fsparam_flag("hide_dot_files",		Opt_hide_dot_files),
 	fsparam_flag("windows_names",		Opt_check_windows_names),
+	fsparam_flag("acl",			Opt_acl),
 	{}
 };
 
@@ -177,6 +179,12 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			NVolSetCheckWindowsNames(vol);
 		else
 			NVolClearCheckWindowsNames(vol);
+		break;
+	case Opt_acl:
+		if (result.boolean)
+			fc->sb_flags |= SB_POSIXACL;
+		else
+			fc->sb_flags &= ~SB_POSIXACL;
 		break;
 	default:
 		return -EINVAL;
