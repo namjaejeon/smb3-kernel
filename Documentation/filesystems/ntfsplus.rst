@@ -116,6 +116,7 @@ dmask=			Instead of specifying umask which applies both to
 			files and directories, fmask applies only to files and
 			dmask only to directories.
 
+showmeta=<BOOL>
 show_sys_files=<BOOL>	If show_sys_files is specified, show the system files
 			in directory listings.  Otherwise the default behaviour
 			is to hide the system files.
@@ -176,4 +177,23 @@ mft_zone_multiplier=	Set the MFT zone multiplier for the volume (this
 
 preallocated_size=	Set preallocated size to optimize runlist merge
                         overhead with small chunck size.(64KB size by default)
+
+acl=<BOOL>		Enable POSIX ACL support. When specified, POSIX ACLs stored
+			in extended attributes are enforced. Default is off.
+			Requires kernel config NTFSPLUS_FS_POSIX_ACL enabled.
+
+sys_immutable=<BOOL>	Make NTFS system files (e.g. $MFT, $LogFile, $Bitmap,
+			$UpCase, etc.) immutable to user initiated modifications
+			for extra safety. Default is off.
+
+nohidden=<BOOL>		Hide files and directories marked with the Windows
+			"hidden" attribute. By default hidden items are shown.
+
+hide_dot_files=<BOOL>	Hide names beginning with a dot ("."). By default dot
+			files are shown. When enabled, files and directories created
+			with a leading '.' will be hidden from directory listings.
+
+windows_names=<BOOL>	Refuse creation/rename of files with characters or
+			reserved device names disallowed on Windows (e.g. CON,
+			NUL, AUX, COM1, LPT1, etc.). Default is off.
 ======================= =======================================================
