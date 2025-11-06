@@ -57,6 +57,7 @@ enum {
 	Opt_show_meta,
 	Opt_case_sensitive,
 	Opt_disable_sparse,
+	Opt_sparse,
 	Opt_mft_zone_multiplier,
 	Opt_preallocated_size,
 	Opt_sys_immutable,
@@ -88,6 +89,7 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_flag("windows_names",		Opt_check_windows_names),
 	fsparam_flag("acl",			Opt_acl),
 	fsparam_flag("discard",			Opt_discard),
+	fsparam_flag("sparse",			Opt_sparse),
 	{}
 };
 
@@ -193,6 +195,14 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			NVolSetDiscard(vol);
 		else
 			NVolClearDiscard(vol);
+		break;
+	case Opt_disable_sparse:
+		if (result.boolean)
+			NVolSetDisableSparse(vol);
+		else
+			NVolClearDisableSparse(vol);
+		break;
+	case Opt_sparse:
 		break;
 	default:
 		return -EINVAL;
@@ -2349,6 +2359,8 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	if (vol->nls_map && !strcmp(vol->nls_map->charset, "utf8"))
 		vol->nls_utf8 = true;
+	if (NVolDisableSparse(vol))
+		vol->preallocated_size = 0;
 
 	if (NVolDiscard(vol) && !bdev_max_discard_sectors(sb->s_bdev)) {
 		ntfs_warning(
