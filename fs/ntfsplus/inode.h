@@ -12,7 +12,6 @@
 #define _LINUX_NTFS_INODE_H
 
 #include "misc.h"
-#include <linux/version.h> // jnj Remove it for upstream
 
 enum ntfs_inode_mutex_lock_class {
 	NTFS_INODE_MUTEX_PARENT,

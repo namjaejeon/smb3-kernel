@@ -90,11 +90,11 @@ int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_sea
 
 		WARN_ON(IS_ERR(ctx->mrec));
 		a = ctx->attr;
+		ctx_is_temporary = false;
 		if (!a->non_resident) {
 			err = -EIO;
 			goto err_out;
 		}
-		ctx_is_temporary = false;
 		end_vcn = le64_to_cpu(a->data.non_resident.highest_vcn);
 		read_lock_irqsave(&ni->size_lock, flags);
 		allocated_size_vcn = ni->allocated_size >>

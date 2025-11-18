@@ -36,7 +36,7 @@ static s64 ntfs_convert_page_index_into_lcn(struct ntfs_volume *vol, struct ntfs
 	return lcn;
 }
 
-struct bio *ntfs_setup_bio(struct ntfs_volume *vol, unsigned int opf, s64 lcn,
+struct bio *ntfs_setup_bio(struct ntfs_volume *vol, blk_opf_t opf, s64 lcn,
 		unsigned int pg_ofs)
 {
 	struct bio *bio;
