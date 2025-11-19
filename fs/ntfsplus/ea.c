@@ -437,7 +437,7 @@ int ntfs_ea_set_wsl_inode(struct inode *inode, dev_t rdev, __le16 *ea_size,
 	return err;
 }
 
-ssize_t ntfs_listxattr(struct dentry *dentry, char *buffer, size_t size)
+ssize_t ntfsp_listxattr(struct dentry *dentry, char *buffer, size_t size)
 {
 	struct inode *inode = d_inode(dentry);
 	struct ntfs_inode *ni = NTFS_I(inode);
@@ -769,14 +769,14 @@ static const struct xattr_handler ntfs_other_xattr_handler = {
 	.list	= ntfs_xattr_user_list,
 };
 
-const struct xattr_handler * const ntfs_xattr_handlers[] = {
+const struct xattr_handler * const ntfsp_xattr_handlers[] = {
 	&ntfs_other_xattr_handler,
 	NULL,
 };
 // clang-format on
 
 #ifdef CONFIG_NTFSPLUS_FS_POSIX_ACL
-struct posix_acl *ntfs_get_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+struct posix_acl *ntfsp_get_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 			       int type)
 {
 	struct inode *inode = d_inode(dentry);
@@ -893,13 +893,13 @@ out:
 	return err;
 }
 
-int ntfs_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+int ntfsp_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct posix_acl *acl, int type)
 {
 	return ntfs_set_acl_ex(idmap, d_inode(dentry), acl, type, false);
 }
 
-int ntfs_init_acl(struct mnt_idmap *idmap, struct inode *inode,
+int ntfsp_init_acl(struct mnt_idmap *idmap, struct inode *inode,
 		  struct inode *dir)
 {
 	struct posix_acl *default_acl, *acl;

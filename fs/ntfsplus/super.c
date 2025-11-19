@@ -2422,7 +2422,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	/* Ntfs measures time in 100ns intervals. */
 	sb->s_time_gran = 100;
 
-	sb->s_xattr = ntfs_xattr_handlers;
+	sb->s_xattr = ntfsp_xattr_handlers;
 	/*
 	 * Now load the metadata required for the page cache and our address
 	 * space operations to function. We do this by setting up a specialised

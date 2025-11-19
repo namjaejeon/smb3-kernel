@@ -67,7 +67,7 @@ extern const struct address_space_operations ntfs_mst_aops;
 extern const struct  file_operations ntfs_file_ops;
 extern const struct inode_operations ntfs_file_inode_ops;
 extern const  struct inode_operations ntfs_symlink_inode_operations;
-extern const struct inode_operations ntfs_special_inode_operations;
+extern const struct inode_operations ntfsp_special_inode_operations;
 
 extern const struct  file_operations ntfs_dir_ops;
 extern const struct inode_operations ntfs_dir_inode_ops;

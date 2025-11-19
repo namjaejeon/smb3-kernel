@@ -242,7 +242,7 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 }
 
 /**
- * ntfs_setattr - called from notify_change() when an attribute is being changed
+ * ntfsp_setattr - called from notify_change() when an attribute is being changed
  * @idmap:	idmap of the mount the inode was found from
  * @dentry:	dentry whose attributes to change
  * @attr:	structure describing the attributes and the changes
@@ -254,7 +254,7 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
  * We also abort all changes of user, group, and mode as we do not implement
  * the NTFS ACLs yet.
  */
-int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+int ntfsp_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct iattr *attr)
 {
 	struct inode *vi = d_inode(dentry);
@@ -357,7 +357,7 @@ out:
 	return err;
 }
 
-int ntfs_getattr(struct mnt_idmap *idmap, const struct path *path,
+int ntfsp_getattr(struct mnt_idmap *idmap, const struct path *path,
 		struct kstat *stat, unsigned int request_mask,
 		unsigned int query_flags)
 {
@@ -826,7 +826,7 @@ static int ntfs_ioctl_fitrim(struct ntfs_volume *vol, unsigned long arg)
 
 	range.minlen = max_t(u32, range.minlen, bdev_discard_granularity(dev));
 
-	err = ntfs_trim_fs(vol, &range);
+	err = ntfsp_trim_fs(vol, &range);
 	if (err < 0)
 		return err;
 
@@ -836,7 +836,7 @@ static int ntfs_ioctl_fitrim(struct ntfs_volume *vol, unsigned long arg)
 	return 0;
 }
 
-long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+static long ntfsp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
 	case NTFS_IOC_SHUTDOWN:
@@ -853,7 +853,7 @@ long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 }
 
 #ifdef CONFIG_COMPAT
-long ntfs_compat_ioctl(struct file *filp, unsigned int cmd,
+static long ntfsp_compat_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg)
 {
 	return ntfs_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
@@ -1097,34 +1097,34 @@ const struct file_operations ntfs_file_ops = {
 	.release	= ntfs_file_release,
 	.splice_read	= ntfs_file_splice_read,
 	.splice_write	= iter_file_splice_write,
-	.unlocked_ioctl	= ntfs_ioctl,
+	.unlocked_ioctl	= ntfsp_ioctl,
 #ifdef CONFIG_COMPAT
-	.compat_ioctl	= ntfs_compat_ioctl,
+	.compat_ioctl	= ntfsp_compat_ioctl,
 #endif
 	.fallocate	= ntfs_fallocate,
 };
 
 const struct inode_operations ntfs_file_inode_ops = {
-	.setattr	= ntfs_setattr,
-	.getattr	= ntfs_getattr,
-	.listxattr	= ntfs_listxattr,
-	.get_acl	= ntfs_get_acl,
-	.set_acl	= ntfs_set_acl,
+	.setattr	= ntfsp_setattr,
+	.getattr	= ntfsp_getattr,
+	.listxattr	= ntfsp_listxattr,
+	.get_acl	= ntfsp_get_acl,
+	.set_acl	= ntfsp_set_acl,
 	.fiemap		= ntfs_fiemap,
 };
 
 const struct inode_operations ntfs_symlink_inode_operations = {
 	.get_link	= ntfs_get_link,
-	.setattr	= ntfs_setattr,
-	.listxattr	= ntfs_listxattr,
+	.setattr	= ntfsp_setattr,
+	.listxattr	= ntfsp_listxattr,
 };
 
-const struct inode_operations ntfs_special_inode_operations = {
-	.setattr	= ntfs_setattr,
-	.getattr	= ntfs_getattr,
-	.listxattr	= ntfs_listxattr,
-	.get_acl	= ntfs_get_acl,
-	.set_acl	= ntfs_set_acl,
+const struct inode_operations ntfsp_special_inode_operations = {
+	.setattr	= ntfsp_setattr,
+	.getattr	= ntfsp_getattr,
+	.listxattr	= ntfsp_listxattr,
+	.get_acl	= ntfsp_get_acl,
+	.set_acl	= ntfsp_set_acl,
 };
 
 const struct file_operations ntfs_empty_file_ops = {};

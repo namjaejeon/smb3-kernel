@@ -628,7 +628,7 @@ void ntfs_set_vfs_operations(struct inode *inode, mode_t mode, dev_t dev)
 		inode->i_op = &ntfs_symlink_inode_operations;
 		inode->i_mapping->a_ops = &ntfs_normal_aops;
 	} else if (S_ISCHR(mode) || S_ISBLK(mode) || S_ISFIFO(mode) || S_ISSOCK(mode)) {
-		inode->i_op = &ntfs_special_inode_operations;
+		inode->i_op = &ntfsp_special_inode_operations;
 		init_special_inode(inode, inode->i_mode, dev);
 	} else {
 		if (!NInoAttr(NTFS_I(inode))) {

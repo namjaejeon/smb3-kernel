@@ -681,7 +681,7 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 
 #ifdef CONFIG_NTFSPLUS_FS_POSIX_ACL
 	if (!S_ISLNK(mode) && (sb->s_flags & SB_POSIXACL)) {
-		err = ntfs_init_acl(idmap, vi, dir);
+		err = ntfsp_init_acl(idmap, vi, dir);
 		if (err)
 			goto err_out;
 	} else
@@ -1560,11 +1560,11 @@ const struct inode_operations ntfs_dir_inode_ops = {
 	.mkdir		= ntfs_mkdir,
 	.rmdir		= ntfs_rmdir,
 	.rename		= ntfs_rename,
-	.get_acl	= ntfs_get_acl,
-	.set_acl	= ntfs_set_acl,
-	.listxattr	= ntfs_listxattr,
-	.setattr	= ntfs_setattr,
-	.getattr	= ntfs_getattr,
+	.get_acl	= ntfsp_get_acl,
+	.set_acl	= ntfsp_set_acl,
+	.listxattr	= ntfsp_listxattr,
+	.setattr	= ntfsp_setattr,
+	.getattr	= ntfsp_getattr,
 	.symlink	= ntfs_symlink,
 	.mknod		= ntfs_mknod,
 	.link		= ntfs_link,

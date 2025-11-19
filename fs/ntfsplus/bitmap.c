@@ -12,7 +12,7 @@
 #include "aops.h"
 #include "ntfs.h"
 
-int ntfs_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range)
+int ntfsp_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range)
 {
 	size_t buf_clusters;
 	pgoff_t index, start_index, end_index;
