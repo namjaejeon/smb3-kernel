@@ -14,12 +14,6 @@
 
 #include "misc.h"
 
-#ifdef pr_fmt
-#undef pr_fmt
-#endif
-
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-
 /**
  * __ntfs_warning - output a warning to the syslog
  * @function:	name of function outputting the warning

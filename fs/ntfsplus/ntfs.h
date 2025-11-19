@@ -24,6 +24,12 @@
 #include "layout.h"
 #include "inode.h"
 
+#ifdef pr_fmt
+#undef pr_fmt
+#endif
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #define NTFS_DEF_PREALLOC_SIZE		(64*1024*1024)
 
 #define STANDARD_COMPRESSION_UNIT	4
