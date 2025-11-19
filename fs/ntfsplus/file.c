@@ -846,7 +846,7 @@ long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case FS_IOC_SETFSLABEL:
 		return ntfs_ioctl_set_volume_label(filp, arg);
 	case FITRIM:
-		return ntfs_ioctl_fitrim(NTFS_SB(inode->i_sb), arg);
+		return ntfs_ioctl_fitrim(NTFS_SB(file_inode(filp)->i_sb), arg);
 	default:
 		return -ENOTTY;
 	}
