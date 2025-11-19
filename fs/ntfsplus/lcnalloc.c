@@ -254,40 +254,27 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 			pass = 2;
 		}
 		has_guess = 0;
-	} else if (zone == DATA_ZONE && zone_start >= vol->mft_zone_start &&
-			zone_start < vol->mft_zone_end) {
-		zone_start = vol->mft_zone_end;
-		/*
-		 * Starting at beginning of data1_zone which means a single
-		 * pass in this zone is sufficient.
-		 */
-		pass = 2;
-	} else if (zone == MFT_ZONE && (zone_start < vol->mft_zone_start ||
-			zone_start >= vol->mft_zone_end)) {
-		zone_start = vol->mft_lcn;
-		if (!vol->mft_zone_end)
-			zone_start = 0;
-		/*
-		 * Starting at beginning of volume which means a single pass
-		 * is sufficient.
-		 */
-		pass = 2;
 	}
 
-	if (zone == MFT_ZONE) {
-		zone_end = vol->mft_zone_end;
-		search_zone = 1;
-	} else /* if (zone == DATA_ZONE) */ {
+	if (!zone_start || zone_start == vol->mft_zone_start ||
+			zone_start == vol->mft_zone_end)
+		pass = 2;
+
+	if (zone_start < vol->mft_zone_start) {
+		zone_end = vol->mft_zone_start;
+		search_zone = 4;
 		/* Skip searching the mft zone. */
 		done_zones |= 1;
-		if (zone_start >= vol->mft_zone_end) {
-			zone_end = vol->nr_clusters;
-			search_zone = 2;
-		} else {
-			zone_end = vol->mft_zone_start;
-			search_zone = 4;
-		}
+	} else if (zone_start < vol->mft_zone_end) {
+		zone_end = vol->mft_zone_end;
+		search_zone = 1;
+	} else {
+		zone_end = vol->nr_clusters;
+		search_zone = 2;
+		/* Skip searching the mft zone. */
+		done_zones |= 1;
 	}
+
 	/*
 	 * bmp_pos is the current bit position inside the bitmap.  We use
 	 * bmp_initial_pos to determine whether or not to do a zone switch.
