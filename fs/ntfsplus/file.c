@@ -24,6 +24,7 @@
 #include "ea.h"
 #include "ntfs_iomap.h"
 #include "misc.h"
+#include "bitmap.h"
 
 /**
  * ntfs_file_open - called when an inode is about to be opened
@@ -799,6 +800,42 @@ out:
 	return ret;
 }
 
+static int ntfs_ioctl_fitrim(struct ntfs_volume *vol, unsigned long arg)
+{
+	struct fstrim_range __user *user_range;
+	struct fstrim_range range;
+	struct block_device *dev;
+	int err;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	dev = vol->sb->s_bdev;
+	if (!bdev_max_discard_sectors(dev))
+		return -EOPNOTSUPP;
+
+	user_range = (struct fstrim_range __user *)arg;
+	if (copy_from_user(&range, user_range, sizeof(range)))
+		return -EFAULT;
+
+	if (range.len == 0)
+		return -EINVAL;
+
+	if (range.len < vol->cluster_size)
+		return -EINVAL;
+
+	range.minlen = max_t(u32, range.minlen, bdev_discard_granularity(dev));
+
+	err = ntfs_trim_fs(vol, &range);
+	if (err < 0)
+		return err;
+
+	if (copy_to_user(user_range, &range, sizeof(range)))
+		return -EFAULT;
+
+	return 0;
+}
+
 long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
@@ -808,6 +845,8 @@ long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return ntfs_ioctl_get_volume_label(filp, arg);
 	case FS_IOC_SETFSLABEL:
 		return ntfs_ioctl_set_volume_label(filp, arg);
+	case FITRIM:
+		return ntfs_ioctl_fitrim(NTFS_SB(inode->i_sb), arg);
 	default:
 		return -ENOTTY;
 	}

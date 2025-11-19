@@ -4758,8 +4758,10 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 	ni->runlist.count = new_rl_count;
 
 	if (!update_mp) {
-		if (((long long)atomic64_read(&vol->free_clusters) * 100) /
-				(long)vol->nr_clusters <= 5)
+		u64 free = atomic64_read(&vol->free_clusters) * 100;
+
+		do_div(free, vol->nr_clusters);
+		if (free <= 5)
 			update_mp = true;
 	}
 
@@ -5272,8 +5274,8 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
 	vcn_start = (s64)(start >> vol->cluster_size_bits);
 	vcn_end = (s64)(round_up(start + byte_len, vol->cluster_size) >>
 			vol->cluster_size_bits);
-	vcn_uninit = (s64)(round_up(ni->initialized_size, vol->cluster_size) /
-			       vol->cluster_size);
+	vcn_uninit = (s64)(round_up(ni->initialized_size, vol->cluster_size) >>
+			       vol->cluster_size_bits);
 	vcn_uninit = min_t(s64, vcn_uninit, vcn_end);
 
 	/*

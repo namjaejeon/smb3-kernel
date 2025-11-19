@@ -3410,7 +3410,8 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 	struct folio *folio;
 	struct ntfs_inode *ni = NTFS_I(vi);
 	s64 isize;
-	u32 attr_len, total = 0, offset, index;
+	u32 attr_len, total = 0, offset;
+	pgoff_t index;
 	int err = 0;
 
 	WARN_ON(!NInoAttr(ni));
@@ -3455,7 +3456,7 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 	}
 	mutex_unlock(&ni->mrec_lock);
 
-	index = (u32)(pos / PAGE_SIZE);
+	index = pos >> PAGE_SHIFT;
 	do {
 		/* Update @index and get the next folio. */
 		folio = ntfs_read_mapping_folio(mapping, index);

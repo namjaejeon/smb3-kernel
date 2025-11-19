@@ -868,10 +868,10 @@ static void ntfs_setup_allocators(struct ntfs_volume *vol)
 	 * On non-standard volumes we do not protect it as the overhead would
 	 * be higher than the speed increase we would get by doing it.
 	 */
-	mft_lcn = (8192 + 2 * vol->cluster_size - 1) / vol->cluster_size;
+	mft_lcn = (8192 + 2 * vol->cluster_size - 1) >> vol->cluster_size_bits;
 	if (mft_lcn * vol->cluster_size < 16 * 1024)
-		mft_lcn = (16 * 1024 + vol->cluster_size - 1) /
-				vol->cluster_size;
+		mft_lcn = (16 * 1024 + vol->cluster_size - 1) >>
+				vol->cluster_size_bits;
 	if (vol->mft_zone_start <= mft_lcn)
 		vol->mft_zone_start = 0;
 	ntfs_debug("vol->mft_zone_start = 0x%llx", vol->mft_zone_start);
@@ -1052,7 +1052,7 @@ mft_unmap_out:
 	rl2[0].vcn = 0;
 	rl2[0].lcn = vol->mftmirr_lcn;
 	rl2[0].length = (vol->mftmirr_size * vol->mft_record_size +
-			vol->cluster_size - 1) / vol->cluster_size;
+			vol->cluster_size - 1) >> vol->cluster_size_bits;
 	rl2[1].vcn = rl2[0].length;
 	rl2[1].lcn = LCN_ENOENT;
 	rl2[1].length = 0;
