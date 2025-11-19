@@ -3501,7 +3501,7 @@ retry:
 							cur_max_mp_size)) {
 					ntfs_error(sb,
 						"Attribute list is too big. Defragment the volume\n");
-					return -EIO;
+					return -ENOSPC;
 				}
 				if (ntfs_attrlist_update(base_ni))
 					return -EIO;

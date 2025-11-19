@@ -3355,9 +3355,13 @@ retry:
 			if (err) {
 				if (err != -ENOENT)
 					ntfs_error(sb, "Attr lookup failed #2");
-				else
+				else if (ctx->attr->type == AT_END)
 					err = -ENOSPC;
-				goto put_err_out;
+				else
+					err = 0;
+
+				if (err)
+					goto put_err_out;
 			}
 		}
 
