@@ -1076,8 +1076,11 @@ static int ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 				 * mft record (base record) then give up searching since
 				 * no guarantee that the found record will be accessible.
 				 */
-				if (base_ni && base_ni->mft_no == FILE_MFT && bit > 400)
+				if (base_ni && base_ni->mft_no == FILE_MFT && bit > 400) {
+					folio_unlock(folio);
+					ntfs_unmap_folio(folio, buf);
 					return -ENOSPC;
+				}
 
 				byte = buf + (bit >> 3);
 				if (*byte == 0xff)
