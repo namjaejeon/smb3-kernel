@@ -64,13 +64,24 @@ int ntfs_attrlist_update(struct ntfs_inode *base_ni)
 	}
 	attr_ni = NTFS_I(attr_vi);
 
-	if (ntfs_attr_truncate_i(attr_ni, base_ni->attr_list_size, HOLES_NO) != 0) {
+	err = ntfs_attr_truncate_i(attr_ni, base_ni->attr_list_size, HOLES_NO);
+	if (err == -ENOSPC && attr_ni->mft_no == FILE_MFT) {
+		err = ntfs_attr_truncate(attr_ni, 0);
+		if (err || ntfs_attr_truncate_i(attr_ni, base_ni->attr_list_size, HOLES_NO) != 0) {
+			iput(attr_vi);
+			ntfs_error(base_ni->vol->sb,
+					"Failed to truncate attribute list of inode %#llx",
+					(long long)base_ni->mft_no);
+			return -EIO;
+		}
+	} else if (err) {
 		iput(attr_vi);
 		ntfs_error(base_ni->vol->sb,
 			   "Failed to truncate attribute list of inode %#llx",
 			   (long long)base_ni->mft_no);
 		return -EIO;
 	}
+
 	i_size_write(attr_vi, base_ni->attr_list_size);
 
 	if (NInoNonResident(attr_ni) && !NInoAttrListNonResident(base_ni))

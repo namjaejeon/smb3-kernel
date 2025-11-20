@@ -3499,8 +3499,7 @@ retry:
 				ntfs_attr_put_search_ctx(ctx);
 				if (ntfs_inode_free_space(base_ni, mp_size -
 							cur_max_mp_size)) {
-					ntfs_error(sb,
-						"Attribute list is too big. Defragment the volume\n");
+					ntfs_debug("Attribute list is too big. Defragment the volume\n");
 					return -ENOSPC;
 				}
 				if (ntfs_attrlist_update(base_ni))
@@ -4191,7 +4190,7 @@ static int ntfs_non_resident_attr_expand(struct ntfs_inode *ni, const s64 newsiz
 		ni->allocated_size = first_free_vcn << vol->cluster_size_bits;
 		err = ntfs_attr_update_mapping_pairs(ni, 0);
 		if (err) {
-			ntfs_error(sb, "Mapping pairs update failed");
+			ntfs_debug("Mapping pairs update failed");
 			goto rollback;
 		}
 	}
@@ -4230,7 +4229,7 @@ rollback:
 	err2 = ntfs_cluster_free(ni, org_alloc_size >>
 				vol->cluster_size_bits, -1, ctx);
 	if (err2)
-		ntfs_error(sb, "Leaking clusters");
+		ntfs_debug("Leaking clusters");
 
 	/* Now, truncate the runlist itself. */
 	down_write(&ni->runlist.lock);
