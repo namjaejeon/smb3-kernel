@@ -1221,8 +1221,8 @@ const struct file_operations ntfs_dir_ops = {
 	.fsync		= ntfs_dir_fsync,	/* Sync a directory to disk. */
 	.open		= ntfs_dir_open,	/* Open directory. */
 	.release	= ntfs_dir_release,
-	.unlocked_ioctl	= ntfs_ioctl,
+	.unlocked_ioctl	= ntfsp_ioctl,
 #ifdef CONFIG_COMPAT
-	.compat_ioctl	= ntfs_compat_ioctl,
+	.compat_ioctl	= ntfsp_compat_ioctl,
 #endif
 };

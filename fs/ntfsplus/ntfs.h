@@ -141,9 +141,9 @@ bool ntfs_names_are_equal(const __le16 *s1, size_t s1_len,
 		const u32 ic,
 		const __le16 *upcase, const u32 upcase_size);
 int ntfs_force_shutdown(struct super_block *sb, u32 flags);
-long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+long ntfsp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 #ifdef CONFIG_COMPAT
-long ntfs_compat_ioctl(struct file *filp, unsigned int cmd,
+long ntfsp_compat_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg);
 #endif
 

@@ -836,7 +836,7 @@ static int ntfs_ioctl_fitrim(struct ntfs_volume *vol, unsigned long arg)
 	return 0;
 }
 
-static long ntfsp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+long ntfsp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
 	case NTFS_IOC_SHUTDOWN:
@@ -853,10 +853,10 @@ static long ntfsp_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 }
 
 #ifdef CONFIG_COMPAT
-static long ntfsp_compat_ioctl(struct file *filp, unsigned int cmd,
+long ntfsp_compat_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg)
 {
-	return ntfs_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
+	return ntfsp_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
 }
 #endif
 

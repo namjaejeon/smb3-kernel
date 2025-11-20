@@ -20,6 +20,6 @@ int ntfsp_set_acl(struct mnt_idmap *idmap, struct dentry *dentry,
 int ntfsp_init_acl(struct mnt_idmap *idmap, struct inode *inode,
 		  struct inode *dir);
 #else
-#define ntfs_get_acl NULL
-#define ntfs_set_acl NULL
+#define ntfsp_get_acl NULL
+#define ntfsp_set_acl NULL
 #endif
