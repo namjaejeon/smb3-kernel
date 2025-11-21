@@ -129,7 +129,6 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 	unsigned long mft_no;
 	struct ntfs_inode *tni;
 	s64 lcn;
-	unsigned int lcn_folio_off = 0;
 	s64 vcn = (s64)folio->index << PAGE_SHIFT >> vol->cluster_size_bits;
 	s64 end_vcn = ni->allocated_size >> vol->cluster_size_bits;
 	unsigned int folio_sz;
@@ -146,11 +145,6 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 		return -EIO;
 	}
 
-	if (vol->cluster_size_bits > PAGE_SHIFT) {
-		lcn_folio_off = folio->index << PAGE_SHIFT;
-		lcn_folio_off &= vol->cluster_size_mask;
-	}
-
 	/* Map folio so we can access its contents. */
 	kaddr = kmap_local_folio(folio, 0);
 	/* Clear the page uptodate flag whilst the mst fixups are applied. */
@@ -161,6 +155,7 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 		/* Get the mft record number. */
 		mft_no = (((s64)folio->index << PAGE_SHIFT) + mft_ofs) >>
 			vol->mft_record_size_bits;
+		vcn = mft_no << vol->mft_record_size_bits >> vol->cluster_size_bits;
 		/* Check whether to write this mft record. */
 		tni = NULL;
 		if (ntfs_may_write_mft_record(vol, mft_no,
@@ -184,7 +179,7 @@ flush_bio:
 				bio = NULL;
 			}
 
-			if (vol->cluster_size == NTFS_BLOCK_SIZE) {
+			if (vol->cluster_size < folio_size(folio)) {
 				down_write(&ni->runlist.lock);
 				rl = ntfs_attr_vcn_to_rl(ni, vcn_off, &lcn);
 				up_write(&ni->runlist.lock);
@@ -192,13 +187,22 @@ flush_bio:
 					err = -EIO;
 					goto unm_done;
 				}
+
+				if (bio &&
+				   (bio_end_sector(bio) >> (vol->cluster_size_bits - 9)) !=
+				    lcn) {
+					flush_dcache_folio(folio);
+					submit_bio_wait(bio);
+					bio_put(bio);
+					bio = NULL;
+				}
 			}
 
 			if (!bio) {
-				unsigned int off = lcn_folio_off;
+				unsigned int off;
 
-				if (vol->cluster_size != NTFS_BLOCK_SIZE)
-					off += mft_ofs;
+				off = ((mft_no << vol->mft_record_size_bits) +
+				       mft_record_off) & vol->cluster_size_mask;
 
 				bio = ntfs_setup_bio(vol, REQ_OP_WRITE, lcn, off);
 				if (!bio) {
@@ -207,7 +211,10 @@ flush_bio:
 				}
 			}
 
-			if (vol->cluster_size == NTFS_BLOCK_SIZE && rl->length == 1)
+			if (vol->cluster_size == NTFS_BLOCK_SIZE &&
+			    (mft_record_off ||
+			     rl->length - (vcn_off - rl->vcn) == 1 ||
+			     mft_ofs + NTFS_BLOCK_SIZE >= PAGE_SIZE))
 				folio_sz = NTFS_BLOCK_SIZE;
 			else
 				folio_sz = vol->mft_record_size;
@@ -217,20 +224,19 @@ flush_bio:
 				bio_put(bio);
 				goto unm_done;
 			}
-			prev_mft_ofs = mft_ofs;
 			mft_record_off += folio_sz;
 
 			if (mft_record_off != vol->mft_record_size) {
 				vcn_off++;
 				goto flush_bio;
 			}
+			prev_mft_ofs = mft_ofs;
 
 			if (mft_no < vol->mftmirr_size)
 				ntfs_sync_mft_mirror(vol, mft_no,
 						(struct mft_record *)(kaddr + mft_ofs));
 		}
 
-		vcn += vol->mft_record_size >> vol->cluster_size_bits;
 	}
 
 	if (bio) {

@@ -552,7 +552,6 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 {
 	struct ntfs_volume *vol = ni->vol;
 	struct folio *folio = ni->folio;
-	unsigned int lcn_folio_off = 0;
 	int err = 0, i = 0;
 	u8 *kaddr;
 	struct mft_record *fixup_m;
@@ -574,13 +573,10 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 		goto done;
 
 	if (ni->mft_lcn[0] == LCN_RL_NOT_MAPPED) {
-		sector_t iblock;
 		s64 vcn;
-		unsigned char blocksize_bits = vol->sb->s_blocksize_bits;
 		struct runlist_element *rl;
 
-		iblock = (s64)folio->index << (PAGE_SHIFT - blocksize_bits);
-		vcn = ((s64)iblock << blocksize_bits) >> vol->cluster_size_bits;
+		vcn = (s64)ni->mft_no << vol->mft_record_size_bits >> vol->cluster_size_bits;
 
 		down_read(&NTFS_I(vol->mft_ino)->runlist.lock);
 		rl = NTFS_I(vol->mft_ino)->runlist.rl;
@@ -611,18 +607,16 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 		goto err_out;
 	}
 
+	folio_size = vol->mft_record_size / ni->mft_lcn_count;
 	while (i < ni->mft_lcn_count) {
-		folio_size = vol->mft_record_size / ni->mft_lcn_count;
+		unsigned int clu_off;
+
+		clu_off = (unsigned int)((s64)ni->mft_no * vol->mft_record_size + offset) &
+			vol->cluster_size_mask;
 
 		flush_dcache_folio(folio);
 
-		if (vol->cluster_size_bits > PAGE_SHIFT) {
-			lcn_folio_off = folio->index << PAGE_SHIFT;
-			lcn_folio_off &= vol->cluster_size_mask;
-		}
-
-		bio = ntfs_setup_bio(vol, REQ_OP_WRITE, ni->mft_lcn[i],
-				lcn_folio_off + ni->folio_ofs);
+		bio = ntfs_setup_bio(vol, REQ_OP_WRITE, ni->mft_lcn[i], clu_off);
 		if (!bio) {
 			err = -ENOMEM;
 			goto err_out;
@@ -1198,7 +1192,8 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 		u8 added_cluster:1;
 		u8 added_run:1;
 		u8 mp_rebuilt:1;
-	} status = { 0, 0, 0 };
+		u8 mp_extended:1;
+	} status = { 0, 0, 0, 0 };
 	size_t new_rl_count;
 
 	ntfs_debug("Extending mft bitmap allocation.");
@@ -1344,6 +1339,7 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 		ret = ntfs_mft_attr_extend(mftbmp_ni);
 		if (!ret)
 			goto extended_ok;
+		status.mp_extended = 1;
 		goto undo_alloc;
 	}
 	status.mp_rebuilt = 1;
@@ -1426,6 +1422,7 @@ undo_alloc:
 		/* Remove the last run from the runlist. */
 		rl->lcn = rl[1].lcn;
 		rl->length = 0;
+		mftbmp_ni->runlist.count--;
 	}
 	/* Deallocate the cluster. */
 	down_write(&vol->lcnbmp_lock);
@@ -1449,6 +1446,9 @@ undo_alloc:
 			NVolSetErrors(vol);
 		}
 		mark_mft_record_dirty(ctx->ntfs_ino);
+	} else if (status.mp_extended && ntfs_attr_update_mapping_pairs(mftbmp_ni, 0)) {
+		ntfs_error(vol->sb, "Failed to restore mapping pairs.%s", es);
+		NVolSetErrors(vol);
 	}
 	if (ctx)
 		ntfs_attr_put_search_ctx(ctx);
@@ -1618,7 +1618,7 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 	struct attr_record *a = NULL;
 	int ret, mp_size;
 	u32 old_alen = 0;
-	bool mp_rebuilt = false;
+	bool mp_rebuilt = false, mp_extended = false;
 	size_t new_rl_count;
 
 	ntfs_debug("Extending mft data allocation.");
@@ -1776,6 +1776,7 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 		ret = ntfs_mft_attr_extend(mft_ni);
 		if (!ret)
 			goto extended_ok;
+		mp_extended = true;
 		goto undo_alloc;
 	}
 	mp_rebuilt = true;
@@ -1854,6 +1855,11 @@ undo_alloc:
 
 	if (ntfs_rl_truncate_nolock(vol, &mft_ni->runlist, old_last_vcn)) {
 		ntfs_error(vol->sb, "Failed to truncate mft data attribute runlist.%s", es);
+		NVolSetErrors(vol);
+	}
+	if (mp_extended && ntfs_attr_update_mapping_pairs(mft_ni, 0)) {
+		ntfs_error(vol->sb, "Failed to restore mapping pairs.%s",
+			   es);
 		NVolSetErrors(vol);
 	}
 	if (ctx) {
