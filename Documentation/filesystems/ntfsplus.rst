@@ -196,4 +196,6 @@ hide_dot_files=<BOOL>	Hide names beginning with a dot ("."). By default dot
 windows_names=<BOOL>	Refuse creation/rename of files with characters or
 			reserved device names disallowed on Windows (e.g. CON,
 			NUL, AUX, COM1, LPT1, etc.). Default is off.
+discard=<BOOL>		Issue block device discard for clusters freed on
+			file deletion/truncation to inform underlying storage.
 ======================= =======================================================
