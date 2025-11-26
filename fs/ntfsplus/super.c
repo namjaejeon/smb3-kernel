@@ -124,6 +124,8 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_nls:
 	case Opt_charset:
+		if (vol->nls_map)
+			unload_nls(vol->nls_map);
 		vol->nls_map = load_nls(param->string);
 		if (!vol->nls_map) {
 			ntfs_error(vol->sb, "Failed to load NLS table '%s'.",
