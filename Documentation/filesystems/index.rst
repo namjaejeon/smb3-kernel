@@ -99,6 +99,7 @@ Documentation for filesystem implementations.
    nilfs2
    nfs/index
    ntfs3
+   ntfsplus
    ocfs2
    ocfs2-online-filecheck
    omfs
