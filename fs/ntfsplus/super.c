@@ -66,6 +66,7 @@ enum {
 	Opt_check_windows_names,
 	Opt_acl,
 	Opt_discard,
+	Opt_nocase,
 };
 
 static const struct fs_parameter_spec ntfs_parameters[] = {
@@ -90,6 +91,7 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_flag("acl",			Opt_acl),
 	fsparam_flag("discard",			Opt_discard),
 	fsparam_flag("sparse",			Opt_sparse),
+	fsparam_flag("nocase",			Opt_nocase),
 	{}
 };
 
@@ -158,6 +160,12 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 			NVolSetCaseSensitive(vol);
 		else
 			NVolClearCaseSensitive(vol);
+		break;
+	case Opt_nocase:
+		if (result.boolean)
+			NVolClearCaseSensitive(vol);
+		else
+			NVolSetCaseSensitive(vol);
 		break;
 	case Opt_preallocated_size:
 		vol->preallocated_size = (loff_t)result.uint_64;
@@ -2699,6 +2707,7 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 	};
 
 	NVolSetShowHiddenFiles(vol);
+	NVolSetCaseSensitive(vol);
 	init_rwsem(&vol->mftbmp_lock);
 	init_rwsem(&vol->lcnbmp_lock);
 

@@ -2380,6 +2380,8 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 	seq_printf(sf, ",iocharset=%s", vol->nls_map->charset);
 	if (NVolCaseSensitive(vol))
 		seq_puts(sf, ",case_sensitive");
+	else
+		seq_puts(sf, ",nocase");
 	if (NVolShowSystemFiles(vol))
 		seq_puts(sf, ",show_sys_files,showmeta");
 	for (i = 0; on_errors_arr[i].val; i++) {

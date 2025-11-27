@@ -129,15 +129,13 @@ show_sys_files=<BOOL>	If show_sys_files is specified, show the system files
 
 case_sensitive=<BOOL>	If case_sensitive is specified, treat all file names as
 			case sensitive and create file names in the POSIX
-			namespace.  Otherwise the default behaviour is to treat
-			file names as case insensitive and to create file names
-			in the WIN32/LONG name space.  Note, the Linux NTFS
+			namespace (default behavior). Note, the Linux NTFS
 			driver will never create short file names and will
 			remove them on rename/delete of the corresponding long
-			file name.
-			Note that files remain accessible via their short file
-			name, if it exists.  If case_sensitive, you will need
-			to provide the correct case of the short file name.
+			file name. Note that files remain accessible via their
+			short file name, if it exists.
+
+nocase=<BOOL>		If nocase is specified, treat file names case-insensitively.
 
 disable_sparse=<BOOL>	If disable_sparse is specified, creation of sparse
 			regions, i.e. holes, inside files is disabled for the
