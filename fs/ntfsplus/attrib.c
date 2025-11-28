@@ -4081,12 +4081,12 @@ static int ntfs_non_resident_attr_expand(struct ntfs_inode *ni, const s64 newsiz
 			if (NInoCompressed(ni)) {
 				int last = 0, i = 0;
 				s64 alloc_size;
-				int more_entries =
-					round_up(first_free_vcn -
+				u64 more_entries = round_up(first_free_vcn -
 						 (ni->allocated_size >>
 						  vol->cluster_size_bits),
-						 ni->itype.compressed.block_clusters) /
-					ni->itype.compressed.block_clusters;
+						 ni->itype.compressed.block_clusters);
+
+				do_div(more_entries, ni->itype.compressed.block_clusters);
 
 				while (ni->runlist.rl[last].length)
 					last++;

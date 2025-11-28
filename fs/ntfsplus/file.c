@@ -970,8 +970,8 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 		}
 
 		if ((end_vcn << vol->cluster_size_bits) > ni->allocated_size)
-			end_vcn = DIV_ROUND_UP(ni->allocated_size - 1,
-					       vol->cluster_size) + 1;
+			end_vcn = (round_up(ni->allocated_size - 1, vol->cluster_size) >>
+					vol->cluster_size_bits) + 1;
 		new_size = old_size -
 			((end_vcn - start_vcn) << vol->cluster_size_bits);
 		if (new_size < 0)
