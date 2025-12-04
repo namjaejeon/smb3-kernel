@@ -2718,7 +2718,7 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 
 static struct file_system_type ntfs_fs_type = {
 	.owner                  = THIS_MODULE,
-	.name                   = "ntfsplus",
+	.name                   = "ntfs",
 	.init_fs_context        = ntfs_init_fs_context,
 	.parameters             = ntfs_parameters,
 	.kill_sb                = kill_block_super,
@@ -2728,7 +2728,7 @@ MODULE_ALIAS_FS("ntfsplus");
 
 static int ntfs_workqueue_init(void)
 {
-	ntfs_wq = alloc_workqueue("ntfsplus-bg-io", 0, 0);
+	ntfs_wq = alloc_workqueue("ntfs-bg-io", 0, 0);
 	if (!ntfs_wq)
 		return -ENOMEM;
 	return 0;
@@ -2857,7 +2857,7 @@ module_exit(exit_ntfs_fs);
 
 MODULE_AUTHOR("Anton Altaparmakov <anton@tuxera.com>"); /* Original read-only NTFS driver */
 MODULE_AUTHOR("Namjae Jeon <linkinjeon@kernel.org>"); /* Add write, iomap and various features */
-MODULE_DESCRIPTION("NTFS+ read-write filesystem driver");
+MODULE_DESCRIPTION("NTFS read-write filesystem driver");
 MODULE_LICENSE("GPL");
 #ifdef DEBUG
 module_param(debug_msgs, bint, 0);
