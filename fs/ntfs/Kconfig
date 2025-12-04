@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
-config NTFSPLUS_FS
-	tristate "NTFS+ file system support"
+config NTFS_FS
+	tristate "NTFS file system support"
 	select NLS
 	help
 	  NTFS is the file system of Microsoft Windows NT, 2000, XP and 2003.
@@ -9,8 +9,8 @@ config NTFSPLUS_FS
 	  To compile this as a module, choose M here: the module will be called
 	  ntfsplus.
 
-config NTFSPLUS_DEBUG
-	bool "NTFS+ debugging support"
+config NTFS_DEBUG
+	bool "NTFS debugging support"
 	depends on NTFSPLUS_FS
 	help
 	  If you are experiencing any problems with the NTFS file system, say
@@ -31,8 +31,8 @@ config NTFSPLUS_DEBUG
 	  When reporting bugs, please try to have available a full dump of
 	  debugging messages while the misbehaviour was occurring.
 
-config NTFSPLUS_FS_POSIX_ACL
-	bool "NTFS+ POSIX Access Control Lists"
+config NTFS_FS_POSIX_ACL
+	bool "NTFS POSIX Access Control Lists"
 	depends on NTFSPLUS_FS
 	select FS_POSIX_ACL
 	help
