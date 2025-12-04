@@ -155,6 +155,23 @@ source "fs/exfat/Kconfig"
 source "fs/ntfs/Kconfig"
 source "fs/ntfs3/Kconfig"
 
+choice
+	prompt "Select built-in NTFS filesystem (only one can be built-in)"
+	default DEFAULT_NTFS
+	help
+	  Only one NTFS can be built into the kernel(y) when selecting a
+	  specific default. Both can still be built as modules(m).
+
+	config DEFAULT_NTFS_NONE
+		bool "No built-in restriction (allows both drivers as 'y')"
+
+	config DEFAULT_NTFS
+		bool "NTFS"
+
+	config DEFAULT_NTFS3
+		bool "NTFS3"
+endchoice
+
 endmenu
 endif # BLOCK
 
