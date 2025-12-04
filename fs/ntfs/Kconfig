@@ -7,11 +7,11 @@ config NTFS_FS
 	  This allows you to mount devices formatted with the ntfs file system.
 
 	  To compile this as a module, choose M here: the module will be called
-	  ntfsplus.
+	  ntfs.
 
 config NTFS_DEBUG
 	bool "NTFS debugging support"
-	depends on NTFSPLUS_FS
+	depends on NTFS_FS
 	help
 	  If you are experiencing any problems with the NTFS file system, say
 	  Y here.  This will result in additional consistency checks to be
@@ -33,7 +33,7 @@ config NTFS_DEBUG
 
 config NTFS_FS_POSIX_ACL
 	bool "NTFS POSIX Access Control Lists"
-	depends on NTFSPLUS_FS
+	depends on NTFS_FS
 	select FS_POSIX_ACL
 	help
 	  POSIX Access Control Lists (ACLs) support additional access rights

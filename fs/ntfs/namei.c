@@ -680,7 +680,7 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	set_nlink(vi, 1);
 	ntfs_set_vfs_operations(vi, mode, dev);
 
-#ifdef CONFIG_NTFSPLUS_FS_POSIX_ACL
+#ifdef CONFIG_NTFS_FS_POSIX_ACL
 	if (!S_ISLNK(mode) && (sb->s_flags & SB_POSIXACL)) {
 		err = ntfsp_init_acl(idmap, vi, dir);
 		if (err)
