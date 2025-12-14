@@ -1,7 +1,7 @@
 .. SPDX-License-Identifier: GPL-2.0
 
 =================================
-The Linux NTFS+ filesystem driver
+The Linux NTFS filesystem driver
 =================================
 
 
@@ -16,11 +16,10 @@ The Linux NTFS+ filesystem driver
 Overview
 ========
 
-The ntfsplus is an implementation that supports write and the current
+The new ntfs is an implementation that supports write and the current
 trends(iomap, no buffer-head) based on read-only classic NTFS.
 The old read-only ntfs code is much cleaner, with extensive comments,
-offers readability that makes understanding NTFS easier. This is why
-ntfsplus was developed on old read-only NTFS base.
+offers readability that makes understanding NTFS easier.
 The target is to provide current trends(iomap, no buffer head, folio),
 enhanced performance, stable maintenance, utility support including fsck.
 
@@ -53,7 +52,7 @@ Features
 
 - Stability improvement:
    a. Pass more xfstests tests:
-      ntfsplus implement fallocate, idmapped mount and permission, etc,
+      ntfs implement fallocate, idmapped mount and permission, etc,
       resulting in a significantly high number(287) of xfstests pass.
    b. Bonnie++ issue[3]:
       The Bonnie++ benchmark fails on ntfs3 with a "Directory not empty"
@@ -62,7 +61,7 @@ Features
       concurrently, index block merging or entry relocation can cause
       readdir() to skip some entries, leaving files undeleted in
       workloads(bonnie++) that mix unlink and directory scans.
-      ntfsplus implement leaf chain traversal in readdir to avoid entry skip
+      ntfs implement leaf chain traversal in readdir to avoid entry skip
       on deletion.
 
 
@@ -74,7 +73,7 @@ the fsck implementation. So we have launched a new ntfs utilitiies
 project called ntfsprogs-plus by forking from ntfs-3g after removing
 unnecessary ntfs fuse implementation. fsck.ntfs can be used for ntfs
 testing with xfstests as well as for recovering corrupted NTFS device.
-Download the following ntfsplus-plus and can use mkfs.ntfs and fsck.ntfs.
+Download the following ntfsprogs-plus and can use mkfs.ntfs and fsck.ntfs.
 
   https://github.com/ntfsprogs-plus/ntfsprogs-plus
 
