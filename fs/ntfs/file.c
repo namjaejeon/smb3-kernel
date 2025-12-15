@@ -22,7 +22,7 @@
 #include "aops.h"
 #include "reparse.h"
 #include "ea.h"
-#include "ntfs_iomap.h"
+#include "iomap.h"
 #include "misc.h"
 #include "bitmap.h"
 

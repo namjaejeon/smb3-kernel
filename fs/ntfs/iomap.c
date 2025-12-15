@@ -14,7 +14,7 @@
 #include "mft.h"
 #include "ntfs.h"
 #include "misc.h"
-#include "ntfs_iomap.h"
+#include "iomap.h"
 
 static void ntfs_iomap_put_folio(struct inode *inode, loff_t pos,
 		unsigned int len, struct folio *folio)
