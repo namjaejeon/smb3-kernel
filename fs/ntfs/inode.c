@@ -1768,8 +1768,8 @@ static int load_attribute_list_mount(struct ntfs_volume *vol,
 			goto err_out;
 		}
 
-		rl_byte_off = lcn << vol->cluster_size_bits;
-		rl_byte_len = rl->length << vol->cluster_size_bits;
+		rl_byte_off = NTFS_CLU_TO_B(vol, lcn);
+		rl_byte_len = NTFS_CLU_TO_B(vol, rl->length);
 
 		if (al + rl_byte_len > al_end)
 			rl_byte_len = al_end - al;
@@ -1896,7 +1896,7 @@ int ntfs_read_inode_mount(struct inode *vi)
 		nr_blocks = 1;
 
 	/* Load $MFT/$DATA's first mft record. */
-	err = ntfs_dev_read(sb, m, vol->mft_lcn << vol->cluster_size_bits, i);
+	err = ntfs_dev_read(sb, m, NTFS_CLU_TO_B(vol, vol->mft_lcn), i);
 	if (err) {
 		ntfs_error(sb, "Device read failed.");
 		goto err_out;
@@ -2112,8 +2112,8 @@ int ntfs_read_inode_mount(struct inode *vi)
 				goto put_err_out;
 			}
 			/* Get the last vcn in the $DATA attribute. */
-			last_vcn = le64_to_cpu(a->data.non_resident.allocated_size) >>
-				vol->cluster_size_bits;
+			last_vcn = NTFS_B_TO_CLU(vol,
+					le64_to_cpu(a->data.non_resident.allocated_size));
 			/* Fill in the inode size. */
 			vi->i_size = le64_to_cpu(a->data.non_resident.data_size);
 			ni->initialized_size = le64_to_cpu(a->data.non_resident.initialized_size);
@@ -3621,8 +3621,8 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 			s64 vcn;
 			struct runlist_element *rl;
 
-			lcn_count = max_t(s64, 1, attr_len >> vol->cluster_size_bits);
-			vcn = (s64)folio->index << PAGE_SHIFT >> vol->cluster_size_bits;
+			lcn_count = max_t(s64, 1, NTFS_B_TO_CLU(vol, attr_len));
+			vcn = NTFS_FOLIO_IDX_TO_CLUS(vol, folio->index);
 
 			do {
 				down_write(&ni->runlist.lock);
@@ -3655,7 +3655,7 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 				}
 
 				length = min_t(unsigned long,
-					       rl_length << vol->cluster_size_bits,
+					       NTFS_B_TO_CLU(vol, rl_length),
 					       folio_size(folio));
 				if (!bio_add_folio(bio, folio, length, offset)) {
 					ret = -EIO;
