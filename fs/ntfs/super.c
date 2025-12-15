@@ -787,19 +787,6 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
 	}
 	vol->nr_clusters = ll;
 	ntfs_debug("vol->nr_clusters = 0x%llx", vol->nr_clusters);
-	/*
-	 * On an architecture where unsigned long is 32-bits, we restrict the
-	 * volume size to 2TiB (2^41). On a 64-bit architecture, the compiler
-	 * will hopefully optimize the whole check away.
-	 */
-	if (sizeof(unsigned long) < 8) {
-		if (NTFS_CLU_TO_B(vol, ll) >= (1ULL << 41)) {
-			ntfs_error(vol->sb,
-				   "Volume size (%lluTiB) is too large for this architecture.  Maximum supported is 2TiB.",
-				   ll >> (40 - vol->cluster_size_bits));
-			return false;
-		}
-	}
 	ll = le64_to_cpu(b->mft_lcn);
 	if (ll >= vol->nr_clusters) {
 		ntfs_error(vol->sb, "MFT LCN (%lli, 0x%llx) is beyond end of volume.  Weird.",
