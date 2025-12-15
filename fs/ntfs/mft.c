@@ -104,9 +104,8 @@ static inline struct mft_record *map_mft_record_folio(struct ntfs_inode *ni)
 	 * The index into the page cache and the offset within the page cache
 	 * page of the wanted mft record.
 	 */
-	index = (u64)ni->mft_no << vol->mft_record_size_bits >>
-			PAGE_SHIFT;
-	ofs = (ni->mft_no << vol->mft_record_size_bits) & ~PAGE_MASK;
+	index = NTFS_MFT_REC_NR_TO_FOLIO_IDX(vol, ni->mft_no);
+	ofs = NTFS_MFT_REC_NR_TO_FOLIO_OFS(vol, ni->mft_no);
 
 	i_size = i_size_read(mft_vi);
 	/* The maximum valid index into the page cache for $MFT's data. */
@@ -463,8 +462,8 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const unsigned long mft_no,
 		goto err_out;
 	}
 	/* Get the page containing the mirror copy of the mft record @m. */
-	folio = ntfs_read_mapping_folio(vol->mftmirr_ino->i_mapping, mft_no >>
-			(PAGE_SHIFT - vol->mft_record_size_bits));
+	folio = ntfs_read_mapping_folio(vol->mftmirr_ino->i_mapping,
+			NTFS_MFT_REC_NR_TO_FOLIO_IDX(vol, mft_no));
 	if (IS_ERR(folio)) {
 		ntfs_error(vol->sb, "Failed to map mft mirror page.");
 		err = PTR_ERR(folio);
@@ -474,7 +473,7 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const unsigned long mft_no,
 	folio_lock(folio);
 	folio_clear_uptodate(folio);
 	/* Offset of the mft mirror record inside the page. */
-	folio_ofs = (mft_no << vol->mft_record_size_bits) & ~PAGE_MASK;
+	folio_ofs = NTFS_MFT_REC_NR_TO_FOLIO_OFS(vol, mft_no);
 	/* The address in the page of the mirror copy of the mft record @m. */
 	kmirr = kmap_local_folio(folio, 0) + folio_ofs;
 	/* Copy the mst protected mft record to the mirror. */
@@ -576,7 +575,7 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 		s64 vcn;
 		struct runlist_element *rl;
 
-		vcn = (s64)ni->mft_no << vol->mft_record_size_bits >> vol->cluster_size_bits;
+		vcn = NTFS_MFT_REC_NR_TO_CLU(vol, ni->mft_no);
 
 		down_read(&NTFS_I(vol->mft_ino)->runlist.lock);
 		rl = NTFS_I(vol->mft_ino)->runlist.rl;
@@ -1991,8 +1990,8 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 	 * The index into the page cache and the offset within the page cache
 	 * page of the wanted mft record.
 	 */
-	index = mft_no << vol->mft_record_size_bits >> PAGE_SHIFT;
-	ofs = (mft_no << vol->mft_record_size_bits) & ~PAGE_MASK;
+	index = NTFS_MFT_REC_NR_TO_FOLIO_IDX(vol, mft_no);
+	ofs = NTFS_MFT_REC_NR_TO_FOLIO_OFS(vol, mft_no);
 	/* The maximum valid index into the page cache for $MFT's data. */
 	i_size = i_size_read(mft_vi);
 	end_index = i_size >> PAGE_SHIFT;
@@ -2416,8 +2415,8 @@ mft_rec_already_initialized:
 	 * We now have allocated and initialized the mft record.  Calculate the
 	 * index of and the offset within the page cache page the record is in.
 	 */
-	index = bit << vol->mft_record_size_bits >> PAGE_SHIFT;
-	ofs = (bit << vol->mft_record_size_bits) & ~PAGE_MASK;
+	index = NTFS_MFT_REC_NR_TO_FOLIO_IDX(vol, bit);
+	ofs = NTFS_MFT_REC_NR_TO_FOLIO_OFS(vol, bit);
 	/* Read, map, and pin the folio containing the mft record. */
 	folio = ntfs_read_mapping_folio(vol->mft_ino->i_mapping, index);
 	if (IS_ERR(folio)) {

@@ -557,8 +557,8 @@ found_it2:
 			 * If vcn is in the same page cache page as old_vcn we
 			 * recycle the mapped page.
 			 */
-			if ((old_vcn << vol->cluster_size_bits >> PAGE_SHIFT) ==
-			    (vcn << vol->cluster_size_bits >> PAGE_SHIFT))
+			if (NTFS_CLU_TO_FOLIO_IDX(vol, old_vcn) ==
+			    NTFS_CLU_TO_FOLIO_IDX(vol, vcn))
 				goto fast_descend_into_child_node;
 			kfree(kaddr);
 			kaddr = NULL;

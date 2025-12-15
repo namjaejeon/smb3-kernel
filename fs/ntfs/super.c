@@ -793,7 +793,7 @@ static bool parse_ntfs_boot_sector(struct ntfs_volume *vol,
 	 * will hopefully optimize the whole check away.
 	 */
 	if (sizeof(unsigned long) < 8) {
-		if ((ll << vol->cluster_size_bits) >= (1ULL << 41)) {
+		if (NTFS_CLU_TO_B(vol, ll) >= (1ULL << 41)) {
 			ntfs_error(vol->sb,
 				   "Volume size (%lluTiB) is too large for this architecture.  Maximum supported is 2TiB.",
 				   ll >> (40 - vol->cluster_size_bits));
@@ -896,7 +896,7 @@ static void ntfs_setup_allocators(struct ntfs_volume *vol)
 	 * On non-standard volumes we do not protect it as the overhead would
 	 * be higher than the speed increase we would get by doing it.
 	 */
-	mft_lcn = (8192 + 2 * vol->cluster_size - 1) >> vol->cluster_size_bits;
+	mft_lcn = NTFS_B_TO_CLU(vol, 8192 + 2 * vol->cluster_size - 1);
 	if (mft_lcn * vol->cluster_size < 16 * 1024)
 		mft_lcn = (16 * 1024 + vol->cluster_size - 1) >>
 				vol->cluster_size_bits;
@@ -1079,8 +1079,8 @@ mft_unmap_out:
 	/* Construct the mft mirror runlist by hand. */
 	rl2[0].vcn = 0;
 	rl2[0].lcn = vol->mftmirr_lcn;
-	rl2[0].length = (vol->mftmirr_size * vol->mft_record_size +
-			vol->cluster_size - 1) >> vol->cluster_size_bits;
+	rl2[0].length = NTFS_B_TO_CLU(vol, vol->mftmirr_size * vol->mft_record_size +
+				vol->cluster_size - 1);
 	rl2[1].vcn = rl2[0].length;
 	rl2[1].lcn = LCN_ENOENT;
 	rl2[1].length = 0;

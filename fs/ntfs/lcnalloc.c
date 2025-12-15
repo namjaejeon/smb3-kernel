@@ -960,11 +960,11 @@ s64 __ntfs_cluster_free(struct ntfs_inode *ni, const s64 start_vcn, s64 count,
 				sector_t start_sector, end_sector;
 				int ret;
 
-				start_sector = ALIGN((rl->lcn + rl_off) << vol->cluster_size_bits,
+				start_sector = ALIGN(NTFS_CLU_TO_B(vol, rl->lcn + rl_off),
 						     gran) >> SECTOR_SHIFT;
-				end_sector = ALIGN_DOWN((rl->lcn + rl_off + to_discard) <<
-							vol->cluster_size_bits, gran) >>
-							SECTOR_SHIFT;
+				end_sector = ALIGN_DOWN(NTFS_CLU_TO_B(vol,
+							rl->lcn + rl_off + to_discard),
+							gran) >> SECTOR_SHIFT;
 				if (start_sector < end_sector) {
 					ret = blkdev_issue_discard(vol->sb->s_bdev, start_sector,
 								   end_sector - start_sector,

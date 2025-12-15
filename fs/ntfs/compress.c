@@ -639,8 +639,8 @@ lock_retry_remap:
 			goto map_rl_err;
 		}
 
-		page_ofs = (lcn << vol->cluster_size_bits) & ~PAGE_MASK;
-		page_index = (lcn << vol->cluster_size_bits) >> PAGE_SHIFT;
+		page_ofs = NTFS_CLU_TO_FOLIO_OFFS(vol, lcn);
+		page_index = NTFS_CLU_TO_FOLIO_IDX(vol, lcn);
 
 retry:
 		lpage = read_mapping_page(sb->s_bdev->bd_mapping,
@@ -1371,8 +1371,8 @@ static int ntfs_write_cb(struct ntfs_inode *ni, loff_t pos, struct page **pages,
 		bio_size = insz;
 	}
 
-	new_vcn = (pos & ~(ni->itype.compressed.block_size - 1)) >> vol->cluster_size_bits;
-	new_length = round_up(bio_size, vol->cluster_size) >> vol->cluster_size_bits;
+	new_vcn = NTFS_B_TO_CLU(vol, pos & ~(ni->itype.compressed.block_size - 1));
+	new_length = NTFS_B_TO_CLU(vol, round_up(bio_size, vol->cluster_size));
 
 	err = ntfs_non_resident_attr_punch_hole(ni, new_vcn, ni->itype.compressed.block_clusters);
 	if (err < 0)
