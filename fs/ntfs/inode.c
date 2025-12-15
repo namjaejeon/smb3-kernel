@@ -17,7 +17,7 @@
 #include "reparse.h"
 #include "ea.h"
 #include "attrib.h"
-#include "ntfs_iomap.h"
+#include "iomap.h"
 
 /**
  * ntfs_test_inode - compare two (possibly fake) inodes for equality

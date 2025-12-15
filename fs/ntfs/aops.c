@@ -16,7 +16,7 @@
 #include "mft.h"
 #include "ntfs.h"
 #include "misc.h"
-#include "ntfs_iomap.h"
+#include "iomap.h"
 
 static s64 ntfs_convert_page_index_into_lcn(struct ntfs_volume *vol, struct ntfs_inode *ni,
 		unsigned long page_index)
