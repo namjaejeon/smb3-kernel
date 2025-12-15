@@ -24,7 +24,7 @@ static s64 ntfs_convert_folio_index_into_lcn(struct ntfs_volume *vol, struct ntf
 	s64 vcn;
 	s64 lcn;
 
-	vcn = NTFS_FOLIO_IDX_TO_CLUS(vol, folio_index);
+	vcn = NTFS_FOLIO_IDX_TO_CLU(vol, folio_index);
 
 	down_read(&ni->runlist.lock);
 	lcn = ntfs_attr_vcn_to_lcn_nolock(ni, vcn, false);
@@ -391,7 +391,7 @@ hole:
 			return 0;
 		}
 	} else
-		block = ((NTFS_CLU_TO_B(vol, lcn) + delta) >>
+		block = (NTFS_CLU_TO_B(vol, lcn) + delta) >>
 				blocksize_bits;
 	ntfs_debug("Done (returning block 0x%llx).", (unsigned long long)lcn);
 	return block;
