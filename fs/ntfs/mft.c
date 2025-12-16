@@ -104,8 +104,8 @@ static inline struct mft_record *map_mft_record_folio(struct ntfs_inode *ni)
 	 * The index into the page cache and the offset within the page cache
 	 * page of the wanted mft record.
 	 */
-	index = NTFS_MFT_REC_NR_TO_FOLIO_IDX(vol, ni->mft_no);
-	ofs = NTFS_MFT_REC_NR_TO_FOLIO_OFS(vol, ni->mft_no);
+	index = NTFS_MFT_NR_TO_PIDX(vol, ni->mft_no);
+	ofs = NTFS_MFT_NR_TO_POFS(vol, ni->mft_no);
 
 	i_size = i_size_read(mft_vi);
 	/* The maximum valid index into the page cache for $MFT's data. */
@@ -463,7 +463,7 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const unsigned long mft_no,
 	}
 	/* Get the page containing the mirror copy of the mft record @m. */
 	folio = ntfs_read_mapping_folio(vol->mftmirr_ino->i_mapping,
-			NTFS_MFT_REC_NR_TO_FOLIO_IDX(vol, mft_no));
+			NTFS_MFT_NR_TO_PIDX(vol, mft_no));
 	if (IS_ERR(folio)) {
 		ntfs_error(vol->sb, "Failed to map mft mirror page.");
 		err = PTR_ERR(folio);
@@ -473,7 +473,7 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const unsigned long mft_no,
 	folio_lock(folio);
 	folio_clear_uptodate(folio);
 	/* Offset of the mft mirror record inside the page. */
-	folio_ofs = NTFS_MFT_REC_NR_TO_FOLIO_OFS(vol, mft_no);
+	folio_ofs = NTFS_MFT_NR_TO_POFS(vol, mft_no);
 	/* The address in the page of the mirror copy of the mft record @m. */
 	kmirr = kmap_local_folio(folio, 0) + folio_ofs;
 	/* Copy the mst protected mft record to the mirror. */
@@ -575,7 +575,7 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 		s64 vcn;
 		struct runlist_element *rl;
 
-		vcn = NTFS_MFT_REC_NR_TO_CLU(vol, ni->mft_no);
+		vcn = NTFS_MFT_NR_TO_CLU(vol, ni->mft_no);
 
 		down_read(&NTFS_I(vol->mft_ino)->runlist.lock);
 		rl = NTFS_I(vol->mft_ino)->runlist.rl;
@@ -1207,7 +1207,7 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 	ll = mftbmp_ni->allocated_size;
 	read_unlock_irqrestore(&mftbmp_ni->size_lock, flags);
 	rl = ntfs_attr_find_vcn_nolock(mftbmp_ni,
-			(ll - 1) >> vol->cluster_size_bits, NULL);
+			NTFS_B_TO_CLU(vol, ll - 1), NULL);
 	if (IS_ERR(rl) || unlikely(!rl->length || rl->lcn < 0)) {
 		up_write(&mftbmp_ni->runlist.lock);
 		ntfs_error(vol->sb,
@@ -1632,7 +1632,7 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 	ll = mft_ni->allocated_size;
 	read_unlock_irqrestore(&mft_ni->size_lock, flags);
 	rl = ntfs_attr_find_vcn_nolock(mft_ni,
-			(ll - 1) >> vol->cluster_size_bits, NULL);
+			NTFS_B_TO_CLU(vol, ll - 1), NULL);
 	if (IS_ERR(rl) || unlikely(!rl->length || rl->lcn < 0)) {
 		up_write(&mft_ni->runlist.lock);
 		ntfs_error(vol->sb,
@@ -1646,7 +1646,7 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 	lcn = rl->lcn + rl->length;
 	ntfs_debug("Last lcn of mft data attribute is 0x%llx.", lcn);
 	/* Minimum allocation is one mft record worth of clusters. */
-	min_nr = vol->mft_record_size >> vol->cluster_size_bits;
+	min_nr = NTFS_B_TO_CLU(vol, vol->mft_record_size);
 	if (!min_nr)
 		min_nr = 1;
 	/* Want to allocate 16 mft records worth of clusters. */
@@ -1657,10 +1657,10 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 	read_lock_irqsave(&mft_ni->size_lock, flags);
 	ll = mft_ni->allocated_size;
 	read_unlock_irqrestore(&mft_ni->size_lock, flags);
-	if (unlikely((ll + (nr << vol->cluster_size_bits)) >>
+	if (unlikely((ll + NTFS_CLU_TO_B(vol, nr)) >>
 			vol->mft_record_size_bits >= (1ll << 32))) {
 		nr = min_nr;
-		if (unlikely((ll + (nr << vol->cluster_size_bits)) >>
+		if (unlikely((ll + NTFS_CLU_TO_B(vol, nr)) >>
 				vol->mft_record_size_bits >= (1ll << 32))) {
 			ntfs_warning(vol->sb,
 				"Cannot allocate mft record because the maximum number of inodes (2^32) has already been reached.");
@@ -1815,7 +1815,7 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 
 extended_ok:
 	write_lock_irqsave(&mft_ni->size_lock, flags);
-	mft_ni->allocated_size += nr << vol->cluster_size_bits;
+	mft_ni->allocated_size += NTFS_CLU_TO_B(vol, nr);
 	a->data.non_resident.allocated_size =
 			cpu_to_le64(mft_ni->allocated_size);
 	write_unlock_irqrestore(&mft_ni->size_lock, flags);
@@ -1832,7 +1832,7 @@ restore_undo_alloc:
 		ntfs_error(vol->sb,
 			"Failed to find last attribute extent of mft data attribute.%s", es);
 		write_lock_irqsave(&mft_ni->size_lock, flags);
-		mft_ni->allocated_size += nr << vol->cluster_size_bits;
+		mft_ni->allocated_size += NTFS_CLU_TO_B(vol, nr);
 		write_unlock_irqrestore(&mft_ni->size_lock, flags);
 		ntfs_attr_put_search_ctx(ctx);
 		unmap_mft_record(mft_ni);
@@ -1990,8 +1990,8 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 	 * The index into the page cache and the offset within the page cache
 	 * page of the wanted mft record.
 	 */
-	index = NTFS_MFT_REC_NR_TO_FOLIO_IDX(vol, mft_no);
-	ofs = NTFS_MFT_REC_NR_TO_FOLIO_OFS(vol, mft_no);
+	index = NTFS_MFT_NR_TO_PIDX(vol, mft_no);
+	ofs = NTFS_MFT_NR_TO_POFS(vol, mft_no);
 	/* The maximum valid index into the page cache for $MFT's data. */
 	i_size = i_size_read(mft_vi);
 	end_index = i_size >> PAGE_SHIFT;
@@ -2415,8 +2415,8 @@ mft_rec_already_initialized:
 	 * We now have allocated and initialized the mft record.  Calculate the
 	 * index of and the offset within the page cache page the record is in.
 	 */
-	index = NTFS_MFT_REC_NR_TO_FOLIO_IDX(vol, bit);
-	ofs = NTFS_MFT_REC_NR_TO_FOLIO_OFS(vol, bit);
+	index = NTFS_MFT_NR_TO_PIDX(vol, bit);
+	ofs = NTFS_MFT_NR_TO_POFS(vol, bit);
 	/* Read, map, and pin the folio containing the mft record. */
 	folio = ntfs_read_mapping_folio(vol->mft_ino->i_mapping, index);
 	if (IS_ERR(folio)) {

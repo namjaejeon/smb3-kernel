@@ -24,7 +24,7 @@ static s64 ntfs_convert_folio_index_into_lcn(struct ntfs_volume *vol, struct ntf
 	s64 vcn;
 	s64 lcn;
 
-	vcn = NTFS_FOLIO_IDX_TO_CLU(vol, folio_index);
+	vcn = NTFS_PIDX_TO_CLU(vol, folio_index);
 
 	down_read(&ni->runlist.lock);
 	lcn = ntfs_attr_vcn_to_lcn_nolock(ni, vcn, false);
@@ -41,7 +41,7 @@ struct bio *ntfs_setup_bio(struct ntfs_volume *vol, blk_opf_t opf, s64 lcn,
 	bio = bio_alloc(vol->sb->s_bdev, 1, opf, GFP_NOIO);
 	if (!bio)
 		return NULL;
-	bio->bi_iter.bi_sector = ((lcn << vol->cluster_size_bits) + pg_ofs) >>
+	bio->bi_iter.bi_sector = (NTFS_CLU_TO_B(vol, lcn) + pg_ofs) >>
 		vol->sb->s_blocksize_bits;
 
 	return bio;
@@ -126,7 +126,7 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 	unsigned long mft_no;
 	struct ntfs_inode *tni;
 	s64 lcn;
-	s64 vcn = NTFS_FOLIO_IDX_TO_CLU(vol, folio->index);
+	s64 vcn = NTFS_PIDX_TO_CLU(vol, folio->index);
 	s64 end_vcn = NTFS_B_TO_CLU(vol, ni->allocated_size);
 	unsigned int folio_sz;
 	struct runlist_element *rl;
@@ -152,7 +152,7 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 		/* Get the mft record number. */
 		mft_no = (((s64)folio->index << PAGE_SHIFT) + mft_ofs) >>
 			vol->mft_record_size_bits;
-		vcn = NTFS_MFT_REC_NR_TO_CLU(vol, mft_no);
+		vcn = NTFS_MFT_NR_TO_CLU(vol, mft_no);
 		/* Check whether to write this mft record. */
 		tni = NULL;
 		if (ntfs_may_write_mft_record(vol, mft_no,

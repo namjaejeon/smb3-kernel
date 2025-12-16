@@ -3622,7 +3622,7 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 			struct runlist_element *rl;
 
 			lcn_count = max_t(s64, 1, NTFS_B_TO_CLU(vol, attr_len));
-			vcn = NTFS_FOLIO_IDX_TO_CLU(vol, folio->index);
+			vcn = NTFS_PIDX_TO_CLU(vol, folio->index);
 
 			do {
 				down_write(&ni->runlist.lock);

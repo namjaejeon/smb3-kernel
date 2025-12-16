@@ -37,24 +37,25 @@
 
 #define UCHAR_T_SIZE_BITS 1
 
-#define NTFS_B_TO_CLU(vol, b) (b >> (vol)->cluster_size_bits)
-#define NTFS_CLU_TO_B(vol, clu) ((u64)clu << (vol)->cluster_size_bits)
+#define NTFS_B_TO_CLU(vol, b) ((b) >> (vol)->cluster_size_bits)
+#define NTFS_CLU_TO_B(vol, clu) ((u64)(clu) << (vol)->cluster_size_bits)
+#define NTFS_B_TO_CLU_OFS(vol, clu) ((u64)(clu) & (vol)->cluster_size_mask)
 
-#define NTFS_MFT_REC_NR_TO_CLU(vol, mft_no) (((u64)mft_no << (vol)->mft_record_size_bits) >> \
-					     (vol)->cluster_size_bits)
-#define NTFS_MFT_REC_NR_TO_FOLIO_IDX(vol, mft_no) (mft_no >> (PAGE_SHIFT - \
-							      (vol)->mft_record_size_bits))
-#define NTFS_MFT_REC_NR_TO_FOLIO_OFS(vol, mft_no) (((u64)mft_no << (vol)->mft_record_size_bits) & \
-					     ~PAGE_MASK)
-
-#define NTFS_FOLIO_IDX_TO_BLK(vol, idx) (((u64)idx << PAGE_SHIFT) >> \
-					 ((vol)->sb)->s_blocksize_bits)
-#define NTFS_FOLIO_IDX_TO_CLU(vol, idx) (((u64)idx << PAGE_SHIFT) >> \
+#define NTFS_MFT_NR_TO_CLU(vol, mft_no) (((u64)mft_no << (vol)->mft_record_size_bits) >> \
 					 (vol)->cluster_size_bits)
-#define NTFS_CLU_TO_FOLIO_IDX(vol, clu) (((u64)clu << (vol)->cluster_size_bits) >> \
-					 PAGE_SHIFT)
-#define NTFS_CLU_TO_FOLIO_OFFS(vol, clu) (((u64)clu << (vol)->cluster_size_bits) & \
-					 ~PAGE_MASK)
+#define NTFS_MFT_NR_TO_PIDX(vol, mft_no) (mft_no >> (PAGE_SHIFT - \
+					  (vol)->mft_record_size_bits))
+#define NTFS_MFT_NR_TO_POFS(vol, mft_no) (((u64)mft_no << (vol)->mft_record_size_bits) & \
+					  ~PAGE_MASK)
+
+#define NTFS_PIDX_TO_BLK(vol, idx) (((u64)idx << PAGE_SHIFT) >> \
+				    ((vol)->sb)->s_blocksize_bits)
+#define NTFS_PIDX_TO_CLU(vol, idx) (((u64)idx << PAGE_SHIFT) >> \
+				    (vol)->cluster_size_bits)
+#define NTFS_CLU_TO_PIDX(vol, clu) (((u64)(clu) << (vol)->cluster_size_bits) >> \
+				    PAGE_SHIFT)
+#define NTFS_CLU_TO_POFS(vol, clu) (((u64)(clu) << (vol)->cluster_size_bits) & \
+				    ~PAGE_MASK)
 
 enum {
 	NTFS_BLOCK_SIZE		= 512,

@@ -94,8 +94,8 @@ static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t leng
 		loff_t vcn_ofs;
 		loff_t rl_length;
 
-		vcn = offset >> vol->cluster_size_bits;
-		vcn_ofs = offset & vol->cluster_size_mask;
+		vcn = NTFS_B_TO_CLU(vol, offset);
+		vcn_ofs = NTFS_B_TO_CLU_OFS(vol, offset);
 
 		down_write(&ni->runlist.lock);
 		rl = ntfs_attr_vcn_to_rl(ni, vcn, &lcn);
@@ -128,10 +128,10 @@ static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t leng
 				iomap->type = IOMAP_UNWRITTEN;
 			else
 				iomap->type = IOMAP_MAPPED;
-			iomap->addr = (lcn << vol->cluster_size_bits) + vcn_ofs;
+			iomap->addr = NTFS_CLU_TO_B(vol, lcn) + vcn_ofs;
 		}
 
-		rl_length = (rl->length - (vcn - rl->vcn)) << ni->vol->cluster_size_bits;
+		rl_length = NTFS_CLU_TO_B(vol, rl->length - (vcn - rl->vcn));
 
 		if (rl_length == 0 && rl->lcn > LCN_DELALLOC) {
 			ntfs_error(inode->i_sb,
@@ -238,9 +238,9 @@ static int ntfs_buffered_zeroed_clusters(struct inode *vi, s64 vcn)
 	pgoff_t idx, idx_end;
 	u32 from, to;
 
-	idx = (vcn << vol->cluster_size_bits) >> PAGE_SHIFT;
-	idx_end = ((vcn + 1) << vol->cluster_size_bits) >> PAGE_SHIFT;
-	from = (vcn << vol->cluster_size_bits) & ~PAGE_MASK;
+	idx = NTFS_CLU_TO_PIDX(vol, vcn);
+	idx_end = NTFS_CLU_TO_PIDX(vol, vcn + 1);
+	from = NTFS_CLU_TO_POFS(vol, vcn);
 	if (idx == idx_end)
 		idx_end++;
 
@@ -282,8 +282,8 @@ int ntfs_zeroed_clusters(struct inode *vi, s64 lcn, s64 num)
 	struct ntfs_volume *vol = ni->vol;
 	u32 to;
 	struct bio *bio = NULL;
-	s64 err = 0, zero_len = num << vol->cluster_size_bits;
-	s64 loc = lcn << vol->cluster_size_bits, curr = 0;
+	s64 err = 0, zero_len = NTFS_CLU_TO_B(vol, num);
+	s64 loc = NTFS_CLU_TO_B(vol, lcn), curr = 0;
 
 	while (zero_len > 0) {
 setup_bio:
@@ -339,10 +339,10 @@ static int __ntfs_write_iomap_begin(struct inode *inode, loff_t offset,
 		loff_t vcn_ofs;
 		loff_t rl_length;
 		s64 max_clu_count =
-			round_up(length, vol->cluster_size) >> vol->cluster_size_bits;
+			NTFS_B_TO_CLU(vol, round_up(length, vol->cluster_size));
 
-		vcn = offset >> vol->cluster_size_bits;
-		vcn_ofs = offset & vol->cluster_size_mask;
+		vcn = NTFS_B_TO_CLU(vol, offset);
+		vcn_ofs = NTFS_B_TO_CLU_OFS(vol, offset);
 
 		if (da) {
 			bool balloc = false;
@@ -365,7 +365,7 @@ static int __ntfs_write_iomap_begin(struct inode *inode, loff_t offset,
 			iomap->bdev = inode->i_sb->s_bdev;
 			iomap->offset = offset;
 
-			rl_length = lcn_count << ni->vol->cluster_size_bits;
+			rl_length = NTFS_CLU_TO_B(vol, lcn_count);
 			if (length > rl_length - vcn_ofs)
 				iomap->length = rl_length - vcn_ofs;
 			else
@@ -378,7 +378,7 @@ static int __ntfs_write_iomap_begin(struct inode *inode, loff_t offset,
 			if (balloc == true)
 				iomap->flags = IOMAP_F_NEW;
 
-			iomap->addr = (start_lcn << vol->cluster_size_bits) + vcn_ofs;
+			iomap->addr = NTFS_CLU_TO_B(vol, start_lcn);
 
 			if (balloc == true) {
 				if (flags & IOMAP_DIRECT || mapped == true) {
@@ -510,7 +510,7 @@ remap_rl:
 				if (lcn < LCN_DELALLOC)
 					ntfs_hold_dirty_clusters(vol, max_clu_count);
 
-				rl_length = max_clu_count << ni->vol->cluster_size_bits;
+				rl_length = NTFS_CLU_TO_B(vol, max_clu_count);
 				if (length > rl_length - vcn_ofs)
 					iomap->length = rl_length - vcn_ofs;
 				else
@@ -538,9 +538,9 @@ remap_rl:
 				mutex_unlock(&ni->mrec_lock);
 
 				iomap->type = IOMAP_MAPPED;
-				iomap->addr = (lcn << vol->cluster_size_bits) + vcn_ofs;
+				iomap->addr = NTFS_CLU_TO_B(vol, lcn) + vcn_ofs;
 
-				rl_length = max_clu_count << ni->vol->cluster_size_bits;
+				rl_length = NTFS_CLU_TO_B(vol, max_clu_count);
 				if (length > rl_length - vcn_ofs)
 					iomap->length = rl_length - vcn_ofs;
 				else

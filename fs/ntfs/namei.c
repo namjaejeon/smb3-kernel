@@ -565,7 +565,7 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 		ir->index_block_size = cpu_to_le32(ni->vol->index_record_size);
 		if (ni->vol->cluster_size <= ni->vol->index_record_size)
 			ir->clusters_per_index_block =
-				ni->vol->index_record_size >> ni->vol->cluster_size_bits;
+				NTFS_B_TO_CLU(vol, ni->vol->index_record_size);
 		else
 			ir->clusters_per_index_block =
 				ni->vol->index_record_size >> ni->vol->sector_size_bits;

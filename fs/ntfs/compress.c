@@ -485,15 +485,14 @@ int ntfs_read_compressed_block(struct folio *folio)
 	s64 end_vcn = ((((s64)(index + 1UL) << PAGE_SHIFT) + cb_size - 1)
 			& ~cb_size_mask) >> vol->cluster_size_bits;
 	/* Number of compression blocks (cbs) in the wanted vcn range. */
-	unsigned int nr_cbs = (end_vcn - start_vcn) << vol->cluster_size_bits
-			>> ni->itype.compressed.block_size_bits;
+	unsigned int nr_cbs = NTFS_CLU_TO_B(vol, end_vcn - start_vcn) >>
+		ni->itype.compressed.block_size_bits;
 	/*
 	 * Number of pages required to store the uncompressed data from all
 	 * compression blocks (cbs) overlapping @page. Due to alignment
 	 * guarantees of start_vcn and end_vcn, no need to round up here.
 	 */
-	unsigned int nr_pages = (end_vcn - start_vcn) <<
-			vol->cluster_size_bits >> PAGE_SHIFT;
+	unsigned int nr_pages = NTFS_CLU_TO_PIDX(vol, end_vcn - start_vcn);
 	unsigned int xpage, max_page, cur_page, cur_ofs, i, page_ofs, page_index;
 	unsigned int cb_clusters, cb_max_ofs;
 	int cb_max_page, err = 0;
@@ -528,7 +527,7 @@ int ntfs_read_compressed_block(struct folio *folio)
 	 * We have already been given one page, this is the one we must do.
 	 * Once again, the alignment guarantees keep it simple.
 	 */
-	offset = start_vcn << vol->cluster_size_bits >> PAGE_SHIFT;
+	offset = NTFS_CLU_TO_PIDX(vol, start_vcn);
 	xpage = index - offset;
 	pages[xpage] = page;
 	/*
@@ -639,8 +638,8 @@ lock_retry_remap:
 			goto map_rl_err;
 		}
 
-		page_ofs = NTFS_CLU_TO_FOLIO_OFFS(vol, lcn);
-		page_index = NTFS_CLU_TO_FOLIO_IDX(vol, lcn);
+		page_ofs = NTFS_CLU_TO_POFS(vol, lcn);
+		page_index = NTFS_CLU_TO_PIDX(vol, lcn);
 
 retry:
 		lpage = read_mapping_page(sb->s_bdev->bd_mapping,
