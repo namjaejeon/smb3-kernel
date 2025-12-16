@@ -75,8 +75,8 @@ const struct iomap_write_ops ntfs_iomap_folio_ops = {
 	.put_folio = ntfs_iomap_put_folio,
 };
 
-static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
-		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
+static int ntfs_read_iomap_begin_resident(struct inode *inode, loff_t offset,
+		unsigned int flags, struct iomap *iomap)
 {
 	struct ntfs_inode *base_ni, *ni = NTFS_I(inode);
 	struct ntfs_attr_search_ctx *ctx;
@@ -85,78 +85,6 @@ static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t leng
 	int err = 0;
 	char *kattr;
 	struct page *ipage;
-
-	if (NInoNonResident(ni)) {
-		s64 vcn;
-		s64 lcn;
-		struct runlist_element *rl;
-		struct ntfs_volume *vol = ni->vol;
-		loff_t vcn_ofs;
-		loff_t rl_length;
-
-		vcn = NTFS_B_TO_CLU(vol, offset);
-		vcn_ofs = NTFS_B_TO_CLU_OFS(vol, offset);
-
-		down_write(&ni->runlist.lock);
-		rl = ntfs_attr_vcn_to_rl(ni, vcn, &lcn);
-		if (IS_ERR(rl)) {
-			up_write(&ni->runlist.lock);
-			return PTR_ERR(rl);
-		}
-
-		if (flags & IOMAP_REPORT) {
-			if (lcn < LCN_HOLE) {
-				up_write(&ni->runlist.lock);
-				return -ENOENT;
-			}
-		} else if (lcn < LCN_ENOENT) {
-			up_write(&ni->runlist.lock);
-			return -EINVAL;
-		}
-
-		iomap->bdev = inode->i_sb->s_bdev;
-		iomap->offset = offset;
-
-		if (lcn <= LCN_DELALLOC) {
-			if (lcn == LCN_DELALLOC)
-				iomap->type = IOMAP_DELALLOC;
-			else
-				iomap->type = IOMAP_HOLE;
-			iomap->addr = IOMAP_NULL_ADDR;
-		} else {
-			if (!(flags & IOMAP_ZERO) && offset >= ni->initialized_size)
-				iomap->type = IOMAP_UNWRITTEN;
-			else
-				iomap->type = IOMAP_MAPPED;
-			iomap->addr = NTFS_CLU_TO_B(vol, lcn) + vcn_ofs;
-		}
-
-		rl_length = NTFS_CLU_TO_B(vol, rl->length - (vcn - rl->vcn));
-
-		if (rl_length == 0 && rl->lcn > LCN_DELALLOC) {
-			ntfs_error(inode->i_sb,
-				   "runlist(vcn : %lld, length : %lld, lcn : %lld) is corrupted\n",
-				   rl->vcn, rl->length, rl->lcn);
-			up_write(&ni->runlist.lock);
-			return -EIO;
-		}
-
-		if (rl_length && length > rl_length - vcn_ofs)
-			iomap->length = rl_length - vcn_ofs;
-		else
-			iomap->length = length;
-		up_write(&ni->runlist.lock);
-
-		if (!(flags & IOMAP_ZERO) &&
-		    iomap->type == IOMAP_MAPPED &&
-		    iomap->offset < ni->initialized_size &&
-		    iomap->offset + iomap->length > ni->initialized_size) {
-			iomap->length = round_up(ni->initialized_size, 1 << inode->i_blkbits) -
-				iomap->offset;
-		}
-		iomap->flags |= IOMAP_F_MERGED;
-		return 0;
-	}
 
 	if (NInoAttr(ni))
 		base_ni = ni->ext.base_ntfs_ino;
@@ -210,7 +138,99 @@ static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t leng
 out:
 	if (ctx)
 		ntfs_attr_put_search_ctx(ctx);
+
 	return err;
+}
+
+static int ntfs_read_iomap_begin_non_resident(struct inode *inode, loff_t offset,
+		loff_t length, unsigned int flags, struct iomap *iomap)
+{
+	struct ntfs_inode *ni = NTFS_I(inode);
+	s64 vcn;
+	s64 lcn;
+	struct runlist_element *rl;
+	struct ntfs_volume *vol = ni->vol;
+	loff_t vcn_ofs;
+	loff_t rl_length;
+
+	vcn = NTFS_B_TO_CLU(vol, offset);
+	vcn_ofs = NTFS_B_TO_CLU_OFS(vol, offset);
+
+	down_write(&ni->runlist.lock);
+	rl = ntfs_attr_vcn_to_rl(ni, vcn, &lcn);
+	if (IS_ERR(rl)) {
+		up_write(&ni->runlist.lock);
+		return PTR_ERR(rl);
+	}
+
+	if (flags & IOMAP_REPORT) {
+		if (lcn < LCN_HOLE) {
+			up_write(&ni->runlist.lock);
+			return -ENOENT;
+		}
+	} else if (lcn < LCN_ENOENT) {
+		up_write(&ni->runlist.lock);
+		return -EINVAL;
+	}
+
+	iomap->bdev = inode->i_sb->s_bdev;
+	iomap->offset = offset;
+
+	if (lcn <= LCN_DELALLOC) {
+		if (lcn == LCN_DELALLOC)
+			iomap->type = IOMAP_DELALLOC;
+		else
+			iomap->type = IOMAP_HOLE;
+		iomap->addr = IOMAP_NULL_ADDR;
+	} else {
+		if (!(flags & IOMAP_ZERO) && offset >= ni->initialized_size)
+			iomap->type = IOMAP_UNWRITTEN;
+		else
+			iomap->type = IOMAP_MAPPED;
+		iomap->addr = NTFS_CLU_TO_B(vol, lcn) + vcn_ofs;
+	}
+
+	rl_length = NTFS_CLU_TO_B(vol, rl->length - (vcn - rl->vcn));
+
+	if (rl_length == 0 && rl->lcn > LCN_DELALLOC) {
+		ntfs_error(inode->i_sb,
+				"runlist(vcn : %lld, length : %lld, lcn : %lld) is corrupted\n",
+				rl->vcn, rl->length, rl->lcn);
+		up_write(&ni->runlist.lock);
+		return -EIO;
+	}
+
+	if (rl_length && length > rl_length - vcn_ofs)
+		iomap->length = rl_length - vcn_ofs;
+	else
+		iomap->length = length;
+	up_write(&ni->runlist.lock);
+
+	if (!(flags & IOMAP_ZERO) &&
+			iomap->type == IOMAP_MAPPED &&
+			iomap->offset < ni->initialized_size &&
+			iomap->offset + iomap->length > ni->initialized_size) {
+		iomap->length = round_up(ni->initialized_size, 1 << inode->i_blkbits) -
+			iomap->offset;
+	}
+	iomap->flags |= IOMAP_F_MERGED;
+
+	return 0;
+}
+
+static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
+		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
+{
+	struct ntfs_inode *ni = NTFS_I(inode);
+	int ret;
+
+	if (NInoNonResident(ni))
+		ret = ntfs_read_iomap_begin_non_resident(inode, offset, length,
+				flags, iomap);
+	else
+		ret = ntfs_read_iomap_begin_resident(inode, offset, flags, iomap);
+
+	return ret;
 }
 
 static int ntfs_read_iomap_end(struct inode *inode, loff_t pos, loff_t length,
