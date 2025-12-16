@@ -39,8 +39,6 @@ struct bio *ntfs_setup_bio(struct ntfs_volume *vol, blk_opf_t opf, s64 lcn,
 	struct bio *bio;
 
 	bio = bio_alloc(vol->sb->s_bdev, 1, opf, GFP_NOIO);
-	if (!bio)
-		return NULL;
 	bio->bi_iter.bi_sector = (NTFS_CLU_TO_B(vol, lcn) + pg_ofs) >>
 		vol->sb->s_blocksize_bits;
 
