@@ -53,30 +53,7 @@ static s64 ntfs_convert_folio_index_into_lcn(struct ntfs_volume *vol, struct ntf
  */
 static int ntfs_read_folio(struct file *file, struct folio *folio)
 {
-	loff_t i_size;
-	struct inode *vi;
-	struct ntfs_inode *ni;
-
-	vi = folio->mapping->host;
-	i_size = i_size_read(vi);
-	/* Is the page fully outside i_size? (truncate in progress) */
-	if (unlikely(folio->index >= (i_size + PAGE_SIZE - 1) >>
-			PAGE_SHIFT)) {
-		folio_zero_segment(folio, 0, PAGE_SIZE);
-		ntfs_debug("Read outside i_size - truncated?");
-		folio_mark_uptodate(folio);
-		folio_unlock(folio);
-		return 0;
-	}
-	/*
-	 * This can potentially happen because we clear PageUptodate() during
-	 * ntfs_writepage() of MstProtected() attributes.
-	 */
-	if (folio_test_uptodate(folio)) {
-		folio_unlock(folio);
-		return 0;
-	}
-	ni = NTFS_I(vi);
+	struct ntfs_inode *ni = NTFS_I(folio->mapping->host);
 
 	/*
 	 * Only $DATA attributes can be encrypted and only unnamed $DATA
