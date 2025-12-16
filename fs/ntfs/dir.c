@@ -934,8 +934,7 @@ nextdir:
 
 		actor->pos = ie_pos;
 
-		index = (MREF_LE(next->data.dir.indexed_file) <<
-				vol->mft_record_size_bits) >> PAGE_SHIFT;
+		index = NTFS_MFT_NR_TO_PIDX(vol, MREF_LE(next->data.dir.indexed_file));
 		if (nir) {
 			struct ntfs_index_ra *cnir;
 			struct rb_node *node = ra_root.rb_node;
