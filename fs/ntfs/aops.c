@@ -33,18 +33,6 @@ static s64 ntfs_convert_folio_index_into_lcn(struct ntfs_volume *vol, struct ntf
 	return lcn;
 }
 
-struct bio *ntfs_setup_bio(struct ntfs_volume *vol, blk_opf_t opf, s64 lcn,
-		unsigned int pg_ofs)
-{
-	struct bio *bio;
-
-	bio = bio_alloc(vol->sb->s_bdev, 1, opf, GFP_NOIO);
-	bio->bi_iter.bi_sector = (NTFS_CLU_TO_B(vol, lcn) + pg_ofs) >>
-		vol->sb->s_blocksize_bits;
-
-	return bio;
-}
-
 /**
  * ntfs_read_folio - fill a @folio of a @file with data from the device
  * @file:	open file to which the folio @folio belongs or NULL
@@ -199,11 +187,10 @@ flush_bio:
 				off = ((mft_no << vol->mft_record_size_bits) +
 				       mft_record_off) & vol->cluster_size_mask;
 
-				bio = ntfs_setup_bio(vol, REQ_OP_WRITE, lcn, off);
-				if (!bio) {
-					err = -ENOMEM;
-					goto unm_done;
-				}
+				bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
+						GFP_NOIO);
+				bio->bi_iter.bi_sector =
+					NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, lcn) + off);
 			}
 
 			if (vol->cluster_size == NTFS_BLOCK_SIZE &&

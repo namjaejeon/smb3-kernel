@@ -1891,7 +1891,7 @@ int ntfs_read_inode_mount(struct inode *vi)
 	}
 
 	/* Determine the first block of the $MFT/$DATA attribute. */
-	nr_blocks = vol->mft_record_size >> sb->s_blocksize_bits;
+	nr_blocks = NTFS_B_TO_SECTOR(vol, vol->mft_record_size);
 	if (!nr_blocks)
 		nr_blocks = 1;
 
@@ -3647,12 +3647,11 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 					lcn_folio_off &= vol->cluster_size_mask;
 				}
 
-				bio = ntfs_setup_bio(vol, REQ_OP_WRITE, lcn,
-						lcn_folio_off);
-				if (!bio) {
-					ret = -ENOMEM;
-					goto err_unlock_folio;
-				}
+				bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
+						GFP_NOIO);
+				bio->bi_iter.bi_sector =
+					NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, lcn) +
+							 lcn_folio_off);
 
 				length = min_t(unsigned long,
 					       NTFS_B_TO_CLU(vol, rl_length),

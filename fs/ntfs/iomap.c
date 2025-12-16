@@ -291,7 +291,7 @@ setup_bio:
 			bio = bio_alloc(vol->sb->s_bdev,
 					bio_max_segs(DIV_ROUND_UP(zero_len, PAGE_SIZE)),
 					REQ_OP_WRITE | REQ_SYNC | REQ_IDLE, GFP_NOIO);
-			bio->bi_iter.bi_sector = (loc + curr) >> vol->sb->s_blocksize_bits;
+			bio->bi_iter.bi_sector = NTFS_B_TO_SECTOR(vol, loc + curr);
 		}
 
 		to = min_t(u32, zero_len, PAGE_SIZE);

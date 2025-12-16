@@ -57,6 +57,8 @@
 #define NTFS_CLU_TO_POFS(vol, clu) (((u64)(clu) << (vol)->cluster_size_bits) & \
 				    ~PAGE_MASK)
 
+#define NTFS_B_TO_SECTOR(vol, b) ((b) >> ((vol)->sb)->s_blocksize_bits)
+
 enum {
 	NTFS_BLOCK_SIZE		= 512,
 	NTFS_BLOCK_SIZE_BITS	= 9,

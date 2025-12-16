@@ -484,12 +484,10 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const unsigned long mft_no,
 		lcn_folio_off &= vol->cluster_size_mask;
 	}
 
-	bio = ntfs_setup_bio(vol, REQ_OP_WRITE, vol->mftmirr_lcn,
-			     lcn_folio_off + folio_ofs);
-	if (!bio) {
-		err = -ENOMEM;
-		goto unlock_folio;
-	}
+	bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
+	bio->bi_iter.bi_sector =
+		NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, vol->mftmirr_lcn) +
+				 lcn_folio_off + folio_ofs);
 
 	if (!bio_add_folio(bio, folio, vol->mft_record_size, folio_ofs)) {
 		err = -EIO;
@@ -615,11 +613,10 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 
 		flush_dcache_folio(folio);
 
-		bio = ntfs_setup_bio(vol, REQ_OP_WRITE, ni->mft_lcn[i], clu_off);
-		if (!bio) {
-			err = -ENOMEM;
-			goto err_out;
-		}
+		bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
+		bio->bi_iter.bi_sector =
+			NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, ni->mft_lcn[i]) +
+					 clu_off);
 
 		if (!bio_add_folio(bio, folio, folio_size,
 				   ni->folio_ofs + offset)) {

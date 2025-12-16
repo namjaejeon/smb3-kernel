@@ -1421,11 +1421,10 @@ static int ntfs_write_cb(struct ntfs_inode *ni, loff_t pos, struct page **pages,
 
 setup_bio:
 		if (!bio) {
-			bio = ntfs_setup_bio(vol, REQ_OP_WRITE, bio_lcn + i, 0);
-			if (!bio) {
-				err = -ENOMEM;
-				goto out;
-			}
+			bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
+					GFP_NOIO);
+			bio->bi_iter.bi_sector =
+				NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, bio_lcn + i));
 		}
 
 		if (!bio_add_page(bio, pages[i], page_size, 0)) {
