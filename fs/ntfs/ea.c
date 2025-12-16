@@ -669,12 +669,10 @@ static int ntfs_new_attr_flags(struct ntfs_inode *ni, __le32 fattr)
 		if (new_aflags & ATTR_IS_COMPRESSED) {
 			NInoSetCompressed(ni);
 			ni->flags |= FILE_ATTR_COMPRESSED;
-			VFS_I(ni)->i_mapping->a_ops = &ntfs_compressed_aops;
 		}
 	} else {
 		ni->flags &= ~(FILE_ATTR_SPARSE_FILE | FILE_ATTR_COMPRESSED);
 		a->data.non_resident.compression_unit = 0;
-		VFS_I(ni)->i_mapping->a_ops = &ntfs_normal_aops;
 		NInoClearSparse(ni);
 		NInoClearCompressed(ni);
 	}

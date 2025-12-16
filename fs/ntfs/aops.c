@@ -442,13 +442,7 @@ static int ntfs_swap_activate(struct swap_info_struct *sis,
 			&ntfs_read_iomap_ops);
 }
 
-/**
- * ntfs_normal_aops - address space operations for normal inodes and attributes
- *
- * Note these are not used for compressed or mst protected inodes and
- * attributes.
- */
-const struct address_space_operations ntfs_normal_aops = {
+const struct address_space_operations ntfs_aops = {
 	.read_folio		= ntfs_read_folio,
 	.readahead		= ntfs_readahead,
 	.writepages		= ntfs_writepages,
@@ -461,37 +455,6 @@ const struct address_space_operations ntfs_normal_aops = {
 	.release_folio		= iomap_release_folio,
 	.invalidate_folio	= iomap_invalidate_folio,
 	.swap_activate          = ntfs_swap_activate,
-};
-
-/**
- * ntfs_compressed_aops - address space operations for compressed inodes
- */
-const struct address_space_operations ntfs_compressed_aops = {
-	.read_folio		= ntfs_read_folio,
-	.direct_IO		= noop_direct_IO,
-	.writepages		= ntfs_writepages,
-	.dirty_folio		= iomap_dirty_folio,
-	.migrate_folio		= filemap_migrate_folio,
-	.is_partially_uptodate	= iomap_is_partially_uptodate,
-	.error_remove_folio	= generic_error_remove_folio,
-	.release_folio		= iomap_release_folio,
-	.invalidate_folio	= iomap_invalidate_folio,
-};
-
-/**
- * ntfs_mst_aops - general address space operations for mst protecteed inodes
- *		   and attributes
- */
-const struct address_space_operations ntfs_mst_aops = {
-	.read_folio		= ntfs_read_folio,	/* Fill page with data. */
-	.readahead		= ntfs_readahead,
-	.writepages		= ntfs_writepages,	/* Write dirty page to disk. */
-	.dirty_folio		= iomap_dirty_folio,
-	.migrate_folio		= filemap_migrate_folio,
-	.is_partially_uptodate	= iomap_is_partially_uptodate,
-	.error_remove_folio	= generic_error_remove_folio,
-	.release_folio		= iomap_release_folio,
-	.invalidate_folio	= iomap_invalidate_folio,
 };
 
 void mark_ntfs_record_dirty(struct folio *folio)

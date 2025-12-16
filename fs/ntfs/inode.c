@@ -618,15 +618,12 @@ void ntfs_set_vfs_operations(struct inode *inode, mode_t mode, dev_t dev)
 			inode->i_op = &ntfs_dir_inode_ops;
 			inode->i_fop = &ntfs_dir_ops;
 		}
-		if (NInoMstProtected(NTFS_I(inode)))
-			inode->i_mapping->a_ops = &ntfs_mst_aops;
-		else
-			inode->i_mapping->a_ops = &ntfs_normal_aops;
+		inode->i_mapping->a_ops = &ntfs_aops;
 		lockdep_set_class(&inode->i_mapping->invalidate_lock,
 				  &ntfs_dir_inval_lock_key);
 	} else if (S_ISLNK(mode)) {
 		inode->i_op = &ntfs_symlink_inode_operations;
-		inode->i_mapping->a_ops = &ntfs_normal_aops;
+		inode->i_mapping->a_ops = &ntfs_aops;
 	} else if (S_ISCHR(mode) || S_ISBLK(mode) || S_ISFIFO(mode) || S_ISSOCK(mode)) {
 		inode->i_op = &ntfsp_special_inode_operations;
 		init_special_inode(inode, inode->i_mode, dev);
@@ -635,12 +632,7 @@ void ntfs_set_vfs_operations(struct inode *inode, mode_t mode, dev_t dev)
 			inode->i_op = &ntfs_file_inode_ops;
 			inode->i_fop = &ntfs_file_ops;
 		}
-		if (NInoMstProtected(NTFS_I(inode)))
-			inode->i_mapping->a_ops = &ntfs_mst_aops;
-		else if (NInoCompressed(NTFS_I(inode)))
-			inode->i_mapping->a_ops = &ntfs_compressed_aops;
-		else
-			inode->i_mapping->a_ops = &ntfs_normal_aops;
+		inode->i_mapping->a_ops = &ntfs_aops;
 	}
 }
 
@@ -1419,11 +1411,7 @@ static int ntfs_read_locked_attr_inode(struct inode *base_vi, struct inode *vi)
 		ni->initialized_size = le64_to_cpu(a->data.non_resident.initialized_size);
 		ni->allocated_size = le64_to_cpu(a->data.non_resident.allocated_size);
 	}
-	vi->i_mapping->a_ops = &ntfs_normal_aops;
-	if (NInoMstProtected(ni))
-		vi->i_mapping->a_ops = &ntfs_mst_aops;
-	else if (NInoCompressed(ni))
-		vi->i_mapping->a_ops = &ntfs_compressed_aops;
+	vi->i_mapping->a_ops = &ntfs_aops;
 	if ((NInoCompressed(ni) || NInoSparse(ni)) && ni->type != AT_INDEX_ROOT)
 		vi->i_blocks = ni->itype.compressed.size >> 9;
 	else
@@ -1923,7 +1911,7 @@ int ntfs_read_inode_mount(struct inode *vi)
 	vi->i_generation = ni->seq_no = le16_to_cpu(m->sequence_number);
 
 	/* Provides read_folio() for map_mft_record(). */
-	vi->i_mapping->a_ops = &ntfs_mst_aops;
+	vi->i_mapping->a_ops = &ntfs_aops;
 
 	ctx = ntfs_attr_get_search_ctx(ni, m);
 	if (!ctx) {
