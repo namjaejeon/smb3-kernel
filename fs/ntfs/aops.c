@@ -371,10 +371,6 @@ static void ntfs_readahead(struct readahead_control *rac)
 		return;
 	}
 
-	if (NInoMstProtected(ni) &&
-	    (ni->mft_no == FILE_MFT || ni->mft_no == FILE_MFTMirr))
-		return;
-
 	iomap_readahead(rac, &ntfs_read_iomap_ops);
 }
 
