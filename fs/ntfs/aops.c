@@ -465,7 +465,6 @@ int ntfs_dev_read(struct super_block *sb, void *buf, loff_t start, loff_t size)
 	loff_t offset, end = start + size;
 	u32 from, to, buf_off = 0;
 	struct folio *folio;
-	char *kaddr;
 
 	idx = start >> PAGE_SHIFT;
 	idx_end = end >> PAGE_SHIFT;
@@ -481,13 +480,11 @@ int ntfs_dev_read(struct super_block *sb, void *buf, loff_t start, loff_t size)
 			return PTR_ERR(folio);
 		}
 
-		kaddr = kmap_local_folio(folio, 0);
 		offset = (loff_t)idx << PAGE_SHIFT;
 		to = min_t(u32, end - offset, PAGE_SIZE);
 
-		memcpy(buf + buf_off, kaddr + from, to);
+		memcpy_from_folio(buf + buf_off, folio, from, to);
 		buf_off += to;
-		kunmap_local(kaddr);
 		folio_put(folio);
 	}
 
@@ -501,7 +498,6 @@ int ntfs_dev_write(struct super_block *sb, void *buf, loff_t start,
 	loff_t offset, end = start + size;
 	u32 from, to, buf_off = 0;
 	struct folio *folio;
-	char *kaddr;
 
 	idx = start >> PAGE_SHIFT;
 	idx_end = end >> PAGE_SHIFT;
@@ -517,13 +513,11 @@ int ntfs_dev_write(struct super_block *sb, void *buf, loff_t start,
 			return PTR_ERR(folio);
 		}
 
-		kaddr = kmap_local_folio(folio, 0);
 		offset = (loff_t)idx << PAGE_SHIFT;
 		to = min_t(u32, end - offset, PAGE_SIZE);
 
-		memcpy(kaddr + from, buf + buf_off, to);
+		memcpy_to_folio(folio, from, buf + buf_off, to);
 		buf_off += to;
-		kunmap_local(kaddr);
 		folio_mark_uptodate(folio);
 		folio_mark_dirty(folio);
 		if (wait)
