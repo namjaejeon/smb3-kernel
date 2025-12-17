@@ -335,239 +335,245 @@ setup_bio:
 	return err;
 }
 
-static int __ntfs_write_iomap_begin(struct inode *inode, loff_t offset,
-				    loff_t length, unsigned int flags,
-				    struct iomap *iomap, bool da, bool mapped)
+static int ntfs_write_iomap_begin_non_resident(struct inode *inode, loff_t offset,
+		loff_t length, struct iomap *iomap)
 {
 	struct ntfs_inode *ni = NTFS_I(inode);
 	struct ntfs_volume *vol = ni->vol;
+	loff_t vcn_ofs, rl_length;
+	struct runlist_element *rl, *rlc;
+	bool is_retry = false;
+	int err;
+	s64 vcn, lcn;
+	s64 max_clu_count =
+		NTFS_B_TO_CLU(vol, round_up(length, vol->cluster_size));
+
+	vcn = NTFS_B_TO_CLU(vol, offset);
+	vcn_ofs = NTFS_B_TO_CLU_OFS(vol, offset);
+
+	down_read(&ni->runlist.lock);
+	rl = ni->runlist.rl;
+	if (!rl) {
+		up_read(&ni->runlist.lock);
+		err = ntfs_map_runlist(ni, vcn);
+		if (err) {
+			mutex_unlock(&ni->mrec_lock);
+			return -ENOENT;
+		}
+		down_read(&ni->runlist.lock);
+		rl = ni->runlist.rl;
+	}
+	up_read(&ni->runlist.lock);
+
+	down_write(&ni->runlist.lock);
+remap_rl:
+	/* Seek to element containing target vcn. */
+	while (rl->length && rl[1].vcn <= vcn)
+		rl++;
+	lcn = ntfs_rl_vcn_to_lcn(rl, vcn);
+
+	if (lcn <= LCN_RL_NOT_MAPPED && is_retry == false) {
+		is_retry = true;
+		if (!ntfs_map_runlist_nolock(ni, vcn, NULL)) {
+			rl = ni->runlist.rl;
+			goto remap_rl;
+		}
+	}
+
+	max_clu_count = min(max_clu_count, rl->length - (vcn - rl->vcn));
+	if (max_clu_count == 0) {
+		ntfs_error(inode->i_sb,
+				"runlist(vcn : %lld, length : %lld) is corrupted\n",
+				rl->vcn, rl->length);
+		up_write(&ni->runlist.lock);
+		mutex_unlock(&ni->mrec_lock);
+		return -EIO;
+	}
+
+	iomap->bdev = inode->i_sb->s_bdev;
+	iomap->offset = offset;
+
+	if (lcn <= LCN_DELALLOC) {
+		if (lcn < LCN_DELALLOC) {
+			max_clu_count =
+				ntfs_available_clusters_count(vol, max_clu_count);
+			if (max_clu_count < 0) {
+				err = max_clu_count;
+				up_write(&ni->runlist.lock);
+				mutex_unlock(&ni->mrec_lock);
+				return err;
+			}
+		}
+
+		iomap->type = IOMAP_DELALLOC;
+		iomap->addr = IOMAP_NULL_ADDR;
+
+		if (lcn <= LCN_HOLE) {
+			size_t new_rl_count;
+
+			rlc = ntfs_malloc_nofs(sizeof(struct runlist_element) * 2);
+			if (!rlc) {
+				up_write(&ni->runlist.lock);
+				mutex_unlock(&ni->mrec_lock);
+				return -ENOMEM;
+			}
+
+			rlc->vcn = vcn;
+			rlc->lcn = LCN_DELALLOC;
+			rlc->length = max_clu_count;
+
+			rlc[1].vcn = vcn + max_clu_count;
+			rlc[1].lcn = LCN_RL_NOT_MAPPED;
+			rlc[1].length = 0;
+
+			rl = ntfs_runlists_merge(&ni->runlist, rlc, 0,
+					&new_rl_count);
+			if (IS_ERR(rl)) {
+				ntfs_error(vol->sb, "Failed to merge runlists");
+				up_write(&ni->runlist.lock);
+				mutex_unlock(&ni->mrec_lock);
+				ntfs_free(rlc);
+				return PTR_ERR(rl);
+			}
+
+			ni->runlist.rl = rl;
+			ni->runlist.count = new_rl_count;
+			ni->i_dealloc_clusters += max_clu_count;
+		}
+		up_write(&ni->runlist.lock);
+		mutex_unlock(&ni->mrec_lock);
+
+		if (lcn < LCN_DELALLOC)
+			ntfs_hold_dirty_clusters(vol, max_clu_count);
+
+		rl_length = NTFS_CLU_TO_B(vol, max_clu_count);
+		if (length > rl_length - vcn_ofs)
+			iomap->length = rl_length - vcn_ofs;
+		else
+			iomap->length = length;
+
+		iomap->flags = IOMAP_F_NEW;
+		if (lcn <= LCN_HOLE) {
+			loff_t end = offset + length;
+
+			if (vcn_ofs || ((vol->cluster_size > iomap->length) &&
+						end < ni->initialized_size))
+				err = ntfs_buffered_zeroed_clusters(inode, vcn);
+			if (!err && max_clu_count > 1 &&
+					(iomap->length & vol->cluster_size_mask &&
+					 end < ni->initialized_size))
+				err = ntfs_buffered_zeroed_clusters(inode,
+						vcn + (max_clu_count - 1));
+			if (err) {
+				ntfs_release_dirty_clusters(vol, max_clu_count);
+				return err;
+			}
+		}
+	} else {
+		up_write(&ni->runlist.lock);
+		mutex_unlock(&ni->mrec_lock);
+
+		iomap->type = IOMAP_MAPPED;
+		iomap->addr = NTFS_CLU_TO_B(vol, lcn) + vcn_ofs;
+
+		rl_length = NTFS_CLU_TO_B(vol, max_clu_count);
+		if (length > rl_length - vcn_ofs)
+			iomap->length = rl_length - vcn_ofs;
+		else
+			iomap->length = length;
+	}
+
+	return 0;
+}
+
+static int ntfs_write_da_iomap_begin_non_resident(struct inode *inode, loff_t offset,
+		loff_t length, unsigned int flags, struct iomap *iomap, bool mapped)
+{
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct ntfs_volume *vol = ni->vol;
+	loff_t vcn_ofs, rl_length;
+	s64 vcn, start_lcn, lcn_count;
+	bool balloc = false, update_mp;
+	int err;
+	s64 max_clu_count =
+		NTFS_B_TO_CLU(vol, round_up(length, vol->cluster_size));
+
+	vcn = NTFS_B_TO_CLU(vol, offset);
+	vcn_ofs = NTFS_B_TO_CLU_OFS(vol, offset);
+
+	update_mp = (flags & IOMAP_DIRECT) || mapped ||
+		NInoAttr(ni) || ni->mft_no < FILE_first_user;
+	down_write(&ni->runlist.lock);
+	err = ntfs_attr_map_cluster(ni, vcn, &start_lcn, &lcn_count,
+			max_clu_count, &balloc, update_mp,
+			!(flags & IOMAP_DIRECT) && !mapped);
+	up_write(&ni->runlist.lock);
+	mutex_unlock(&ni->mrec_lock);
+	if (err) {
+		ni->i_dealloc_clusters = 0;
+		return err;
+	}
+
+	iomap->bdev = inode->i_sb->s_bdev;
+	iomap->offset = offset;
+
+	rl_length = NTFS_CLU_TO_B(vol, lcn_count);
+	if (length > rl_length - vcn_ofs)
+		iomap->length = rl_length - vcn_ofs;
+	else
+		iomap->length = length;
+
+	if (start_lcn == LCN_HOLE)
+		iomap->type = IOMAP_HOLE;
+	else
+		iomap->type = IOMAP_MAPPED;
+	if (balloc == true)
+		iomap->flags = IOMAP_F_NEW;
+
+	iomap->addr = NTFS_CLU_TO_B(vol, start_lcn);
+
+	if (balloc == true) {
+		if (flags & IOMAP_DIRECT || mapped == true) {
+			loff_t end = offset + length;
+
+			if (vcn_ofs || ((vol->cluster_size > iomap->length) &&
+						end < ni->initialized_size))
+				err = ntfs_zeroed_clusters(inode,
+						start_lcn, 1);
+			if (!err && lcn_count > 1 &&
+					(iomap->length & vol->cluster_size_mask &&
+					 end < ni->initialized_size))
+				err = ntfs_zeroed_clusters(inode,
+						start_lcn + (lcn_count - 1), 1);
+		} else {
+			if (lcn_count > ni->i_dealloc_clusters)
+				ni->i_dealloc_clusters = 0;
+			else
+				ni->i_dealloc_clusters -= lcn_count;
+		}
+		if (err < 0)
+			return err;
+	}
+
+	if (mapped && iomap->offset + iomap->length >
+			ni->initialized_size) {
+		err = ntfs_attr_set_initialized_size(ni, iomap->offset +
+				iomap->length);
+	}
+
+	return err;
+}
+
+static int ntfs_write_iomap_begin_resident(struct inode *inode, loff_t offset,
+		struct iomap *iomap)
+{
+	struct ntfs_inode *ni = NTFS_I(inode);
 	struct attr_record *a;
 	struct ntfs_attr_search_ctx *ctx;
 	u32 attr_len;
 	int err = 0;
 	char *kattr;
 	struct page *ipage;
-
-	if (NVolShutdown(vol))
-		return -EIO;
-
-	mutex_lock(&ni->mrec_lock);
-	if (NInoNonResident(ni)) {
-		s64 vcn;
-		loff_t vcn_ofs;
-		loff_t rl_length;
-		s64 max_clu_count =
-			NTFS_B_TO_CLU(vol, round_up(length, vol->cluster_size));
-
-		vcn = NTFS_B_TO_CLU(vol, offset);
-		vcn_ofs = NTFS_B_TO_CLU_OFS(vol, offset);
-
-		if (da) {
-			bool balloc = false;
-			s64 start_lcn, lcn_count;
-			bool update_mp;
-
-			update_mp = (flags & IOMAP_DIRECT) || mapped ||
-				NInoAttr(ni) || ni->mft_no < FILE_first_user;
-			down_write(&ni->runlist.lock);
-			err = ntfs_attr_map_cluster(ni, vcn, &start_lcn, &lcn_count,
-					max_clu_count, &balloc, update_mp,
-					!(flags & IOMAP_DIRECT) && !mapped);
-			up_write(&ni->runlist.lock);
-			mutex_unlock(&ni->mrec_lock);
-			if (err) {
-				ni->i_dealloc_clusters = 0;
-				return err;
-			}
-
-			iomap->bdev = inode->i_sb->s_bdev;
-			iomap->offset = offset;
-
-			rl_length = NTFS_CLU_TO_B(vol, lcn_count);
-			if (length > rl_length - vcn_ofs)
-				iomap->length = rl_length - vcn_ofs;
-			else
-				iomap->length = length;
-
-			if (start_lcn == LCN_HOLE)
-				iomap->type = IOMAP_HOLE;
-			else
-				iomap->type = IOMAP_MAPPED;
-			if (balloc == true)
-				iomap->flags = IOMAP_F_NEW;
-
-			iomap->addr = NTFS_CLU_TO_B(vol, start_lcn);
-
-			if (balloc == true) {
-				if (flags & IOMAP_DIRECT || mapped == true) {
-					loff_t end = offset + length;
-
-					if (vcn_ofs || ((vol->cluster_size > iomap->length) &&
-							end < ni->initialized_size))
-						err = ntfs_zeroed_clusters(inode,
-								start_lcn, 1);
-					if (!err && lcn_count > 1 &&
-					    (iomap->length & vol->cluster_size_mask &&
-					     end < ni->initialized_size))
-						err = ntfs_zeroed_clusters(inode,
-								start_lcn + (lcn_count - 1), 1);
-				} else {
-					if (lcn_count > ni->i_dealloc_clusters)
-						ni->i_dealloc_clusters = 0;
-					else
-						ni->i_dealloc_clusters -= lcn_count;
-				}
-				if (err < 0)
-					return err;
-			}
-
-			if (mapped && iomap->offset + iomap->length >
-			    ni->initialized_size) {
-				err = ntfs_attr_set_initialized_size(ni, iomap->offset +
-								     iomap->length);
-				if (err)
-					return err;
-			}
-		} else {
-			struct runlist_element *rl, *rlc;
-			s64 lcn;
-			bool is_retry = false;
-
-			down_read(&ni->runlist.lock);
-			rl = ni->runlist.rl;
-			if (!rl) {
-				up_read(&ni->runlist.lock);
-				err = ntfs_map_runlist(ni, vcn);
-				if (err) {
-					mutex_unlock(&ni->mrec_lock);
-					return -ENOENT;
-				}
-				down_read(&ni->runlist.lock);
-				rl = ni->runlist.rl;
-			}
-			up_read(&ni->runlist.lock);
-
-			down_write(&ni->runlist.lock);
-remap_rl:
-			/* Seek to element containing target vcn. */
-			while (rl->length && rl[1].vcn <= vcn)
-				rl++;
-			lcn = ntfs_rl_vcn_to_lcn(rl, vcn);
-
-			if (lcn <= LCN_RL_NOT_MAPPED && is_retry == false) {
-				is_retry = true;
-				if (!ntfs_map_runlist_nolock(ni, vcn, NULL)) {
-					rl = ni->runlist.rl;
-					goto remap_rl;
-				}
-			}
-
-			max_clu_count = min(max_clu_count, rl->length - (vcn - rl->vcn));
-			if (max_clu_count == 0) {
-				ntfs_error(inode->i_sb,
-					   "runlist(vcn : %lld, length : %lld) is corrupted\n",
-					   rl->vcn, rl->length);
-				up_write(&ni->runlist.lock);
-				mutex_unlock(&ni->mrec_lock);
-				return -EIO;
-			}
-
-			iomap->bdev = inode->i_sb->s_bdev;
-			iomap->offset = offset;
-
-			if (lcn <= LCN_DELALLOC) {
-				if (lcn < LCN_DELALLOC) {
-					max_clu_count =
-						ntfs_available_clusters_count(vol, max_clu_count);
-					if (max_clu_count < 0) {
-						err = max_clu_count;
-						up_write(&ni->runlist.lock);
-						mutex_unlock(&ni->mrec_lock);
-						return err;
-					}
-				}
-
-				iomap->type = IOMAP_DELALLOC;
-				iomap->addr = IOMAP_NULL_ADDR;
-
-				if (lcn <= LCN_HOLE) {
-					size_t new_rl_count;
-
-					rlc = ntfs_malloc_nofs(sizeof(struct runlist_element) * 2);
-					if (!rlc) {
-						up_write(&ni->runlist.lock);
-						mutex_unlock(&ni->mrec_lock);
-						return -ENOMEM;
-					}
-
-					rlc->vcn = vcn;
-					rlc->lcn = LCN_DELALLOC;
-					rlc->length = max_clu_count;
-
-					rlc[1].vcn = vcn + max_clu_count;
-					rlc[1].lcn = LCN_RL_NOT_MAPPED;
-					rlc[1].length = 0;
-
-					rl = ntfs_runlists_merge(&ni->runlist, rlc, 0,
-							&new_rl_count);
-					if (IS_ERR(rl)) {
-						ntfs_error(vol->sb, "Failed to merge runlists");
-						up_write(&ni->runlist.lock);
-						mutex_unlock(&ni->mrec_lock);
-						ntfs_free(rlc);
-						return PTR_ERR(rl);
-					}
-
-					ni->runlist.rl = rl;
-					ni->runlist.count = new_rl_count;
-					ni->i_dealloc_clusters += max_clu_count;
-				}
-				up_write(&ni->runlist.lock);
-				mutex_unlock(&ni->mrec_lock);
-
-				if (lcn < LCN_DELALLOC)
-					ntfs_hold_dirty_clusters(vol, max_clu_count);
-
-				rl_length = NTFS_CLU_TO_B(vol, max_clu_count);
-				if (length > rl_length - vcn_ofs)
-					iomap->length = rl_length - vcn_ofs;
-				else
-					iomap->length = length;
-
-				iomap->flags = IOMAP_F_NEW;
-				if (lcn <= LCN_HOLE) {
-					loff_t end = offset + length;
-
-					if (vcn_ofs || ((vol->cluster_size > iomap->length) &&
-							end < ni->initialized_size))
-						err = ntfs_buffered_zeroed_clusters(inode, vcn);
-					if (!err && max_clu_count > 1 &&
-					    (iomap->length & vol->cluster_size_mask &&
-					     end < ni->initialized_size))
-						err = ntfs_buffered_zeroed_clusters(inode,
-								vcn + (max_clu_count - 1));
-					if (err) {
-						ntfs_release_dirty_clusters(vol, max_clu_count);
-						return err;
-					}
-				}
-			} else {
-				up_write(&ni->runlist.lock);
-				mutex_unlock(&ni->mrec_lock);
-
-				iomap->type = IOMAP_MAPPED;
-				iomap->addr = NTFS_CLU_TO_B(vol, lcn) + vcn_ofs;
-
-				rl_length = NTFS_CLU_TO_B(vol, max_clu_count);
-				if (length > rl_length - vcn_ofs)
-					iomap->length = rl_length - vcn_ofs;
-				else
-					iomap->length = length;
-			}
-		}
-
-		return 0;
-	}
 
 	ctx = ntfs_attr_get_search_ctx(ni, NULL);
 	if (!ctx) {
@@ -605,9 +611,33 @@ remap_rl:
 out:
 	if (ctx)
 		ntfs_attr_put_search_ctx(ctx);
-	mutex_unlock(&ni->mrec_lock);
 
 	return err;
+}
+
+static int __ntfs_write_iomap_begin(struct inode *inode, loff_t offset,
+				    loff_t length, unsigned int flags,
+				    struct iomap *iomap, bool da, bool mapped)
+{
+	struct ntfs_inode *ni = NTFS_I(inode);
+	int ret;
+
+	if (NVolShutdown(ni->vol))
+		return -EIO;
+
+	mutex_lock(&ni->mrec_lock);
+	if (NInoNonResident(ni)) {
+		if (da)
+			ret = ntfs_write_da_iomap_begin_non_resident(inode,
+					offset, length, flags, iomap, mapped);
+		else
+			ret = ntfs_write_iomap_begin_non_resident(inode, offset,
+					length, iomap);
+	} else
+		ret = ntfs_write_iomap_begin_resident(inode, offset, iomap);
+	mutex_unlock(&ni->mrec_lock);
+
+	return ret;
 }
 
 static int ntfs_write_iomap_begin(struct inode *inode, loff_t offset,
