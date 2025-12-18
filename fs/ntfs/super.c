@@ -2763,7 +2763,7 @@ static int __init init_ntfs_fs(void)
 			sizeof(struct ntfs_attr_search_ctx), 0 /* offset */,
 			SLAB_HWCACHE_ALIGN, NULL /* ctor */);
 	if (!ntfs_attr_ctx_cache) {
-		pr_crit("ntfs+: Failed to create %s!\n",
+		pr_crit("NTFS: Failed to create %s!\n",
 			ntfs_attr_ctx_cache_name);
 		goto actx_err_out;
 	}
@@ -2801,10 +2801,10 @@ static int __init init_ntfs_fs(void)
 
 	err = register_filesystem(&ntfs_fs_type);
 	if (!err) {
-		ntfs_debug("ntfs+ driver registered successfully.");
+		ntfs_debug("NTFS driver registered successfully.");
 		return 0; /* Success! */
 	}
-	pr_crit("Failed to register ntfs+ filesystem driver!\n");
+	pr_crit("Failed to register NTFS filesystem driver!\n");
 
 	/* Unregister the ntfs sysctls. */
 	ntfs_sysctl(0);
@@ -2820,7 +2820,7 @@ actx_err_out:
 	kmem_cache_destroy(ntfs_index_ctx_cache);
 ictx_err_out:
 	if (!err) {
-		pr_crit("Aborting ntfs+ filesystem driver registration...\n");
+		pr_crit("Aborting NTFS filesystem driver registration...\n");
 		err = -ENOMEM;
 	}
 	return err;
@@ -2828,7 +2828,7 @@ ictx_err_out:
 
 static void __exit exit_ntfs_fs(void)
 {
-	ntfs_debug("Unregistering ntfs+ driver.");
+	ntfs_debug("Unregistering NTFS driver.");
 
 	unregister_filesystem(&ntfs_fs_type);
 
