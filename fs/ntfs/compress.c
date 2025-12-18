@@ -641,12 +641,9 @@ lock_retry_remap:
 		page_ofs = NTFS_CLU_TO_POFS(vol, lcn);
 		page_index = NTFS_CLU_TO_PIDX(vol, lcn);
 
-retry:
 		lpage = read_mapping_page(sb->s_bdev->bd_mapping,
 					  page_index, NULL);
-		if (PTR_ERR(page) == -EINTR)
-			goto retry;
-		else if (IS_ERR(lpage)) {
+		if (IS_ERR(lpage)) {
 			err = PTR_ERR(lpage);
 			mutex_unlock(&ntfs_cb_lock);
 			goto read_err;
@@ -1492,7 +1489,7 @@ int ntfs_compress_write(struct ntfs_inode *ni, loff_t pos, size_t count,
 		}
 
 		for (i = 0; i < pages_per_cb; i++) {
-			folio = ntfs_read_mapping_folio(mapping, index + i);
+			folio = read_mapping_folio(mapping, index + i, NULL);
 			if (IS_ERR(folio)) {
 				for (ip = 0; ip < i; ip++) {
 					folio_unlock(page_folio(pages[ip]));

@@ -261,7 +261,7 @@ static int ntfs_buffered_zeroed_clusters(struct inode *vi, s64 vcn)
 	to = min_t(u32, vol->cluster_size, PAGE_SIZE);
 	for (; idx < idx_end; idx++, from = 0) {
 		if (to != PAGE_SIZE) {
-			folio = ntfs_read_mapping_folio(mapping, idx);
+			folio = read_mapping_folio(mapping, idx, NULL);
 			if (IS_ERR(folio))
 				return PTR_ERR(folio);
 			folio_lock(folio);

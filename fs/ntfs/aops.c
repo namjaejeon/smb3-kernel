@@ -474,7 +474,7 @@ int ntfs_dev_read(struct super_block *sb, void *buf, loff_t start, loff_t size)
 		idx_end++;
 
 	for (; idx < idx_end; idx++, from = 0) {
-		folio = ntfs_read_mapping_folio(sb->s_bdev->bd_mapping, idx);
+		folio = read_mapping_folio(sb->s_bdev->bd_mapping, idx, NULL);
 		if (IS_ERR(folio)) {
 			ntfs_error(sb, "Unable to read %ld page", idx);
 			return PTR_ERR(folio);
@@ -507,7 +507,7 @@ int ntfs_dev_write(struct super_block *sb, void *buf, loff_t start,
 		idx_end++;
 
 	for (; idx < idx_end; idx++, from = 0) {
-		folio = ntfs_read_mapping_folio(sb->s_bdev->bd_mapping, idx);
+		folio = read_mapping_folio(sb->s_bdev->bd_mapping, idx, NULL);
 		if (IS_ERR(folio)) {
 			ntfs_error(sb, "Unable to read %ld page", idx);
 			return PTR_ERR(folio);

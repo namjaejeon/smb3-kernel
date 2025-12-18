@@ -369,7 +369,7 @@ static int ntfs_check_and_load_restart_page(struct inode *vi,
 		to_read = le32_to_cpu(rp->system_page_size) - size;
 		idx = (pos + size) >> PAGE_SHIFT;
 		do {
-			folio = ntfs_read_mapping_folio(vi->i_mapping, idx);
+			folio = read_mapping_folio(vi->i_mapping, idx, NULL);
 			if (IS_ERR(folio)) {
 				ntfs_error(vi->i_sb, "Error mapping LogFile page (index %lu).",
 						idx);
@@ -512,9 +512,11 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
 		pgoff_t idx = pos >> PAGE_SHIFT;
 
 		if (!folio || folio->index != idx) {
-			if (folio)
-				ntfs_unmap_folio(folio, kaddr);
-			folio = ntfs_read_mapping_folio(mapping, idx);
+			if (folio) {
+				kunmap_local(kaddr);
+				folio_put(folio);
+			}
+			folio = read_mapping_folio(mapping, idx, NULL);
 			if (IS_ERR(folio)) {
 				ntfs_error(vol->sb, "Error mapping LogFile page (index %lu).",
 						idx);
@@ -574,15 +576,18 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
 		 * find a valid one further in the file.
 		 */
 		if (err != -EINVAL) {
-			ntfs_unmap_folio(folio, kaddr);
+			kunmap_local(kaddr);
+			folio_put(folio);
 			goto err_out;
 		}
 		/* Continue looking. */
 		if (!pos)
 			pos = NTFS_BLOCK_SIZE >> 1;
 	}
-	if (folio)
-		ntfs_unmap_folio(folio, kaddr);
+	if (folio) {
+		kunmap_local(kaddr);
+		folio_put(folio);
+	}
 	if (logfile_is_empty) {
 		NVolSetLogFileEmpty(vol);
 is_empty:

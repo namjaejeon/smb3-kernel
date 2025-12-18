@@ -1000,20 +1000,22 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
 		/* Switch pages if necessary. */
 		if (!(i % mrecs_per_page)) {
 			if (index) {
-				ntfs_unmap_folio(mirr_folio, kmirr);
-				ntfs_unmap_folio(mft_folio, kmft);
+				kunmap_local(kmirr);
+				folio_put(mirr_folio);
+				kunmap_local(kmft);
+				folio_put(mft_folio);
 			}
 			/* Get the $MFT page. */
-			mft_folio = ntfs_read_mapping_folio(vol->mft_ino->i_mapping,
-					index);
+			mft_folio = read_mapping_folio(vol->mft_ino->i_mapping,
+					index, NULL);
 			if (IS_ERR(mft_folio)) {
 				ntfs_error(sb, "Failed to read $MFT.");
 				return false;
 			}
 			kmft = kmap_local_folio(mft_folio, 0);
 			/* Get the $MFTMirr page. */
-			mirr_folio = ntfs_read_mapping_folio(vol->mftmirr_ino->i_mapping,
-					index);
+			mirr_folio = read_mapping_folio(vol->mftmirr_ino->i_mapping,
+					index, NULL);
 			if (IS_ERR(mirr_folio)) {
 				ntfs_error(sb, "Failed to read $MFTMirr.");
 				goto mft_unmap_out;
@@ -1030,9 +1032,11 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
 					"Incomplete multi sector transfer detected in mft record %i.",
 					i);
 mm_unmap_out:
-				ntfs_unmap_folio(mirr_folio, kmirr);
+				kunmap_local(kmirr);
+				folio_put(mirr_folio);
 mft_unmap_out:
-				ntfs_unmap_folio(mft_folio, kmft);
+				kunmap_local(kmft);
+				folio_put(mft_folio);
 				return false;
 			}
 		}
@@ -1060,8 +1064,10 @@ mft_unmap_out:
 		kmirr += vol->mft_record_size;
 	} while (++i < vol->mftmirr_size);
 	/* Release the last folios. */
-	ntfs_unmap_folio(mirr_folio, kmirr);
-	ntfs_unmap_folio(mft_folio, kmft);
+	kunmap_local(kmirr);
+	folio_put(mirr_folio);
+	kunmap_local(kmft);
+	folio_put(mft_folio);
 
 	/* Construct the mft mirror runlist by hand. */
 	rl2[0].vcn = 0;
@@ -1197,7 +1203,7 @@ static int check_windows_hibernation_status(struct ntfs_volume *vol)
 		goto iput_out;
 	}
 
-	folio = ntfs_read_mapping_folio(vi->i_mapping, 0);
+	folio = read_mapping_folio(vi->i_mapping, 0, NULL);
 	if (IS_ERR(folio)) {
 		ntfs_error(vol->sb, "Failed to read from hiberfil.sys.");
 		ret = PTR_ERR(folio);
@@ -1220,7 +1226,8 @@ static int check_windows_hibernation_status(struct ntfs_volume *vol)
 	ntfs_debug("hiberfil.sys contains a zero header.  Windows is not hibernated on the volume.  This is the system volume.");
 	ret = 0;
 unm_iput_out:
-	ntfs_unmap_folio(folio, start_addr);
+	kunmap_local(start_addr);
+	folio_put(folio);
 iput_out:
 	iput(vi);
 	return ret;
@@ -1331,13 +1338,14 @@ static bool load_and_init_attrdef(struct ntfs_volume *vol)
 	while (index < max_index) {
 		/* Read the attrdef table and copy it into the linear buffer. */
 read_partial_attrdef_page:
-		folio = ntfs_read_mapping_folio(ino->i_mapping, index);
+		folio = read_mapping_folio(ino->i_mapping, index, NULL);
 		if (IS_ERR(folio))
 			goto free_iput_failed;
 		addr = kmap_local_folio(folio, 0);
 		memcpy((u8 *)vol->attrdef + (index++ << PAGE_SHIFT),
 				addr, size);
-		ntfs_unmap_folio(folio, addr);
+		kunmap_local(addr);
+		folio_put(folio);
 	}
 	if (size == PAGE_SIZE) {
 		size = i_size & ~PAGE_MASK;
@@ -1400,13 +1408,14 @@ static bool load_and_init_upcase(struct ntfs_volume *vol)
 	while (index < max_index) {
 		/* Read the upcase table and copy it into the linear buffer. */
 read_partial_upcase_page:
-		folio = ntfs_read_mapping_folio(ino->i_mapping, index);
+		folio = read_mapping_folio(ino->i_mapping, index, NULL);
 		if (IS_ERR(folio))
 			goto iput_upcase_failed;
 		addr = kmap_local_folio(folio, 0);
 		memcpy((char *)vol->upcase + (index++ << PAGE_SHIFT),
 				addr, size);
-		ntfs_unmap_folio(folio, addr);
+		kunmap_local(addr);
+		folio_put(folio);
 	};
 	if (size == PAGE_SIZE) {
 		size = i_size & ~PAGE_MASK;
@@ -2043,7 +2052,7 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 		if (IS_ERR(folio)) {
 			page_cache_sync_readahead(mapping, ra, NULL,
 				index, max_index - index);
-			folio = ntfs_read_mapping_folio(mapping, index);
+			folio = read_mapping_folio(mapping, index, NULL);
 			if (!IS_ERR(folio))
 				folio_lock(folio);
 		}
@@ -2164,7 +2173,7 @@ static unsigned long __get_nr_free_mft_records(struct ntfs_volume *vol,
 		if (IS_ERR(folio)) {
 			page_cache_sync_readahead(mapping, ra, NULL,
 				index, max_index - index);
-			folio = ntfs_read_mapping_folio(mapping, index);
+			folio = read_mapping_folio(mapping, index, NULL);
 			if (!IS_ERR(folio))
 				folio_lock(folio);
 		}

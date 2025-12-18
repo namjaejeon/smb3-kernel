@@ -287,7 +287,7 @@ found_it:
 
 	/*
 	 * We are done with the index root and the mft record. Release them,
-	 * otherwise we deadlock with ntfs_read_mapping_folio().
+	 * otherwise we deadlock with read_mapping_folio().
 	 */
 	ntfs_attr_put_search_ctx(ctx);
 	unmap_mft_record(dir_ni);
@@ -307,8 +307,8 @@ descend_into_child_node:
 	 * of PAGE_SIZE and map the page cache page, reading it from
 	 * disk if necessary.
 	 */
-	folio = ntfs_read_mapping_folio(ia_mapping, vcn <<
-			dir_ni->itype.index.vcn_size_bits >> PAGE_SHIFT);
+	folio = read_mapping_folio(ia_mapping, vcn <<
+			dir_ni->itype.index.vcn_size_bits >> PAGE_SHIFT, NULL);
 	if (IS_ERR(folio)) {
 		ntfs_error(sb, "Failed to map directory index page, error %ld.",
 				-PTR_ERR(folio));

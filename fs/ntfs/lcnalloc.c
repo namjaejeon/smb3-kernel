@@ -306,7 +306,8 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 				need_writeback = 0;
 			}
 			folio_unlock(folio);
-			ntfs_unmap_folio(folio, buf);
+			kunmap_local(buf);
+			folio_put(folio);
 			folio = NULL;
 		}
 
@@ -322,7 +323,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 		if (vol->lcn_empty_bits_per_page[index] == 0)
 			goto next_bmp_pos;
 
-		folio = ntfs_read_mapping_folio(mapping, index);
+		folio = read_mapping_folio(mapping, index, NULL);
 		if (IS_ERR(folio)) {
 			err = PTR_ERR(folio);
 			ntfs_error(vol->sb, "Failed to map page.");
@@ -697,7 +698,8 @@ out:
 			need_writeback = 0;
 		}
 		folio_unlock(folio);
-		ntfs_unmap_folio(folio, buf);
+		kunmap_local(buf);
+		folio_put(folio);
 	}
 	if (likely(!err)) {
 		if (is_dealloc == true)

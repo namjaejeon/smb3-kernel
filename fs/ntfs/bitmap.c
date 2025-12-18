@@ -53,7 +53,7 @@ int ntfsp_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range)
 		if (IS_ERR(folio)) {
 			page_cache_sync_readahead(vol->lcnbmp_ino->i_mapping, ra, NULL,
 					index, end_index - index);
-			folio = ntfs_read_mapping_folio(vol->lcnbmp_ino->i_mapping, index);
+			folio = read_mapping_folio(vol->lcnbmp_ino->i_mapping, index, NULL);
 			if (!IS_ERR(folio))
 				folio_lock(folio);
 		}
@@ -150,7 +150,7 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 
 	/* Get the page containing the first bit (@start_bit). */
 	mapping = vi->i_mapping;
-	folio = ntfs_read_mapping_folio(mapping, index);
+	folio = read_mapping_folio(mapping, index, NULL);
 	if (IS_ERR(folio)) {
 		if (!is_rollback)
 			ntfs_error(vi->i_sb,
@@ -211,8 +211,9 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 		flush_dcache_folio(folio);
 		folio_mark_dirty(folio);
 		folio_unlock(folio);
-		ntfs_unmap_folio(folio, kaddr);
-		folio = ntfs_read_mapping_folio(mapping, ++index);
+		kunmap_local(kaddr);
+		folio_put(folio);
+		folio = read_mapping_folio(mapping, ++index, NULL);
 		if (IS_ERR(folio)) {
 			ntfs_error(vi->i_sb,
 				   "Failed to map subsequent page (error %li), aborting.",
@@ -258,7 +259,8 @@ done:
 	flush_dcache_folio(folio);
 	folio_mark_dirty(folio);
 	folio_unlock(folio);
-	ntfs_unmap_folio(folio, kaddr);
+	kunmap_local(kaddr);
+	folio_put(folio);
 	ntfs_debug("Done.");
 	return 0;
 rollback:

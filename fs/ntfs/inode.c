@@ -430,7 +430,7 @@ static void ntfs_destroy_extent_inode(struct ntfs_inode *ni)
 	if (!atomic_dec_and_test(&ni->count))
 		WARN_ON(1);
 	if (ni->folio)
-		ntfs_unmap_folio(ni->folio, NULL);
+		folio_put(ni->folio);
 	kfree(ni->mrec);
 	kmem_cache_free(ntfs_inode_cache, ni);
 }
@@ -2335,7 +2335,7 @@ release:
 	if (!atomic_dec_and_test(&ni->count))
 		WARN_ON(1);
 	if (ni->folio)
-		ntfs_unmap_folio(ni->folio, NULL);
+		folio_put(ni->folio);
 	kfree(ni->mrec);
 	ntfs_free(ni->target);
 }
@@ -3453,7 +3453,7 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 	index = pos >> PAGE_SHIFT;
 	do {
 		/* Update @index and get the next folio. */
-		folio = ntfs_read_mapping_folio(mapping, index);
+		folio = read_mapping_folio(mapping, index, NULL);
 		if (IS_ERR(folio))
 			break;
 
@@ -3586,18 +3586,33 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 
 	index = pos >> PAGE_SHIFT;
 	while (count) {
-		folio = ntfs_read_mapping_folio(mapping, index);
-		if (IS_ERR(folio)) {
-			ret = PTR_ERR(folio);
-			ntfs_error(vi->i_sb, "Failed to read a page %lu for attr %#x: %ld",
-				   index, ni->type, PTR_ERR(folio));
-			break;
+		if (count == PAGE_SIZE) {
+			folio = __filemap_get_folio(vi->i_mapping, index,
+					FGP_CREAT | FGP_LOCK,
+					mapping_gfp_mask(mapping));
+			if (IS_ERR(folio)) {
+				ret = -ENOMEM;
+				break;
+			}
+		} else {
+			folio = read_mapping_folio(mapping, index, NULL);
+			if (IS_ERR(folio)) {
+				ret = PTR_ERR(folio);
+				ntfs_error(vi->i_sb, "Failed to read a page %lu for attr %#x: %ld",
+						index, ni->type, PTR_ERR(folio));
+				break;
+			}
+
+			folio_lock(folio);
 		}
 
-		folio_lock(folio);
-		offset = offset_in_folio(folio, pos);
-		attr_len = min_t(size_t, (size_t)count, folio_size(folio) - offset);
-
+		if (count == PAGE_SIZE) {
+			offset = 0;
+			attr_len = count;
+		} else {
+			offset = offset_in_folio(folio, pos);
+			attr_len = min_t(size_t, (size_t)count, folio_size(folio) - offset);
+		}
 		memcpy_to_folio(folio, offset, buf, attr_len);
 
 		if (sync) {
@@ -3657,8 +3672,10 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 			} while (lcn_count != 0);
 
 			folio_mark_uptodate(folio);
-		} else
+		} else {
+			folio_mark_uptodate(folio);
 			folio_mark_dirty(folio);
+		}
 err_unlock_folio:
 		folio_unlock(folio);
 		folio_put(folio);
