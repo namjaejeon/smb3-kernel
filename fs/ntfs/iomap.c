@@ -524,7 +524,7 @@ static int ntfs_write_da_iomap_begin_non_resident(struct inode *inode, loff_t of
 	if (balloc == true)
 		iomap->flags = IOMAP_F_NEW;
 
-	iomap->addr = NTFS_CLU_TO_B(vol, start_lcn);
+	iomap->addr = NTFS_CLU_TO_B(vol, start_lcn) + vcn_ofs;
 
 	if (balloc == true) {
 		if (flags & IOMAP_DIRECT || mapped == true) {

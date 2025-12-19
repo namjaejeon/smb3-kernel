@@ -3657,7 +3657,7 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 							 lcn_folio_off);
 
 				length = min_t(unsigned long,
-					       NTFS_B_TO_CLU(vol, rl_length),
+					       NTFS_CLU_TO_B(vol, rl_length),
 					       folio_size(folio));
 				if (!bio_add_folio(bio, folio, length, offset)) {
 					ret = -EIO;
