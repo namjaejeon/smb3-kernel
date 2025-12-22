@@ -74,7 +74,8 @@ static int ntfs_read_folio(struct file *file, struct folio *folio)
 			return ntfs_read_compressed_block(folio);
 	}
 
-	return iomap_read_folio(folio, &ntfs_read_iomap_ops);
+	iomap_bio_read_folio(folio, &ntfs_read_iomap_ops);
+	return 0;
 }
 
 static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
@@ -371,7 +372,7 @@ static void ntfs_readahead(struct readahead_control *rac)
 		return;
 	}
 
-	iomap_readahead(rac, &ntfs_read_iomap_ops);
+	iomap_bio_readahead(rac, &ntfs_read_iomap_ops);
 }
 
 static int ntfs_mft_writepage(struct folio *folio, struct writeback_control *wbc)

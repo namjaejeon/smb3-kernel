@@ -490,7 +490,7 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	 * Caller must call d_instantiate_new instead of d_instantiate.
 	 */
 	spin_lock(&vi->i_lock);
-	vi->i_state = I_NEW | I_CREATING;
+	inode_state_set(vi, I_NEW | I_CREATING);
 	spin_unlock(&vi->i_lock);
 
 	/* Add the inode to the inode hash for the superblock. */
