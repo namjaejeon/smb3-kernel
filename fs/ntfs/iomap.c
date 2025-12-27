@@ -16,6 +16,10 @@
 #include "misc.h"
 #include "iomap.h"
 
+/*
+ * ioomap_zero_range is called for an area beyond the initialized size,
+ * garbage values may be read, so zeroing out is needed.
+ */
 static void ntfs_iomap_put_folio(struct inode *inode, loff_t pos,
 		unsigned int len, struct folio *folio)
 {
