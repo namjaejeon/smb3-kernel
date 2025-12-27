@@ -169,7 +169,7 @@ static inline void *__ntfs_malloc(unsigned long size, gfp_t gfp_mask)
  */
 static inline void *ntfs_malloc_nofs(unsigned long size)
 {
-	return __ntfs_malloc(size, GFP_NOFS | __GFP_HIGHMEM | __GFP_ZERO);
+	return __ntfs_malloc(size, GFP_NOFS | __GFP_ZERO);
 }
 
 /**
@@ -186,7 +186,7 @@ static inline void *ntfs_malloc_nofs(unsigned long size)
  */
 static inline void *ntfs_malloc_nofs_nofail(unsigned long size)
 {
-	return __ntfs_malloc(size, GFP_NOFS | __GFP_HIGHMEM | __GFP_NOFAIL);
+	return __ntfs_malloc(size, GFP_NOFS | __GFP_NOFAIL);
 }
 
 static inline void ntfs_free(void *addr)
