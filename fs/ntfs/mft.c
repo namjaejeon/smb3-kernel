@@ -571,30 +571,6 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 	if (!NInoTestClearDirty(ni))
 		goto done;
 
-	if (ni->mft_lcn[0] == LCN_RL_NOT_MAPPED) {
-		s64 vcn;
-		struct runlist_element *rl;
-
-		vcn = NTFS_MFT_NR_TO_CLU(vol, ni->mft_no);
-
-		down_read(&NTFS_I(vol->mft_ino)->runlist.lock);
-		rl = NTFS_I(vol->mft_ino)->runlist.rl;
-
-		/* Seek to element containing target vcn. */
-		while (rl->length && rl[1].vcn <= vcn)
-			rl++;
-		ni->mft_lcn[0] = ntfs_rl_vcn_to_lcn(rl, vcn);
-		ni->mft_lcn_count++;
-
-		if (vol->cluster_size < vol->mft_record_size &&
-		    (rl->length - (vcn - rl->vcn)) <= 1) {
-			rl++;
-			ni->mft_lcn[1] = ntfs_rl_vcn_to_lcn(rl, vcn + 1);
-			ni->mft_lcn_count++;
-		}
-		up_read(&NTFS_I(vol->mft_ino)->runlist.lock);
-	}
-
 	kaddr = kmap_local_folio(folio, 0);
 	fixup_m = (struct mft_record *)(kaddr + ni->folio_ofs);
 	memcpy(fixup_m, m, vol->mft_record_size);
@@ -2656,6 +2632,12 @@ int ntfs_mft_record_free(struct ntfs_volume *vol, struct ntfs_inode *ni)
 	else if (seq_no)
 		seq_no++;
 	ni_mrec->sequence_number = cpu_to_le16(seq_no);
+
+	err = ntfs_get_block_mft_record(NTFS_I(vol->mft_ino), ni);
+	if (err) {
+		unmap_mft_record(ni);
+		return err;
+	}
 
 	/*
 	 * Set the ntfs inode dirty and write it out.  We do not need to worry

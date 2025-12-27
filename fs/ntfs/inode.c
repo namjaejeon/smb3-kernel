@@ -2672,6 +2672,38 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
 	return err;
 }
 
+int ntfs_get_block_mft_record(struct ntfs_inode *mft_ni, struct ntfs_inode *ni)
+{
+	s64 vcn;
+	struct runlist_element *rl;
+
+	if (ni->mft_lcn[0] != LCN_RL_NOT_MAPPED)
+		return 0;
+
+	vcn = (s64)ni->mft_no << mft_ni->vol->mft_record_size_bits >>
+	      mft_ni->vol->cluster_size_bits;
+
+	rl = mft_ni->runlist.rl;
+	if (!rl) {
+		ntfs_error(mft_ni->vol->sb, "$MFT runlist is not present");
+		return -EIO;
+	}
+
+	/* Seek to element containing target vcn. */
+	while (rl->length && rl[1].vcn <= vcn)
+		rl++;
+	ni->mft_lcn[0] = ntfs_rl_vcn_to_lcn(rl, vcn);
+	ni->mft_lcn_count = 1;
+
+	if (mft_ni->vol->cluster_size < mft_ni->vol->mft_record_size &&
+	    (rl->length - (vcn - rl->vcn)) <= 1) {
+		rl++;
+		ni->mft_lcn[1] = ntfs_rl_vcn_to_lcn(rl, vcn + 1);
+		ni->mft_lcn_count++;
+	}
+	return 0;
+}
+
 /**
  * __ntfs_write_inode - write out a dirty inode
  * @vi:		inode to write out
@@ -2690,6 +2722,7 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
 int __ntfs_write_inode(struct inode *vi, int sync)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
+	struct ntfs_inode *mft_ni = NTFS_I(ni->vol->mft_ino);
 	struct mft_record *m;
 	int err = 0;
 	bool need_iput = false;
@@ -2749,11 +2782,37 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 
 	/* Now the access times are updated, write the base mft record. */
 	if (NInoDirty(ni)) {
+		down_read(&mft_ni->runlist.lock);
+		err = ntfs_get_block_mft_record(mft_ni, ni);
+		up_read(&mft_ni->runlist.lock);
+		if (err)
+			goto unm_err_out;
+
 		err = write_mft_record(ni, m, sync);
 		if (err)
 			ntfs_error(vi->i_sb, "write_mft_record failed, err : %d\n", err);
 	}
 	unmap_mft_record(ni);
+
+	/* Map any unmapped extent mft records with LCNs. */
+	down_read(&mft_ni->runlist.lock);
+	mutex_lock(&ni->extent_lock);
+	if (ni->nr_extents > 0) {
+		int i;
+
+		for (i = 0; i < ni->nr_extents; i++) {
+			err = ntfs_get_block_mft_record(mft_ni,
+						   ni->ext.extent_ntfs_inos[i]);
+			if (err) {
+				mutex_unlock(&ni->extent_lock);
+				up_read(&mft_ni->runlist.lock);
+				mutex_unlock(&ni->mrec_lock);
+				goto err_out;
+			}
+		}
+	}
+	mutex_unlock(&ni->extent_lock);
+	up_read(&mft_ni->runlist.lock);
 
 	/* Write all attached extent mft records. */
 	mutex_lock(&ni->extent_lock);
