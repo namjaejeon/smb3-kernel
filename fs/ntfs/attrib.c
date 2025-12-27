@@ -65,7 +65,7 @@ int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_sea
 	struct runlist_element *rl;
 	struct folio *put_this_folio = NULL;
 	int err = 0;
-	bool ctx_is_temporary, ctx_needs_reset;
+	bool ctx_is_temporary = false, ctx_needs_reset;
 	struct ntfs_attr_search_ctx old_ctx = { NULL, };
 	size_t new_rl_count;
 
@@ -90,7 +90,6 @@ int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_sea
 
 		WARN_ON(IS_ERR(ctx->mrec));
 		a = ctx->attr;
-		ctx_is_temporary = false;
 		if (!a->non_resident) {
 			err = -EIO;
 			goto err_out;

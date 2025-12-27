@@ -191,7 +191,7 @@ static int ntfs_set_ea(struct inode *inode, const char *name, size_t name_len,
 	struct ea_information *p_ea_info = NULL;
 	int ea_packed, err = 0;
 	struct ea_attr *p_ea;
-	unsigned short int ea_info_qsize;
+	unsigned short int ea_info_qsize = 0;
 	char *ea_buf = NULL;
 	size_t new_ea_size = ALIGN(struct_size(p_ea, ea_name, 1 + name_len + val_size), 4);
 	s64 ea_off, ea_info_size, all_ea_size, ea_size;
@@ -702,16 +702,20 @@ static int ntfs_setxattr(const struct xattr_handler *handler,
 		return -EIO;
 
 	if (!strcmp(name, SYSTEM_DOS_ATTRIB)) {
-		if (sizeof(u8) != size)
+		if (sizeof(u8) != size) {
+			err = -EINVAL;
 			goto out;
+		}
 		fattr = cpu_to_le32(*(u8 *)value);
 		goto set_fattr;
 	}
 
 	if (!strcmp(name, SYSTEM_NTFS_ATTRIB) ||
 	    !strcmp(name, SYSTEM_NTFS_ATTRIB_BE)) {
-		if (size != sizeof(u32))
+		if (size != sizeof(u32)) {
+			err = -EINVAL;
 			goto out;
+		}
 		if (!strcmp(name, SYSTEM_NTFS_ATTRIB_BE))
 			fattr = cpu_to_le32(be32_to_cpu(*(__be32 *)value));
 		else
