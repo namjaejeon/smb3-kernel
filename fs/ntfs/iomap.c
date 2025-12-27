@@ -243,90 +243,71 @@ const struct iomap_ops ntfs_read_iomap_ops = {
 	.iomap_end = ntfs_read_iomap_end,
 };
 
-static int ntfs_buffered_zeroed_clusters(struct inode *vi, s64 vcn)
+/*
+ * Check that the cached iomap still matches the NTFS runlist before
+ * iomap_zero_range() is called. if the runlist changes while iomap is
+ * iterating a cached iomap, iomap_zero_range() may overwrite folios
+ * that have been already written with valid data.
+ */
+static bool ntfs_iomap_valid(struct inode *inode, const struct iomap *iomap)
 {
-	struct ntfs_inode *ni = NTFS_I(vi);
-	struct ntfs_volume *vol = ni->vol;
-	struct address_space *mapping = vi->i_mapping;
-	struct folio *folio;
-	pgoff_t idx, idx_end;
-	u32 from, to;
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct runlist_element *rl;
+	s64 vcn, lcn;
 
-	idx = NTFS_CLU_TO_PIDX(vol, vcn);
-	idx_end = NTFS_CLU_TO_PIDX(vol, vcn + 1);
-	from = NTFS_CLU_TO_POFS(vol, vcn);
-	if (idx == idx_end)
-		idx_end++;
+	if (!NInoNonResident(ni))
+		return false;
 
-	to = min_t(u32, vol->cluster_size, PAGE_SIZE);
-	for (; idx < idx_end; idx++, from = 0) {
-		if (to != PAGE_SIZE) {
-			folio = read_mapping_folio(mapping, idx, NULL);
-			if (IS_ERR(folio))
-				return PTR_ERR(folio);
-			folio_lock(folio);
-		} else {
-			folio = __filemap_get_folio(mapping, idx,
-					FGP_WRITEBEGIN | FGP_NOFS, mapping_gfp_mask(mapping));
-			if (IS_ERR(folio))
-				return PTR_ERR(folio);
-		}
+	vcn = iomap->offset >> ni->vol->cluster_size_bits;
 
-		if (folio_test_uptodate(folio) ||
-		    iomap_is_partially_uptodate(folio, from, to))
-			goto next_folio;
-
-		folio_zero_segment(folio, from, from + to);
-		folio_mark_uptodate(folio);
-
-next_folio:
-		iomap_dirty_folio(mapping, folio);
-		folio_unlock(folio);
-		folio_put(folio);
-		balance_dirty_pages_ratelimited(mapping);
-		cond_resched();
+	down_read(&ni->runlist.lock);
+	rl = __ntfs_attr_find_vcn_nolock(&ni->runlist, vcn);
+	if (IS_ERR(rl)) {
+		up_read(&ni->runlist.lock);
+		return false;
 	}
-
-	return 0;
+	lcn = ntfs_rl_vcn_to_lcn(rl, vcn);
+	up_read(&ni->runlist.lock);
+	return lcn == LCN_DELALLOC;
 }
 
-int ntfs_zeroed_clusters(struct inode *vi, s64 lcn, s64 num)
+const struct iomap_write_ops ntfs_zero_iomap_folio_ops = {
+	.put_folio = ntfs_iomap_put_folio,
+	.iomap_valid = ntfs_iomap_valid,
+};
+
+static int ntfs_zero_read_iomap_end(struct inode *inode, loff_t pos, loff_t length,
+		ssize_t written, unsigned int flags, struct iomap *iomap)
 {
-	struct ntfs_inode *ni = NTFS_I(vi);
-	struct ntfs_volume *vol = ni->vol;
-	u32 to;
-	struct bio *bio = NULL;
-	s64 err = 0, zero_len = NTFS_CLU_TO_B(vol, num);
-	s64 loc = NTFS_CLU_TO_B(vol, lcn), curr = 0;
+	if ((flags & IOMAP_ZERO) && (iomap->flags & IOMAP_F_STALE))
+		return -EPERM;
+	return written;
+}
 
-	while (zero_len > 0) {
-setup_bio:
-		if (!bio) {
-			bio = bio_alloc(vol->sb->s_bdev,
-					bio_max_segs(DIV_ROUND_UP(zero_len, PAGE_SIZE)),
-					REQ_OP_WRITE | REQ_SYNC | REQ_IDLE, GFP_NOIO);
-			bio->bi_iter.bi_sector = NTFS_B_TO_SECTOR(vol, loc + curr);
-		}
+const struct iomap_ops ntfs_zero_read_iomap_ops = {
+	.iomap_begin = ntfs_read_iomap_begin,
+	.iomap_end = ntfs_zero_read_iomap_end,
+};
 
-		to = min_t(u32, zero_len, PAGE_SIZE);
-		if (!bio_add_page(bio, ZERO_PAGE(0), to, 0)) {
-			err = submit_bio_wait(bio);
-			bio_put(bio);
-			bio = NULL;
-			if (err)
-				break;
-			goto setup_bio;
-		}
-		zero_len -= to;
-		curr += to;
+int ntfs_zero_range(struct inode *inode, loff_t offset, loff_t length, bool bdirect)
+{
+	if (bdirect) {
+		if ((offset | length) & (SECTOR_SIZE - 1))
+			return -EINVAL;
+
+		return  blkdev_issue_zeroout(inode->i_sb->s_bdev,
+					     offset >> SECTOR_SHIFT,
+					     length >> SECTOR_SHIFT,
+					     GFP_NOFS,
+					     BLKDEV_ZERO_NOUNMAP);
 	}
 
-	if (bio) {
-		err = submit_bio_wait(bio);
-		bio_put(bio);
-	}
-
-	return err;
+	return iomap_zero_range(inode,
+				offset, length,
+				NULL,
+				&ntfs_zero_read_iomap_ops,
+				&ntfs_zero_iomap_folio_ops,
+				NULL);
 }
 
 static int ntfs_write_iomap_begin_non_resident(struct inode *inode, loff_t offset,
@@ -451,13 +432,37 @@ remap_rl:
 			loff_t end = offset + length;
 
 			if (vcn_ofs || ((vol->cluster_size > iomap->length) &&
-						end < ni->initialized_size))
-				err = ntfs_buffered_zeroed_clusters(inode, vcn);
-			if (!err && max_clu_count > 1 &&
-					(iomap->length & vol->cluster_size_mask &&
-					 end < ni->initialized_size))
-				err = ntfs_buffered_zeroed_clusters(inode,
-						vcn + (max_clu_count - 1));
+					end < ni->initialized_size)) {
+				loff_t z_start, z_end;
+
+				z_start = vcn << vol->cluster_size_bits;
+				z_end = min_t(loff_t, z_start + vol->cluster_size,
+					      i_size_read(inode));
+				if (z_end > z_start)
+					err = ntfs_zero_range(inode,
+							      z_start,
+							      z_end - z_start,
+							      false);
+			}
+			if ((!err || err == -EPERM) &&
+			    max_clu_count > 1 &&
+			    (iomap->length & vol->cluster_size_mask &&
+			     end < ni->initialized_size)) {
+				loff_t z_start, z_end;
+
+				z_start = (vcn + max_clu_count - 1) <<
+					vol->cluster_size_bits;
+				z_end = min_t(loff_t, z_start + vol->cluster_size,
+					      i_size_read(inode));
+				if (z_end > z_start)
+					err = ntfs_zero_range(inode,
+							      z_start,
+							      z_end - z_start,
+							      false);
+			}
+
+			if (err == -EPERM)
+				err = 0;
 			if (err) {
 				ntfs_release_dirty_clusters(vol, max_clu_count);
 				return err;
@@ -532,13 +537,19 @@ static int ntfs_write_da_iomap_begin_non_resident(struct inode *inode, loff_t of
 
 			if (vcn_ofs || ((vol->cluster_size > iomap->length) &&
 						end < ni->initialized_size))
-				err = ntfs_zeroed_clusters(inode,
-						start_lcn, 1);
+				err = ntfs_zero_range(inode,
+						      start_lcn <<
+						      vol->cluster_size_bits,
+						      vol->cluster_size,
+						      true);
 			if (!err && lcn_count > 1 &&
 					(iomap->length & vol->cluster_size_mask &&
 					 end < ni->initialized_size))
-				err = ntfs_zeroed_clusters(inode,
-						start_lcn + (lcn_count - 1), 1);
+				err = ntfs_zero_range(inode,
+						      (start_lcn + lcn_count - 1) <<
+						      vol->cluster_size_bits,
+						      vol->cluster_size,
+						      true);
 		} else {
 			if (lcn_count > ni->i_dealloc_clusters)
 				ni->i_dealloc_clusters = 0;
