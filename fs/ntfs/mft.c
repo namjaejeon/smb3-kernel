@@ -668,7 +668,7 @@ static int ntfs_test_inode_wb(struct inode *vi, unsigned long ino, void *data)
 	 * called
 	 */
 	spin_lock(&vi->i_lock);
-	if (inode_state_read(vi) & I_CREATING) {
+	if (inode_state_read_once(vi) & I_CREATING) {
 		spin_unlock(&vi->i_lock);
 		na->state = NI_BeingCreated;
 		return -1;
