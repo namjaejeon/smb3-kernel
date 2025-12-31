@@ -643,8 +643,11 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 		fn->data_size = cpu_to_le64(ni->data_size);
 		fn->allocated_size = cpu_to_le64(ni->allocated_size);
 	}
-	if (!S_ISREG(mode) && !S_ISDIR(mode))
-		fn->file_attributes |= FILE_ATTR_SYSTEM;
+	if (!S_ISREG(mode) && !S_ISDIR(mode)) {
+		fn->file_attributes = FILE_ATTR_SYSTEM;
+		if (rollback_reparse)
+			fn->file_attributes |= FILE_ATTR_REPARSE_POINT;
+	}
 	if (NVolHideDotFiles(vol) && (name_len > 0 && name[0] == '.'))
 		fn->file_attributes |= FILE_ATTR_HIDDEN;
 	fn->creation_time = fn->last_data_change_time = utc2ntfs(ni->i_crtime);
