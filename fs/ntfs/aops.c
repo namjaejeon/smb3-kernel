@@ -453,7 +453,7 @@ static int ntfs_swap_activate(struct swap_info_struct *sis,
 			&ntfs_read_iomap_ops);
 }
 
-const struct address_space_operations ntfs_aops = {
+const struct address_space_operations ntfsp_aops = {
 	.read_folio		= ntfs_read_folio,
 	.readahead		= ntfs_readahead,
 	.writepages		= ntfs_writepages,
