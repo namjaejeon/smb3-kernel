@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * malloc.h - NTFS kernel memory handling. Part of the Linux-NTFS project.
+ * NTFS kernel memory handling. Part of the Linux-NTFS project.
  *
  * Copyright (c) 2001-2005 Anton Altaparmakov
  */
@@ -28,9 +28,10 @@
 static inline void *__ntfs_malloc(unsigned long size, gfp_t gfp_mask)
 {
 	if (likely(size <= PAGE_SIZE)) {
-		BUG_ON(!size);
+		if (!size)
+			return NULL;
 		/* kmalloc() has per-CPU caches so is faster for now. */
-		return kmalloc(PAGE_SIZE, gfp_mask & ~__GFP_HIGHMEM);
+		return kmalloc(PAGE_SIZE, gfp_mask);
 		/* return (void *)__get_free_page(gfp_mask); */
 	}
 	if (likely((size >> PAGE_SHIFT) < totalram_pages()))
@@ -49,7 +50,7 @@ static inline void *__ntfs_malloc(unsigned long size, gfp_t gfp_mask)
  */
 static inline void *ntfs_malloc_nofs(unsigned long size)
 {
-	return __ntfs_malloc(size, GFP_NOFS | __GFP_HIGHMEM);
+	return __ntfs_malloc(size, GFP_NOFS | __GFP_ZERO);
 }
 
 /**
@@ -66,7 +67,7 @@ static inline void *ntfs_malloc_nofs(unsigned long size)
  */
 static inline void *ntfs_malloc_nofs_nofail(unsigned long size)
 {
-	return __ntfs_malloc(size, GFP_NOFS | __GFP_HIGHMEM | __GFP_NOFAIL);
+	return __ntfs_malloc(size, GFP_NOFS | __GFP_NOFAIL);
 }
 
 static inline void ntfs_free(void *addr)
@@ -74,4 +75,25 @@ static inline void ntfs_free(void *addr)
 	kvfree(addr);
 }
 
+static inline void *ntfs_realloc_nofs(void *addr, unsigned long new_size,
+		unsigned long cpy_size)
+{
+	void *pnew_addr;
+
+	if (new_size == 0) {
+		ntfs_free(addr);
+		return NULL;
+	}
+
+	pnew_addr = ntfs_malloc_nofs(new_size);
+	if (pnew_addr == NULL)
+		return NULL;
+	if (addr) {
+		cpy_size = min(cpy_size, new_size);
+		if (cpy_size)
+			memcpy(pnew_addr, addr, cpy_size);
+		ntfs_free(addr);
+	}
+	return pnew_addr;
+}
 #endif /* _LINUX_NTFS_MALLOC_H */
