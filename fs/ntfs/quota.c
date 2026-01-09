@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * quota.c - NTFS kernel quota ($Quota) handling.  Part of the Linux-NTFS
- *	     project.
+ * NTFS kernel quota ($Quota) handling.
+ * Part of the Linux-NTFS project.
  *
  * Copyright (c) 2004 Anton Altaparmakov
  */
-
-#ifdef NTFS_RW
 
 #include "index.h"
 #include "quota.h"
@@ -20,11 +18,11 @@
  * Mark the quotas out of date on the ntfs volume @vol and return 'true' on
  * success and 'false' on error.
  */
-bool ntfs_mark_quotas_out_of_date(ntfs_volume *vol)
+bool ntfs_mark_quotas_out_of_date(struct ntfs_volume *vol)
 {
-	ntfs_index_context *ictx;
-	QUOTA_CONTROL_ENTRY *qce;
-	const le32 qid = QUOTA_DEFAULTS_ID;
+	struct ntfs_index_context *ictx;
+	struct quota_control_entry *qce;
+	const __le32 qid = QUOTA_DEFAULTS_ID;
 	int err;
 
 	ntfs_debug("Entering.");
@@ -35,7 +33,7 @@ bool ntfs_mark_quotas_out_of_date(ntfs_volume *vol)
 		return false;
 	}
 	inode_lock(vol->quota_q_ino);
-	ictx = ntfs_index_ctx_get(NTFS_I(vol->quota_q_ino));
+	ictx = ntfs_index_ctx_get(NTFS_I(vol->quota_q_ino), I30, 4);
 	if (!ictx) {
 		ntfs_error(vol->sb, "Failed to get index context.");
 		goto err_out;
@@ -43,22 +41,20 @@ bool ntfs_mark_quotas_out_of_date(ntfs_volume *vol)
 	err = ntfs_index_lookup(&qid, sizeof(qid), ictx);
 	if (err) {
 		if (err == -ENOENT)
-			ntfs_error(vol->sb, "Quota defaults entry is not "
-					"present.");
+			ntfs_error(vol->sb, "Quota defaults entry is not present.");
 		else
-			ntfs_error(vol->sb, "Lookup of quota defaults entry "
-					"failed.");
+			ntfs_error(vol->sb, "Lookup of quota defaults entry failed.");
 		goto err_out;
 	}
-	if (ictx->data_len < offsetof(QUOTA_CONTROL_ENTRY, sid)) {
-		ntfs_error(vol->sb, "Quota defaults entry size is invalid.  "
-				"Run chkdsk.");
+	if (ictx->data_len < offsetof(struct quota_control_entry, sid)) {
+		ntfs_error(vol->sb, "Quota defaults entry size is invalid.  Run chkdsk.");
 		goto err_out;
 	}
-	qce = (QUOTA_CONTROL_ENTRY*)ictx->data;
+	qce = (struct quota_control_entry *)ictx->data;
 	if (le32_to_cpu(qce->version) != QUOTA_VERSION) {
-		ntfs_error(vol->sb, "Quota defaults entry version 0x%x is not "
-				"supported.", le32_to_cpu(qce->version));
+		ntfs_error(vol->sb,
+			"Quota defaults entry version 0x%x is not supported.",
+			le32_to_cpu(qce->version));
 		goto err_out;
 	}
 	ntfs_debug("Quota defaults flags = 0x%x.", le32_to_cpu(qce->flags));
@@ -99,5 +95,3 @@ err_out:
 	inode_unlock(vol->quota_q_ino);
 	return false;
 }
-
-#endif /* NTFS_RW */
