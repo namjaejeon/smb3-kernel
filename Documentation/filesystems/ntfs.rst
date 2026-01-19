@@ -8,7 +8,6 @@ The Linux NTFS filesystem driver
 .. Table of contents
 
    - Overview
-   - Features
    - Utilities support
    - Supported mount options
 
@@ -16,64 +15,23 @@ The Linux NTFS filesystem driver
 Overview
 ========
 
-The new ntfs is an implementation that supports write and the current
-trends(iomap, no buffer-head) based on read-only classic NTFS.
-The old read-only ntfs code is much cleaner, with extensive comments,
-offers readability that makes understanding NTFS easier.
-The target is to provide current trends(iomap, no buffer head, folio),
-enhanced performance, stable maintenance, utility support including fsck.
-
-Features
-========
-
-- Write support:
-   Implement write support on classic read-only NTFS. Additionally,
-   integrate delayed allocation to enhance write performance through
-   multi-cluster allocation and minimized fragmentation of cluster bitmap.
-
-- Switch to using iomap:
-   Use iomap for buffered IO writes, reads, direct IO, file extent mapping,
-   readpages, writepages operations.
-
-- Stop using the buffer head:
-   The use of buffer head in old ntfs and switched to use folio instead.
-   As a result, CONFIG_BUFFER_HEAD option enable is removed in Kconfig.
-
-- Performance Enhancements:
-  write, file list browsing, mount performance are improved with
-  the following.
-     - Use iomap aops.
-     - Delayed allocation support.
-     - Optimize zero out for newly allocated clusters.
-     - Optimize runlist merge overhead with small chunck size.
-     - pre-load mft(inode) blocks and index(dentry) blocks to improve
-       readdir + stat performance.
-     - Load lcn bitmap on background.
-
-- Stability improvement:
-   a. Pass more xfstests tests:
-      ntfs implement fallocate, idmapped mount and permission, etc,
-      resulting in a significantly high number(287) of xfstests pass.
-   b. Bonnie++ issue[3]:
-      The Bonnie++ benchmark fails on ntfs3 with a "Directory not empty"
-      error during file deletion. ntfs3 currently iterates directory
-      entries by reading index blocks one by one. When entries are deleted
-      concurrently, index block merging or entry relocation can cause
-      readdir() to skip some entries, leaving files undeleted in
-      workloads(bonnie++) that mix unlink and directory scans.
-      ntfs implement leaf chain traversal in readdir to avoid entry skip
-      on deletion.
+NTFS is a Linux kernel filesystem driver that provides full read and write
+support for NTFS volumes. It is designed for high performance, modern kernel
+infrastructure (iomap, folio), and stable long-term maintenance. The driver
+also supports filesystem utilities such as mkfs.ntfs and fsck.ntfs for
+creation and consistency checking.
 
 
 Utilities support
 =================
 
-While ntfs-3g includes ntfsprogs as a component, it notably lacks
-the fsck implementation. So we have launched a new ntfs utilitiies
-project called ntfsprogs-plus by forking from ntfs-3g after removing
-unnecessary ntfs fuse implementation. fsck.ntfs can be used for ntfs
-testing with xfstests as well as for recovering corrupted NTFS device.
-Download the following ntfsprogs-plus and can use mkfs.ntfs and fsck.ntfs.
+The NTFS utilities project, called ntfsprogs-plus, provides mkfs.ntfs,
+fsck.ntfs, and other related tools (e.g., ntfsinfo, ntfsclone, etc.) for
+creating, checking, and managing NTFS volumes. These utilities can be used
+for filesystem testing with xfstests as well as for recovering corrupted
+NTFS devices.
+
+The project is available at:
 
   https://github.com/ntfsprogs-plus/ntfsprogs-plus
 
