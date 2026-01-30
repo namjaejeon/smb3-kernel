@@ -21,7 +21,7 @@ int ntfs_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range)
 	unsigned long *bitmap;
 	char *kaddr;
 	u64 end, trimmed = 0, start_buf, end_buf, end_cluster;
-	u64 start_cluster = NTFS_B_TO_CLU(vol, range->start);
+	u64 start_cluster = ntfs_bytes_to_cluster(vol, range->start);
 	u32 dq = bdev_discard_granularity(vol->sb->s_bdev);
 	int ret = 0;
 
@@ -34,7 +34,7 @@ int ntfs_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range)
 	if (range->len == (u64)-1)
 		end_cluster = vol->nr_clusters;
 	else {
-		end_cluster = NTFS_B_TO_CLU(vol,
+		end_cluster = ntfs_bytes_to_cluster(vol,
 				(range->start + range->len + vol->cluster_size - 1));
 		if (end_cluster > vol->nr_clusters)
 			end_cluster = vol->nr_clusters;
@@ -79,8 +79,9 @@ int ntfs_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range)
 			end = find_next_bit(bitmap, end_buf - start_buf,
 					start - start_buf) + start_buf;
 
-			aligned_start = ALIGN(NTFS_CLU_TO_B(vol, start), dq);
-			aligned_count = ALIGN_DOWN(NTFS_CLU_TO_B(vol, end - start), dq);
+			aligned_start = ALIGN(ntfs_cluster_to_bytes(vol, start), dq);
+			aligned_count =
+				ALIGN_DOWN(ntfs_cluster_to_bytes(vol, end - start), dq);
 			if (aligned_count >= range->minlen) {
 				ret = blkdev_issue_discard(vol->sb->s_bdev, aligned_start >> 9,
 						aligned_count >> 9, GFP_NOFS);

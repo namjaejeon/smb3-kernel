@@ -24,7 +24,7 @@ static s64 lcn_from_index(struct ntfs_volume *vol, struct ntfs_inode *ni,
 	s64 vcn;
 	s64 lcn;
 
-	vcn = NTFS_PIDX_TO_CLU(vol, index);
+	vcn = ntfs_pidx_to_cluster(vol, index);
 
 	down_read(&ni->runlist.lock);
 	lcn = ntfs_attr_vcn_to_lcn_nolock(ni, vcn, false);
@@ -96,8 +96,8 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 	unsigned long mft_no;
 	struct ntfs_inode *tni;
 	s64 lcn;
-	s64 vcn = NTFS_PIDX_TO_CLU(vol, folio->index);
-	s64 end_vcn = NTFS_B_TO_CLU(vol, ni->allocated_size);
+	s64 vcn = ntfs_pidx_to_cluster(vol, folio->index);
+	s64 end_vcn = ntfs_bytes_to_cluster(vol, ni->allocated_size);
 	unsigned int folio_sz;
 	struct runlist_element *rl;
 
@@ -122,7 +122,7 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 		/* Get the mft record number. */
 		mft_no = (((s64)folio->index << PAGE_SHIFT) + mft_ofs) >>
 			vol->mft_record_size_bits;
-		vcn = NTFS_MFT_NR_TO_CLU(vol, mft_no);
+		vcn = ntfs_mft_no_to_cluster(vol, mft_no);
 		/* Check whether to write this mft record. */
 		tni = NULL;
 		if (ntfs_may_write_mft_record(vol, mft_no,
@@ -187,7 +187,8 @@ flush_bio:
 				bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
 						GFP_NOIO);
 				bio->bi_iter.bi_sector =
-					NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, lcn) + off);
+					ntfs_bytes_to_sector(vol,
+							ntfs_cluster_to_bytes(vol, lcn) + off);
 			}
 
 			if (vol->cluster_size == NTFS_BLOCK_SIZE &&
@@ -320,7 +321,8 @@ static sector_t ntfs_bmap(struct address_space *mapping, sector_t block)
 	if (unlikely(ofs >= size || (ofs + blocksize > size && size < i_size)))
 		goto hole;
 	down_read(&ni->runlist.lock);
-	lcn = ntfs_attr_vcn_to_lcn_nolock(ni, NTFS_B_TO_CLU(vol, ofs), false);
+	lcn = ntfs_attr_vcn_to_lcn_nolock(ni, ntfs_bytes_to_cluster(vol, ofs),
+			false);
 	up_read(&ni->runlist.lock);
 	if (unlikely(lcn < LCN_HOLE)) {
 		/*
@@ -364,7 +366,7 @@ hole:
 	 */
 	delta = ofs & vol->cluster_size_mask;
 	if (unlikely(sizeof(block) < sizeof(lcn))) {
-		block = lcn = (NTFS_CLU_TO_B(vol, lcn) + delta) >>
+		block = lcn = (ntfs_cluster_to_bytes(vol, lcn) + delta) >>
 				blocksize_bits;
 		/* If the block number was truncated return 0. */
 		if (unlikely(block != lcn)) {
@@ -374,7 +376,7 @@ hole:
 			return 0;
 		}
 	} else
-		block = (NTFS_CLU_TO_B(vol, lcn) + delta) >>
+		block = (ntfs_cluster_to_bytes(vol, lcn) + delta) >>
 				blocksize_bits;
 	ntfs_debug("Done (returning block 0x%llx).", (unsigned long long)lcn);
 	return block;

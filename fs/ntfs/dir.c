@@ -557,8 +557,8 @@ found_it2:
 			 * If vcn is in the same page cache page as old_vcn we
 			 * recycle the mapped page.
 			 */
-			if (NTFS_CLU_TO_PIDX(vol, old_vcn) ==
-			    NTFS_CLU_TO_PIDX(vol, vcn))
+			if (ntfs_cluster_to_pidx(vol, old_vcn) ==
+			    ntfs_cluster_to_pidx(vol, vcn))
 				goto fast_descend_into_child_node;
 			kfree(kaddr);
 			kaddr = NULL;
@@ -934,7 +934,8 @@ nextdir:
 
 		actor->pos = ie_pos;
 
-		index = NTFS_MFT_NR_TO_PIDX(vol, MREF_LE(next->data.dir.indexed_file));
+		index = ntfs_mft_no_to_pidx(vol,
+				MREF_LE(next->data.dir.indexed_file));
 		if (nir) {
 			struct ntfs_index_ra *cnir;
 			struct rb_node *node = ra_root.rb_node;

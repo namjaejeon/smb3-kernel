@@ -489,14 +489,14 @@ int ntfs_read_compressed_block(struct folio *folio)
 	s64 end_vcn = ((((s64)(index + 1UL) << PAGE_SHIFT) + cb_size - 1)
 			& ~cb_size_mask) >> vol->cluster_size_bits;
 	/* Number of compression blocks (cbs) in the wanted vcn range. */
-	unsigned int nr_cbs = NTFS_CLU_TO_B(vol, end_vcn - start_vcn) >>
-		ni->itype.compressed.block_size_bits;
+	unsigned int nr_cbs = ntfs_cluster_to_bytes(vol, end_vcn - start_vcn) >>
+			ni->itype.compressed.block_size_bits;
 	/*
 	 * Number of pages required to store the uncompressed data from all
 	 * compression blocks (cbs) overlapping @page. Due to alignment
 	 * guarantees of start_vcn and end_vcn, no need to round up here.
 	 */
-	unsigned int nr_pages = NTFS_CLU_TO_PIDX(vol, end_vcn - start_vcn);
+	unsigned int nr_pages = ntfs_cluster_to_pidx(vol, end_vcn - start_vcn);
 	unsigned int xpage, max_page, cur_page, cur_ofs, i, page_ofs, page_index;
 	unsigned int cb_clusters, cb_max_ofs;
 	int cb_max_page, err = 0;
@@ -531,7 +531,7 @@ int ntfs_read_compressed_block(struct folio *folio)
 	 * We have already been given one page, this is the one we must do.
 	 * Once again, the alignment guarantees keep it simple.
 	 */
-	offset = NTFS_CLU_TO_PIDX(vol, start_vcn);
+	offset = ntfs_cluster_to_pidx(vol, start_vcn);
 	xpage = index - offset;
 	pages[xpage] = page;
 	/*
@@ -642,8 +642,8 @@ lock_retry_remap:
 			goto map_rl_err;
 		}
 
-		page_ofs = NTFS_CLU_TO_POFS(vol, lcn);
-		page_index = NTFS_CLU_TO_PIDX(vol, lcn);
+		page_ofs = ntfs_cluster_to_poff(vol, lcn);
+		page_index = ntfs_cluster_to_pidx(vol, lcn);
 
 		lpage = read_mapping_page(sb->s_bdev->bd_mapping,
 					  page_index, NULL);
@@ -1371,8 +1371,8 @@ static int ntfs_write_cb(struct ntfs_inode *ni, loff_t pos, struct page **pages,
 		bio_size = insz;
 	}
 
-	new_vcn = NTFS_B_TO_CLU(vol, pos & ~(ni->itype.compressed.block_size - 1));
-	new_length = NTFS_B_TO_CLU(vol, round_up(bio_size, vol->cluster_size));
+	new_vcn = ntfs_bytes_to_cluster(vol, pos & ~(ni->itype.compressed.block_size - 1));
+	new_length = ntfs_bytes_to_cluster(vol, round_up(bio_size, vol->cluster_size));
 
 	err = ntfs_non_resident_attr_punch_hole(ni, new_vcn, ni->itype.compressed.block_clusters);
 	if (err < 0)
@@ -1425,7 +1425,8 @@ setup_bio:
 			bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
 					GFP_NOIO);
 			bio->bi_iter.bi_sector =
-				NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, bio_lcn + i));
+				ntfs_bytes_to_sector(vol,
+						ntfs_cluster_to_bytes(vol, bio_lcn + i));
 		}
 
 		if (!bio_add_page(bio, pages[i], page_size, 0)) {

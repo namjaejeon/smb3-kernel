@@ -1764,8 +1764,8 @@ static int load_attribute_list_mount(struct ntfs_volume *vol,
 			goto err_out;
 		}
 
-		rl_byte_off = NTFS_CLU_TO_B(vol, lcn);
-		rl_byte_len = NTFS_CLU_TO_B(vol, rl->length);
+		rl_byte_off = ntfs_cluster_to_bytes(vol, lcn);
+		rl_byte_len = ntfs_cluster_to_bytes(vol, rl->length);
 
 		if (al + rl_byte_len > al_end)
 			rl_byte_len = al_end - al;
@@ -1887,12 +1887,12 @@ int ntfs_read_inode_mount(struct inode *vi)
 	}
 
 	/* Determine the first block of the $MFT/$DATA attribute. */
-	nr_blocks = NTFS_B_TO_SECTOR(vol, vol->mft_record_size);
+	nr_blocks = ntfs_bytes_to_sector(vol, vol->mft_record_size);
 	if (!nr_blocks)
 		nr_blocks = 1;
 
 	/* Load $MFT/$DATA's first mft record. */
-	err = ntfs_dev_read(sb, m, NTFS_CLU_TO_B(vol, vol->mft_lcn), i);
+	err = ntfs_dev_read(sb, m, ntfs_cluster_to_bytes(vol, vol->mft_lcn), i);
 	if (err) {
 		ntfs_error(sb, "Device read failed.");
 		goto err_out;
@@ -2108,7 +2108,7 @@ int ntfs_read_inode_mount(struct inode *vi)
 				goto put_err_out;
 			}
 			/* Get the last vcn in the $DATA attribute. */
-			last_vcn = NTFS_B_TO_CLU(vol,
+			last_vcn = ntfs_bytes_to_cluster(vol,
 					le64_to_cpu(a->data.non_resident.allocated_size));
 			/* Fill in the inode size. */
 			vi->i_size = le64_to_cpu(a->data.non_resident.data_size);
@@ -3686,8 +3686,8 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 			s64 vcn;
 			struct runlist_element *rl;
 
-			lcn_count = max_t(s64, 1, NTFS_B_TO_CLU(vol, attr_len));
-			vcn = NTFS_PIDX_TO_CLU(vol, folio->index);
+			lcn_count = max_t(s64, 1, ntfs_bytes_to_cluster(vol, attr_len));
+			vcn = ntfs_pidx_to_cluster(vol, folio->index);
 
 			do {
 				down_write(&ni->runlist.lock);
@@ -3715,11 +3715,12 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 				bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
 						GFP_NOIO);
 				bio->bi_iter.bi_sector =
-					NTFS_B_TO_SECTOR(vol, NTFS_CLU_TO_B(vol, lcn) +
-							 lcn_folio_off);
+					ntfs_bytes_to_sector(vol,
+							ntfs_cluster_to_bytes(vol, lcn) +
+							lcn_folio_off);
 
 				length = min_t(unsigned long,
-					       NTFS_CLU_TO_B(vol, rl_length),
+					       ntfs_cluster_to_bytes(vol, rl_length),
 					       folio_size(folio));
 				if (!bio_add_folio(bio, folio, length, offset)) {
 					ret = -EIO;

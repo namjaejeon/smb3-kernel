@@ -85,6 +85,81 @@ enum {
 	IGNORE_CASE = 1,
 };
 
+/*
+ * Conversion helpers for NTFS units.
+ */
+
+/* Convert bytes to cluster count */
+static inline u64 ntfs_bytes_to_cluster(const struct ntfs_volume *vol,
+		s64 bytes)
+{
+	return bytes >> vol->cluster_size_bits;
+}
+
+/* Convert cluster count to bytes */
+static inline u64 ntfs_cluster_to_bytes(const struct ntfs_volume *vol,
+		u64 clusters)
+{
+	return clusters << vol->cluster_size_bits;
+}
+
+/* Get the byte offset within a cluster from a linear byte address */
+static inline u64 ntfs_bytes_to_cluster_off(const struct ntfs_volume *vol,
+		u64 bytes)
+{
+	return bytes & vol->cluster_size_mask;
+}
+
+/* Calculate the physical cluster number containing a specific MFT record. */
+static inline u64 ntfs_mft_no_to_cluster(const struct ntfs_volume *vol,
+		unsigned long mft_no)
+{
+	return ((u64)mft_no << vol->mft_record_size_bits) >>
+		vol->cluster_size_bits;
+}
+
+/* Calculate the folio index where the MFT record resides. */
+static inline pgoff_t ntfs_mft_no_to_pidx(const struct ntfs_volume *vol,
+		unsigned long mft_no)
+{
+	return mft_no >> (PAGE_SHIFT - vol->mft_record_size_bits);
+}
+
+/* Calculate the byte offset within a folio for an MFT record. */
+static inline u64 ntfs_mft_no_to_poff(const struct ntfs_volume *vol,
+		unsigned long mft_no)
+{
+	return ((u64)mft_no << vol->mft_record_size_bits) & ~PAGE_MASK;
+}
+
+/* Convert folio index to cluster number. */
+static inline u64 ntfs_pidx_to_cluster(const struct ntfs_volume *vol,
+		pgoff_t idx)
+{
+	return ((u64)idx << PAGE_SHIFT) >> vol->cluster_size_bits;
+}
+
+/* Convert cluster number to folio index. */
+static inline pgoff_t ntfs_cluster_to_pidx(const struct ntfs_volume *vol,
+		u64 clu)
+{
+	return (clu << vol->cluster_size_bits) >> PAGE_SHIFT;
+}
+
+/* Get the byte offset within a folio from a cluster number */
+static inline u64 ntfs_cluster_to_poff(const struct ntfs_volume *vol,
+		u64 clu)
+{
+	return (clu << vol->cluster_size_bits) & ~PAGE_MASK;
+}
+
+/* Convert byte offset to sector (block) number. */
+static inline sector_t ntfs_bytes_to_sector(const struct ntfs_volume *vol,
+		u64 bytes)
+{
+	return bytes >> vol->sb->s_blocksize_bits;
+}
+
 /* Global variables. */
 
 /* Slab caches (from super.c). */

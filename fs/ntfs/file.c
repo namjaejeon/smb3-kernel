@@ -92,7 +92,7 @@ static int ntfs_file_release(struct inode *vi, struct file *filp)
 	down_write(&ni->runlist.lock);
 	if (aligned_data_size < ni->allocated_size) {
 		int err;
-		s64 vcn_ds = NTFS_B_TO_CLU(vol, aligned_data_size);
+		s64 vcn_ds = ntfs_bytes_to_cluster(vol, aligned_data_size);
 		s64 vcn_tr = -1;
 		struct runlist_element *rl = ni->runlist.rl;
 		ssize_t rc = ni->runlist.count - 2;
@@ -109,7 +109,7 @@ static int ntfs_file_release(struct inode *vi, struct file *filp)
 				ni->runlist.rl = NULL;
 				ntfs_error(vol->sb, "Preallocated block rollback failed");
 			} else {
-				ni->allocated_size = NTFS_CLU_TO_B(vol, vcn_tr);
+				ni->allocated_size = ntfs_cluster_to_bytes(vol, vcn_tr);
 				err = ntfs_attr_update_mapping_pairs(ni, 0);
 				if (err)
 					ntfs_error(vol->sb,
@@ -827,8 +827,8 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 
 	old_size = i_size_read(vi);
 	new_size = max_t(loff_t, old_size, end_offset);
-	start_vcn = NTFS_B_TO_CLU(vol, offset);
-	end_vcn = (NTFS_B_TO_CLU(vol, end_offset - 1)) + 1;
+	start_vcn = ntfs_bytes_to_cluster(vol, offset);
+	end_vcn = ntfs_bytes_to_cluster(vol, end_offset - 1) + 1;
 
 	inode_lock(vi);
 	if (NInoCompressed(ni) || NInoEncrypted(ni)) {
@@ -861,9 +861,9 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 		}
 
 		new_size = old_size +
-			(NTFS_CLU_TO_B(vol, end_vcn - start_vcn));
+			ntfs_cluster_to_bytes(vol, end_vcn - start_vcn);
 		alloc_size = ni->allocated_size +
-			(NTFS_CLU_TO_B(vol, end_vcn - start_vcn));
+			ntfs_cluster_to_bytes(vol, end_vcn - start_vcn);
 		if (alloc_size < 0) {
 			err = -EFBIG;
 			goto out;
@@ -896,11 +896,11 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 			goto out;
 		}
 
-		if (NTFS_CLU_TO_B(vol, end_vcn) > ni->allocated_size)
+		if (ntfs_cluster_to_bytes(vol, end_vcn) > ni->allocated_size)
 			end_vcn = (round_up(ni->allocated_size - 1, vol->cluster_size) >>
 					vol->cluster_size_bits) + 1;
 		new_size = old_size -
-			(NTFS_CLU_TO_B(vol, end_vcn - start_vcn));
+			ntfs_cluster_to_bytes(vol, end_vcn - start_vcn);
 		if (new_size < 0)
 			new_size = 0;
 		err = filemap_write_and_wait_range(vi->i_mapping,
@@ -935,7 +935,7 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 
 		if (offset + len > ni->data_size) {
 			end_offset = ni->data_size;
-			end_vcn = (NTFS_B_TO_CLU(vol, end_offset - 1)) + 1;
+			end_vcn = ntfs_bytes_to_cluster(vol, end_offset - 1) + 1;
 		}
 
 		err = filemap_write_and_wait_range(vi->i_mapping, offset_down, LLONG_MAX);
@@ -946,7 +946,7 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 		if (offset & vol->cluster_size_mask) {
 			loff_t to;
 
-			to = min_t(loff_t, NTFS_CLU_TO_B(vol, start_vcn + 1),
+			to = min_t(loff_t, ntfs_cluster_to_bytes(vol, start_vcn + 1),
 				   end_offset);
 			err = iomap_zero_range(vi, offset, to - offset, NULL,
 					       &ntfs_seek_iomap_ops,
@@ -958,7 +958,7 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 		if (end_offset & vol->cluster_size_mask) {
 			loff_t from;
 
-			from = NTFS_CLU_TO_B(vol, end_vcn - 1);
+			from = ntfs_cluster_to_bytes(vol, end_vcn - 1);
 			err = iomap_zero_range(vi, from, end_offset - from, NULL,
 					       &ntfs_seek_iomap_ops,
 					       &ntfs_iomap_folio_ops, NULL);
@@ -980,7 +980,7 @@ static long ntfs_fallocate(struct file *file, int mode, loff_t offset, loff_t le
 		if (err)
 			goto out;
 
-		need_space = NTFS_B_TO_CLU(vol, ni->allocated_size);
+		need_space = ntfs_bytes_to_cluster(vol, ni->allocated_size);
 		if (need_space > start_vcn)
 			need_space = end_vcn - need_space;
 		else
