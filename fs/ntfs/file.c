@@ -368,6 +368,7 @@ int ntfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 		unsigned int query_flags)
 {
 	struct inode *inode = d_backing_inode(path->dentry);
+	struct ntfs_inode *ni = NTFS_I(inode);
 
 	generic_fillattr(idmap, request_mask, inode, stat);
 
@@ -376,6 +377,37 @@ int ntfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 			NTFS_SB(inode->i_sb)->cluster_size_bits) >> 9) + inode->i_blocks;
 	stat->result_mask |= STATX_BTIME;
 	stat->btime = NTFS_I(inode)->i_crtime;
+
+	if (NInoCompressed(ni))
+		stat->attributes |= STATX_ATTR_COMPRESSED;
+
+	if (NInoEncrypted(ni))
+		stat->attributes |= STATX_ATTR_ENCRYPTED;
+
+	if (inode->i_flags & S_IMMUTABLE)
+		stat->attributes |= STATX_ATTR_IMMUTABLE;
+
+	if (inode->i_flags & S_APPEND)
+		stat->attributes |= STATX_ATTR_APPEND;
+
+	stat->attributes_mask |= STATX_ATTR_COMPRESSED | STATX_ATTR_ENCRYPTED |
+				 STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND;
+
+	/*
+	 * If it's a compressed or encrypted file, NTFS currently
+	 * does not support DIO. For normal files, we report the bdev
+	 * logical block size.
+	 */
+	if (request_mask & STATX_DIOALIGN && S_ISREG(inode->i_mode)) {
+		unsigned int align =
+			bdev_logical_block_size(inode->i_sb->s_bdev);
+
+		stat->result_mask |= STATX_DIOALIGN;
+		if (!NInoCompressed(ni) && !NInoEncrypted(ni)) {
+			stat->dio_mem_align = align;
+			stat->dio_offset_align = align;
+		}
+	}
 
 	return 0;
 }
