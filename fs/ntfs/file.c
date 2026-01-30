@@ -273,6 +273,7 @@ int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 				     "Changes in inode size are not supported yet for %s files, ignoring.",
 				     NInoCompressed(ni) ? "compressed" : "encrypted");
 			err = -EOPNOTSUPP;
+			goto out;
 		} else {
 			loff_t old_size = vi->i_size;
 
