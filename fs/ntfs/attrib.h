@@ -18,9 +18,15 @@ extern __le16 AT_UNNAMED[];
 
 /*
  * ntfs_attr_search_ctx - used in attribute search functions
- * @mrec:	buffer containing mft record to search
- * @attr:	attribute record in @mrec where to begin/continue search
- * @is_first:	if true ntfs_attr_lookup() begins search with @attr, else after
+ * @mrec: buffer containing mft record to search
+ * @mapped_mrec: true if @mrec was mapped by the search functions
+ * @attr: attribute record in @mrec where to begin/continue search
+ * @is_first: if true ntfs_attr_lookup() begins search with @attr, else after
+ * @ntfs_ino: Inode owning this attribute search
+ * @al_entry: Current attribute list entry
+ * @base_ntfs_ino: Base inode
+ * @mapped_base_mrec: true if @base_mrec was mapped by the search
+ * @base_attr: Base attribute record pointer
  *
  * Structure must be initialized to zero before the first call to one of the
  * attribute search functions. Initialize @mrec to point to the mft record to
