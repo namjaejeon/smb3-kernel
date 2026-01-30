@@ -21,6 +21,8 @@
  *
  * Check whether all are attributes belong to one MFT record, in that case
  * attribute list is not needed.
+ *
+ * Return 1 if inode need attribute list, 0 if not, or -errno on error.
  */
 int ntfs_attrlist_need(struct ntfs_inode *ni)
 {
@@ -106,6 +108,8 @@ int ntfs_attrlist_update(struct ntfs_inode *base_ni)
  * ntfs_attrlist_entry_add - add an attribute list attribute entry
  * @ni:	opened ntfs inode, which contains that attribute
  * @attr: attribute record to add to attribute list
+ *
+ * Return 0 on success and -errno on error.
  */
 int ntfs_attrlist_entry_add(struct ntfs_inode *ni, struct attr_record *attr)
 {
@@ -236,6 +240,8 @@ err_out:
  * @ctx:	attribute search context describing the attribute list entry
  *
  * Remove the attribute list entry @ctx->al_entry from the attribute list.
+ *
+ * Return 0 on success and -errno on error.
  */
 int ntfs_attrlist_entry_rm(struct ntfs_attr_search_ctx *ctx)
 {

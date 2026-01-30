@@ -530,6 +530,8 @@ inline struct ntfs_inode *ntfs_new_extent_inode(struct super_block *sb,
  * directory.
  *
  * Return values:
+ *	   3: file is $ObjId in $Extend directory
+ *	   2: file is $Reparse in $Extend directory
  *	   1: file is in $Extend directory
  *	   0: file is not in $Extend directory
  *    -errno: failed to determine if the file is in the $Extend directory

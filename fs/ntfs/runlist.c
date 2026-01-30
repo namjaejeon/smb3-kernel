@@ -58,6 +58,9 @@ static inline void ntfs_rl_mc(struct runlist_element *dstbase, int dst,
  *
  * N.B.  If the new allocation doesn't require a different number of pages in
  *       memory, the function will return the original pointer.
+ *
+ * On success, return a pointer to the newly allocated, or recycled, memory.
+ * On error, return -errno.
  */
 struct runlist_element *ntfs_rl_realloc(struct runlist_element *rl,
 		int old_size, int new_size)
@@ -99,6 +102,9 @@ struct runlist_element *ntfs_rl_realloc(struct runlist_element *rl,
  *
  * N.B.  If the new allocation doesn't require a different number of pages in
  *       memory, the function will return the original pointer.
+ *
+ * On success, return a pointer to the newly allocated, or recycled, memory.
+ * On error, return -errno.
  */
 static inline struct runlist_element *ntfs_rl_realloc_nofail(struct runlist_element *rl,
 		int old_size, int new_size)
@@ -186,6 +192,8 @@ static inline void __ntfs_rl_merge(struct runlist_element *dst, struct runlist_e
  * runlists @dst and @src are deallocated before returning so you cannot use
  * the pointers for anything any more. (Strictly speaking the returned runlist
  * may be the same as @dst but this is irrelevant.)
+ *
+ * On error, return -errno. Both runlists are left unmodified.
  */
 static inline struct runlist_element *ntfs_rl_append(struct runlist_element *dst,
 		int dsize, struct runlist_element *src, int ssize, int loc,
@@ -243,6 +251,8 @@ static inline struct runlist_element *ntfs_rl_append(struct runlist_element *dst
  * runlists @dst and @src are deallocated before returning so you cannot use
  * the pointers for anything any more. (Strictly speaking the returned runlist
  * may be the same as @dst but this is irrelevant.)
+ *
+ * On error, return -errno. Both runlists are left unmodified.
  */
 static inline struct runlist_element *ntfs_rl_insert(struct runlist_element *dst,
 		int dsize, struct runlist_element *src, int ssize, int loc,
@@ -330,6 +340,8 @@ static inline struct runlist_element *ntfs_rl_insert(struct runlist_element *dst
  * runlists @dst and @src are deallocated before returning so you cannot use
  * the pointers for anything any more. (Strictly speaking the returned runlist
  * may be the same as @dst but this is irrelevant.)
+ *
+ * On error, return -errno. Both runlists are left unmodified.
  */
 static inline struct runlist_element *ntfs_rl_replace(struct runlist_element *dst,
 		int dsize, struct runlist_element *src, int ssize, int loc,
@@ -409,6 +421,8 @@ static inline struct runlist_element *ntfs_rl_replace(struct runlist_element *ds
  * runlists @dst and @src are deallocated before returning so you cannot use
  * the pointers for anything any more. (Strictly speaking the returned runlist
  * may be the same as @dst but this is irrelevant.)
+ *
+ * On error, return -errno. Both runlists are left unmodified.
  */
 static inline struct runlist_element *ntfs_rl_split(struct runlist_element *dst, int dsize,
 		struct runlist_element *src, int ssize, int loc,
@@ -462,6 +476,8 @@ static inline struct runlist_element *ntfs_rl_split(struct runlist_element *dst,
  * runlists @drl and @srl are deallocated before returning so you cannot use
  * the pointers for anything any more. (Strictly speaking the returned runlist
  * may be the same as @dst but this is irrelevant.)
+ *
+ * On error, return -errno. Both runlists are left unmodified.
  */
 struct runlist_element *ntfs_runlists_merge(struct runlist *d_runlist,
 				     struct runlist_element *srl, size_t s_rl_count,
@@ -1219,6 +1235,16 @@ err_out:
  * as partial success, in that a new attribute extent needs to be created or
  * the next extent has to be used and the mapping pairs build has to be
  * continued with @first_vcn set to *@stop_vcn.
+ *
+ * Return 0 on success and -errno on error.  The following error codes are
+ * defined:
+ *	-EINVAL	- Run list contains unmapped elements.  Make sure to only pass
+ *		  fully mapped runlists to this function.
+ *	-EIO	- The runlist is corrupt.
+ *	-ENOSPC	- The destination buffer is too small.
+ *
+ * Locking: @rl must be locked on entry (either for reading or writing), it
+ *	    remains locked throughout, and is left locked upon return.
  */
 int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 		const int dst_len, const struct runlist_element *rl,
@@ -1398,6 +1424,8 @@ err_out:
  * the caller has mapped any elements that need to be mapped already.
  *
  * Return 0 on success and -errno on error.
+ *
+ * Locking: The caller must hold @runlist->lock for writing.
  */
 int ntfs_rl_truncate_nolock(const struct ntfs_volume *vol, struct runlist *const runlist,
 		const s64 new_length)

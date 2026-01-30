@@ -829,6 +829,8 @@ static int ntfs_test_inode_attr(struct inode *vi, void *data)
  *
  * Delete the specified name from the directory index @dir_ni and decrement
  * the link count of the target inode @ni.
+ *
+ * Return 0 on success and -errno on error.
  */
 static int ntfs_delete(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 		__le16 *name, u8 name_len, bool need_lock)
@@ -1138,6 +1140,8 @@ out:
  *
  * Create a new hard link. This involves adding an entry to the directory
  * index and adding a new FILE_NAME attribute to the target inode.
+ *
+ * Return 0 on success and -errno on error.
  */
 static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 		__le16 *name, u8 name_len)

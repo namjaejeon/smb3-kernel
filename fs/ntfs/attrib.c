@@ -53,8 +53,29 @@ __le16 AT_UNNAMED[] = { cpu_to_le16('\0') };
  * ntfs_map_runlist_nolock(), you will probably want to do:
  *	m = ctx->mrec;
  *	a = ctx->attr;
- * Assuming you cache ctx->attr in a variable @a of type attr_record * and that
- * you cache ctx->mrec in a variable @m of type struct mft_record *.
+ * Assuming you cache ctx->attr in a variable @a of type struct attr_record *
+ * and that you cache ctx->mrec in a variable @m of type struct mft_record *.
+ *
+ * Return 0 on success and -errno on error.  There is one special error code
+ * which is not an error as such.  This is -ENOENT.  It means that @vcn is out
+ * of bounds of the runlist.
+ *
+ * Note the runlist can be NULL after this function returns if @vcn is zero and
+ * the attribute has zero allocated size, i.e. there simply is no runlist.
+ *
+ * WARNING: If @ctx is supplied, regardless of whether success or failure is
+ *	    returned, you need to check IS_ERR(@ctx->mrec) and if 'true' the @ctx
+ *	    is no longer valid, i.e. you need to either call
+ *	    ntfs_attr_reinit_search_ctx() or ntfs_attr_put_search_ctx() on it.
+ *	    In that case PTR_ERR(@ctx->mrec) will give you the error code for
+ *	    why the mapping of the old inode failed.
+ *
+ * Locking: - The runlist described by @ni must be locked for writing on entry
+ *	      and is locked on return.  Note the runlist will be modified.
+ *	    - If @ctx is NULL, the base mft record of @ni must not be mapped on
+ *	      entry and it will be left unmapped on return.
+ *	    - If @ctx is not NULL, the base mft record must be mapped on entry
+ *	      and it will be left mapped on return.
  */
 int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_search_ctx *ctx)
 {
@@ -261,6 +282,14 @@ retry_map:
  * @vcn:	map runlist part containing this vcn
  *
  * Map the part of a runlist containing the @vcn of the ntfs inode @ni.
+ *
+ * Return 0 on success and -errno on error.  There is one special error code
+ * which is not an error as such.  This is -ENOENT.  It means that @vcn is out
+ * of bounds of the runlist.
+ *
+ * Locking: - The runlist must be unlocked on entry and is unlocked on return.
+ *	    - This function takes the runlist lock for writing and may modify
+ *	      the runlist.
  */
 int ntfs_map_runlist(struct ntfs_inode *ni, s64 vcn)
 {
