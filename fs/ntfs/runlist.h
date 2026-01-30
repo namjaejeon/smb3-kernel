@@ -23,11 +23,16 @@
  *
  * When lcn == -1 this means that the count vcns starting at vcn are not
  * physically allocated (i.e. this is a hole / data is sparse).
+ *
+ * In memory vcn to lcn mapping structure element.
+ * @vcn: vcn = Starting virtual cluster number.
+ * @lcn: lcn = Starting logical cluster number.
+ * @length: Run length in clusters.
  */
-struct runlist_element { /* In memory vcn to lcn mapping structure element. */
-	s64 vcn;	/* vcn = Starting virtual cluster number. */
-	s64 lcn;	/* lcn = Starting logical cluster number. */
-	s64 length;	/* Run length in clusters. */
+struct runlist_element {
+	s64 vcn;
+	s64 lcn;
+	s64 length;
 };
 
 /**
