@@ -486,7 +486,6 @@ int ntfs_sync_mft_mirror(struct ntfs_volume *vol, const unsigned long mft_no,
 	bio->bi_end_io = ntfs_bio_end_io;
 	submit_bio(bio);
 	/* Current state: all buffers are clean, unlocked, and uptodate. */
-	flush_dcache_folio(folio);
 	folio_mark_uptodate(folio);
 
 unlock_folio:
@@ -563,8 +562,6 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 
 		clu_off = (unsigned int)((s64)ni->mft_no * vol->mft_record_size + offset) &
 			vol->cluster_size_mask;
-
-		flush_dcache_folio(folio);
 
 		bio = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE, GFP_NOIO);
 		bio->bi_iter.bi_sector =
@@ -1022,7 +1019,6 @@ static int ntfs_mft_bitmap_find_and_alloc_free_rec_nolock(struct ntfs_volume *vo
 						return -ENOSPC;
 					}
 					*byte |= 1 << b;
-					flush_dcache_folio(folio);
 					folio_mark_dirty(folio);
 					folio_unlock(folio);
 					kunmap_local(buf);
@@ -1179,7 +1175,6 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 	if (*b != 0xff && !(*b & tb)) {
 		/* Next cluster is free, allocate it. */
 		*b |= tb;
-		flush_dcache_folio(folio);
 		folio_mark_dirty(folio);
 		folio_unlock(folio);
 		kunmap_local(b);
@@ -1964,7 +1959,6 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 		return err;
 	}
 	pre_write_mst_fixup((struct ntfs_record *)m, vol->mft_record_size);
-	flush_dcache_folio(folio);
 	folio_mark_uptodate(folio);
 	/*
 	 * Make sure the mft record is written out to disk.  We could use
@@ -2414,7 +2408,6 @@ mft_rec_already_initialized:
 	m->flags |= MFT_RECORD_IN_USE;
 	if (S_ISDIR(mode))
 		m->flags |= MFT_RECORD_IS_DIRECTORY;
-	flush_dcache_folio(folio);
 	folio_mark_uptodate(folio);
 	if (base_ni) {
 		struct mft_record *m_tmp;
@@ -2441,7 +2434,6 @@ mft_rec_already_initialized:
 			/* Set the mft record itself not in use. */
 			m->flags &= cpu_to_le16(
 					~le16_to_cpu(MFT_RECORD_IN_USE));
-			flush_dcache_folio(folio);
 			/* Make sure the mft record is written out to disk. */
 			mark_ntfs_record_dirty(folio);
 			folio_unlock(folio);

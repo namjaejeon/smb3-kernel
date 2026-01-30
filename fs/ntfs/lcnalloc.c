@@ -313,7 +313,6 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 		if (likely(folio)) {
 			if (need_writeback) {
 				ntfs_debug("Marking page dirty.");
-				flush_dcache_folio(folio);
 				folio_mark_dirty(folio);
 				need_writeback = 0;
 			}
@@ -724,7 +723,6 @@ out:
 	if (likely(folio && !IS_ERR(folio))) {
 		if (need_writeback) {
 			ntfs_debug("Marking page dirty.");
-			flush_dcache_folio(folio);
 			folio_mark_dirty(folio);
 			need_writeback = 0;
 		}

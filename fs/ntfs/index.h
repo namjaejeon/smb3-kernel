@@ -54,8 +54,7 @@
  * When finished with the @entry and its @data, call ntfs_index_ctx_put() to
  * free the context and other associated resources.
  *
- * If the index entry was modified, call flush_dcache_index_entry_page()
- * immediately after the modification and either ntfs_index_entry_mark_dirty()
+ * If the index entry was modified, ntfs_index_entry_mark_dirty()
  * or ntfs_index_entry_write() before the call to ntfs_index_ctx_put() to
  * ensure that the changes are written to disk.
  */
@@ -73,7 +72,6 @@ struct ntfs_index_context {
 	struct index_block *ib;
 	struct ntfs_inode *base_ni;
 	struct index_block *ia;
-	struct page *page;
 	struct ntfs_inode *ia_ni;
 	int parent_pos[MAX_PARENT_VCN];  /* parent entries' positions */
 	s64 parent_vcn[MAX_PARENT_VCN]; /* entry's parent nodes */
@@ -91,27 +89,6 @@ struct ntfs_index_context *ntfs_index_ctx_get(struct ntfs_inode *ni, __le16 *nam
 void ntfs_index_ctx_put(struct ntfs_index_context *ictx);
 int ntfs_index_lookup(const void *key, const u32 key_len,
 		struct ntfs_index_context *ictx);
-
-/**
- * ntfs_index_entry_flush_dcache_page - flush_dcache_page() for index entries
- * @ictx:	ntfs index context describing the index entry
- *
- * Call flush_dcache_page() for the page in which an index entry resides.
- *
- * This must be called every time an index entry is modified, just after the
- * modification.
- *
- * If the index entry is in the index root attribute, simply flush the page
- * containing the mft record containing the index root attribute.
- *
- * If the index entry is in an index block belonging to the index allocation
- * attribute, simply flush the page cache page containing the index block.
- */
-static inline void ntfs_index_entry_flush_dcache_page(struct ntfs_index_context *ictx)
-{
-	if (!ictx->is_in_root)
-		flush_dcache_page(ictx->page);
-}
 
 void ntfs_index_entry_mark_dirty(struct ntfs_index_context *ictx);
 int ntfs_index_add_filename(struct ntfs_inode *ni, struct file_name_attr *fn, u64 mref);

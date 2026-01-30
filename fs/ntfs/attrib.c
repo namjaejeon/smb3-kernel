@@ -2005,7 +2005,6 @@ int ntfs_attr_set(struct ntfs_inode *ni, s64 ofs, s64 cnt, const u8 val)
 		memset(addr, val, attr_len);
 		kunmap_local(addr);
 
-		flush_dcache_folio(folio);
 		folio_mark_dirty(folio);
 		folio_unlock(folio);
 		folio_put(folio);

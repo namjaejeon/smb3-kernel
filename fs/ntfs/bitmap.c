@@ -211,7 +211,6 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 			goto rollback;
 
 		/* Update @index and get the next folio. */
-		flush_dcache_folio(folio);
 		folio_mark_dirty(folio);
 		folio_unlock(folio);
 		kunmap_local(kaddr);
@@ -259,7 +258,6 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 	}
 done:
 	/* We are done.  Unmap the folio and return success. */
-	flush_dcache_folio(folio);
 	folio_mark_dirty(folio);
 	folio_unlock(folio);
 	kunmap_local(kaddr);
