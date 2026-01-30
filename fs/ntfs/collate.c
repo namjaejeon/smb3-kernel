@@ -22,7 +22,6 @@ static int ntfs_collate_binary(struct ntfs_volume *vol,
 {
 	int rc;
 
-	ntfs_debug("Entering.");
 	rc = memcmp(data1, data2, min(data1_len, data2_len));
 	if (!rc && (data1_len != data2_len)) {
 		if (data1_len < data2_len)
@@ -30,7 +29,6 @@ static int ntfs_collate_binary(struct ntfs_volume *vol,
 		else
 			rc = 1;
 	}
-	ntfs_debug("Done, returning %i", rc);
 	return rc;
 }
 
@@ -40,8 +38,6 @@ static int ntfs_collate_ntofs_ulong(struct ntfs_volume *vol,
 {
 	int rc;
 	u32 d1 = le32_to_cpup(data1), d2 = le32_to_cpup(data2);
-
-	ntfs_debug("Entering.");
 
 	if (data1_len != data2_len || data1_len != 4)
 		return -EINVAL;
@@ -54,7 +50,6 @@ static int ntfs_collate_ntofs_ulong(struct ntfs_volume *vol,
 		else
 			rc = 1;
 	}
-	ntfs_debug("Done, returning %i", rc);
 	return rc;
 }
 
