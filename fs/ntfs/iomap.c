@@ -278,7 +278,7 @@ static bool ntfs_iomap_valid(struct inode *inode, const struct iomap *iomap)
 	return lcn == LCN_DELALLOC;
 }
 
-const struct iomap_write_ops ntfs_zero_iomap_folio_ops = {
+static const struct iomap_write_ops ntfs_zero_iomap_folio_ops = {
 	.put_folio = ntfs_iomap_put_folio,
 	.iomap_valid = ntfs_iomap_valid,
 };
@@ -291,7 +291,7 @@ static int ntfs_zero_read_iomap_end(struct inode *inode, loff_t pos, loff_t leng
 	return written;
 }
 
-const struct iomap_ops ntfs_zero_read_iomap_ops = {
+static const struct iomap_ops ntfs_zero_read_iomap_ops = {
 	.iomap_begin = ntfs_read_iomap_begin,
 	.iomap_end = ntfs_zero_read_iomap_end,
 };
