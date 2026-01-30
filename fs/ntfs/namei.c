@@ -1568,7 +1568,7 @@ out:
 	return err;
 }
 
-/**
+/*
  * Inode operations for directories.
  */
 const struct inode_operations ntfs_dir_inode_ops = {
