@@ -852,7 +852,7 @@ static int ntfs_punch_hole(struct ntfs_inode *ni, int mode, loff_t offset,
 	struct inode *vi = VFS_I(ni);
 	loff_t end_offset;
 	s64 start_vcn, end_vcn;
-	int err;
+	int err = 0;
 
 	loff_t offset_down = round_down(offset, max_t(unsigned int,
 				vol->cluster_size, PAGE_SIZE));
