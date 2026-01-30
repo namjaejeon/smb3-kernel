@@ -1769,7 +1769,9 @@ static int load_attribute_list_mount(struct ntfs_volume *vol,
 		if (al + rl_byte_len > al_end)
 			rl_byte_len = al_end - al;
 
-		err = ntfs_dev_read(sb, al, rl_byte_off, rl_byte_len);
+		err = ntfs_rw_bdev(sb->s_bdev, rl_byte_off,
+				   round_up(rl_byte_len, SECTOR_SIZE),
+				   al, REQ_OP_READ);
 		if (err) {
 			ntfs_error(sb, "Cannot read attribute list.");
 			goto err_out;
@@ -1891,7 +1893,8 @@ int ntfs_read_inode_mount(struct inode *vi)
 		nr_blocks = 1;
 
 	/* Load $MFT/$DATA's first mft record. */
-	err = ntfs_dev_read(sb, m, ntfs_cluster_to_bytes(vol, vol->mft_lcn), i);
+	err = ntfs_rw_bdev(sb->s_bdev, ntfs_cluster_to_bytes(vol, vol->mft_lcn) >>
+			   SECTOR_SHIFT, i, (char *)m, REQ_OP_READ);
 	if (err) {
 		ntfs_error(sb, "Device read failed.");
 		goto err_out;
@@ -1968,7 +1971,8 @@ int ntfs_read_inode_mount(struct inode *vi)
 			ntfs_error(sb, "Attr_list_size is zero");
 			goto put_err_out;
 		}
-		ni->attr_list = kvzalloc(ni->attr_list_size, GFP_NOFS);
+		ni->attr_list = kvzalloc(round_up(ni->attr_list_size, SECTOR_SIZE),
+					 GFP_NOFS);
 		if (!ni->attr_list) {
 			ntfs_error(sb, "Not enough memory to allocate buffer for attribute list.");
 			goto put_err_out;

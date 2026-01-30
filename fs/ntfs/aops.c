@@ -512,36 +512,43 @@ void mark_ntfs_record_dirty(struct folio *folio)
 	iomap_dirty_folio(folio->mapping, folio);
 }
 
-int ntfs_dev_read(struct super_block *sb, void *buf, loff_t start, loff_t size)
+int ntfs_rw_bdev(struct block_device *bdev, sector_t sector, unsigned int count,
+		 char *data, enum req_op op)
 {
-	pgoff_t idx, idx_end;
-	loff_t offset, end = start + size;
-	u32 from, to, buf_off = 0;
-	struct folio *folio;
+	unsigned int		done = 0, added;
+	int			error;
+	struct bio		*bio;
 
-	idx = start >> PAGE_SHIFT;
-	idx_end = end >> PAGE_SHIFT;
-	from = start & ~PAGE_MASK;
+	op |= REQ_META | REQ_SYNC;
+	if (!is_vmalloc_addr(data))
+		return bdev_rw_virt(bdev, sector, data, count, op);
 
-	if (idx == idx_end)
-		idx_end++;
+	bio = bio_alloc(bdev,
+			bio_max_segs(DIV_ROUND_UP(count, PAGE_SIZE)),
+			op, GFP_KERNEL);
+	bio->bi_iter.bi_sector = sector;
 
-	for (; idx < idx_end; idx++, from = 0) {
-		folio = read_mapping_folio(sb->s_bdev->bd_mapping, idx, NULL);
-		if (IS_ERR(folio)) {
-			ntfs_error(sb, "Unable to read %ld page", idx);
-			return PTR_ERR(folio);
+	do {
+		added = bio_add_vmalloc_chunk(bio, data + done, count - done);
+		if (!added) {
+			struct bio	*prev = bio;
+
+			bio = bio_alloc(prev->bi_bdev,
+					bio_max_segs(DIV_ROUND_UP(count - done, PAGE_SIZE)),
+					prev->bi_opf, GFP_KERNEL);
+			bio->bi_iter.bi_sector = bio_end_sector(prev);
+			bio_chain(prev, bio);
+			submit_bio(prev);
 		}
+		done += added;
+	} while (done < count);
 
-		offset = (loff_t)idx << PAGE_SHIFT;
-		to = min_t(u32, end - offset, PAGE_SIZE);
+	error = submit_bio_wait(bio);
+	bio_put(bio);
 
-		memcpy_from_folio(buf + buf_off, folio, from, to);
-		buf_off += to;
-		folio_put(folio);
-	}
-
-	return 0;
+	if (op == REQ_OP_READ)
+		invalidate_kernel_vmap_range(data, count);
+	return error;
 }
 
 int ntfs_dev_write(struct super_block *sb, void *buf, loff_t start, loff_t size)

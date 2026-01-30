@@ -18,7 +18,8 @@
 #include "inode.h"
 
 void mark_ntfs_record_dirty(struct folio *folio);
-int ntfs_dev_read(struct super_block *sb, void *buf, loff_t start, loff_t end);
+int ntfs_rw_bdev(struct block_device *bdev, sector_t sector, unsigned int count,
+		 char *data, enum req_op op);
 int ntfs_dev_write(struct super_block *sb, void *buf, loff_t start,
 		loff_t size);
 void ntfs_bio_end_io(struct bio *bio);
