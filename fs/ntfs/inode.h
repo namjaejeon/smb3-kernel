@@ -277,12 +277,12 @@ struct big_ntfs_inode {
  */
 static inline struct ntfs_inode *NTFS_I(struct inode *inode)
 {
-	return (struct ntfs_inode *)container_of(inode, struct big_ntfs_inode, vfs_inode);
+	return &container_of(inode, struct big_ntfs_inode, vfs_inode)->ntfs_inode;
 }
 
 static inline struct inode *VFS_I(struct ntfs_inode *ni)
 {
-	return &((struct big_ntfs_inode *)ni)->vfs_inode;
+	return &container_of(ni, struct big_ntfs_inode, ntfs_inode)->vfs_inode;
 }
 
 /**
