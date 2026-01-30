@@ -1652,7 +1652,6 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 	struct ntfs_attr_search_ctx *ctx;
 	struct folio *folio;
 	struct runlist_element *rl;
-	u8 *kaddr;
 	unsigned long flags;
 	int mp_size, mp_ofs, name_ofs, arec_size, err, err2;
 	u32 attr_size;
@@ -1784,13 +1783,9 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 	attr_size = le32_to_cpu(a->data.resident.value_length);
 	WARN_ON(attr_size != data_size);
 	if (folio && !folio_test_uptodate(folio)) {
-		kaddr = kmap_local_folio(folio, 0);
-		memcpy(kaddr, (u8 *)a +
+		folio_fill_tail(folio, 0, (u8 *)a +
 				le16_to_cpu(a->data.resident.value_offset),
 				attr_size);
-		memset(kaddr + attr_size, 0, PAGE_SIZE - attr_size);
-		kunmap_local(kaddr);
-		flush_dcache_folio(folio);
 		folio_mark_uptodate(folio);
 	}
 

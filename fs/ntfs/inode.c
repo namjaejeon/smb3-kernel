@@ -3615,15 +3615,11 @@ static s64 __ntfs_inode_resident_attr_pwrite(struct inode *vi,
 			   ni->type, err);
 		goto out;
 	}
-	if (!folio_test_uptodate(folio)) {
-		u32 len = le32_to_cpu(ctx->attr->data.resident.value_length);
-
-		memcpy_to_folio(folio, 0, addr, len);
-		folio_zero_segment(folio, offset_in_folio(folio, len),
-				   folio_size(folio) - len);
-	} else {
+	if (!folio_test_uptodate(folio))
+		folio_fill_tail(folio, 0, addr,
+				le32_to_cpu(ctx->attr->data.resident.value_length));
+	else
 		memcpy_to_folio(folio, offset_in_folio(folio, pos), buf, count);
-	}
 	folio_mark_uptodate(folio);
 	folio_unlock(folio);
 	folio_put(folio);
