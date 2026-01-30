@@ -77,6 +77,14 @@ static int ntfs_read_folio(struct file *file, struct folio *folio)
 	return 0;
 }
 
+/*
+ * ntfs_bio_end_io - bio completion callback for MFT record writes
+ *
+ * Decrements the folio reference count that was incremented before
+ * submit_bio(). This prevents a race condition where umount could
+ * evict the inode and release the folio while I/O is still in flight,
+ * potentially causing data corruption or use-after-free.
+ */
 void ntfs_bio_end_io(struct bio *bio)
 {
 	if (bio->bi_private)
