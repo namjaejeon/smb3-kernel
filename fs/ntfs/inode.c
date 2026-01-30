@@ -400,9 +400,8 @@ int ntfs_drop_big_inode(struct inode *inode)
 				spin_lock(&inode->i_lock);
 				atomic_dec(&inode->i_count);
 			}
-			return 0;
-		} else if (ni->type == AT_INDEX_ROOT)
-			return 0;
+		}
+		return 0;
 	}
 
 	return inode_generic_drop(inode);
