@@ -766,7 +766,7 @@ static int ntfs_ioctl_fitrim(struct ntfs_volume *vol, unsigned long arg)
 long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
-	case NTFS_IOC_SHUTDOWN:
+	case FS_IOC_SHUTDOWN:
 		return ntfs_ioctl_shutdown(file_inode(filp)->i_sb, arg);
 	case FS_IOC_GETFSLABEL:
 		return ntfs_ioctl_get_volume_label(filp, arg);

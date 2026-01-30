@@ -1867,15 +1867,15 @@ int ntfs_force_shutdown(struct super_block *sb, u32 flags)
 		return 0;
 
 	switch (flags) {
-	case NTFS_GOING_DOWN_DEFAULT:
-	case NTFS_GOING_DOWN_FULLSYNC:
+	case FS_SHUTDOWN_FLAGS_DEFAULT:
+	case FS_SHUTDOWN_FLAGS_LOGFLUSH:
 		ret = bdev_freeze(sb->s_bdev);
 		if (ret)
 			return ret;
 		bdev_thaw(sb->s_bdev);
 		NVolSetShutdown(vol);
 		break;
-	case NTFS_GOING_DOWN_NOSYNC:
+	case FS_SHUTDOWN_FLAGS_NOLOGFLUSH:
 		NVolSetShutdown(vol);
 		break;
 	default:
@@ -1887,7 +1887,7 @@ int ntfs_force_shutdown(struct super_block *sb, u32 flags)
 
 static void ntfs_shutdown(struct super_block *sb)
 {
-	ntfs_force_shutdown(sb, NTFS_GOING_DOWN_NOSYNC);
+	ntfs_force_shutdown(sb, FS_SHUTDOWN_FLAGS_NOLOGFLUSH);
 
 }
 
