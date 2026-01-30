@@ -1970,14 +1970,7 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 		 * Get folio from page cache, getting it from backing store
 		 * if necessary, and increment the use count.
 		 */
-		folio = filemap_lock_folio(mapping, index);
-		if (IS_ERR(folio)) {
-			page_cache_sync_readahead(mapping, ra, NULL,
-				index, max_index - index);
-			folio = read_mapping_folio(mapping, index, NULL);
-			if (!IS_ERR(folio))
-				folio_lock(folio);
-		}
+		folio = ntfs_get_locked_folio(mapping, index, max_index, ra);
 
 		/* Ignore pages which errored synchronously. */
 		if (IS_ERR(folio)) {
@@ -2091,14 +2084,7 @@ static unsigned long __get_nr_free_mft_records(struct ntfs_volume *vol,
 		 * Get folio from page cache, getting it from backing store
 		 * if necessary, and increment the use count.
 		 */
-		folio = filemap_lock_folio(mapping, index);
-		if (IS_ERR(folio)) {
-			page_cache_sync_readahead(mapping, ra, NULL,
-				index, max_index - index);
-			folio = read_mapping_folio(mapping, index, NULL);
-			if (!IS_ERR(folio))
-				folio_lock(folio);
-		}
+		folio = ntfs_get_locked_folio(mapping, index, max_index, ra);
 
 		/* Ignore pages which errored synchronously. */
 		if (IS_ERR(folio)) {

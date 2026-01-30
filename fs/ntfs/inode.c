@@ -3792,3 +3792,23 @@ out:
 	ntfs_attr_put_search_ctx(ctx);
 	return ret;
 }
+
+struct folio *ntfs_get_locked_folio(struct address_space *mapping,
+		pgoff_t index, pgoff_t end_index, struct file_ra_state *ra)
+{
+	struct folio *folio;
+
+	folio = filemap_lock_folio(mapping, index);
+	if (IS_ERR(folio)) {
+		if (PTR_ERR(folio) != -ENOENT)
+			return folio;
+
+		page_cache_sync_readahead(mapping, ra, NULL, index,
+				end_index - index);
+		folio = read_mapping_folio(mapping, index, NULL);
+		if (!IS_ERR(folio))
+			folio_lock(folio);
+	}
+
+	return folio;
+}

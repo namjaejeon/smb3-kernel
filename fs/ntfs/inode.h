@@ -356,5 +356,7 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni);
 int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
 		const loff_t new_size);
 void ntfs_set_vfs_operations(struct inode *inode, mode_t mode, dev_t dev);
+struct folio *ntfs_get_locked_folio(struct address_space *mapping,
+		pgoff_t index, pgoff_t end_index, struct file_ra_state *ra);
 
 #endif /* _LINUX_NTFS_INODE_H */

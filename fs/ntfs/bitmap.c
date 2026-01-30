@@ -49,14 +49,8 @@ int ntfs_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range)
 	end_index = (end_cluster + buf_clusters - 1) >> 15;
 
 	for (index = start_index; index < end_index; index++) {
-		folio = filemap_lock_folio(vol->lcnbmp_ino->i_mapping, index);
-		if (IS_ERR(folio)) {
-			page_cache_sync_readahead(vol->lcnbmp_ino->i_mapping, ra, NULL,
-					index, end_index - index);
-			folio = read_mapping_folio(vol->lcnbmp_ino->i_mapping, index, NULL);
-			if (!IS_ERR(folio))
-				folio_lock(folio);
-		}
+		folio = ntfs_get_locked_folio(vol->lcnbmp_ino->i_mapping,
+				index, end_index, ra);
 		if (IS_ERR(folio)) {
 			ret = PTR_ERR(folio);
 			goto out_free;
