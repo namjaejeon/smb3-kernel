@@ -24,7 +24,6 @@
 #include "ea.h"
 #include "iomap.h"
 #include "bitmap.h"
-#include "malloc.h"
 
 /**
  * ntfs_file_open - called when an inode is about to be opened
@@ -106,7 +105,7 @@ static int ntfs_file_release(struct inode *vi, struct file *filp)
 		if (vcn_tr >= 0) {
 			err = ntfs_rl_truncate_nolock(vol, &ni->runlist, vcn_tr);
 			if (err) {
-				ntfs_free(ni->runlist.rl);
+				kvfree(ni->runlist.rl);
 				ni->runlist.rl = NULL;
 				ntfs_error(vol->sb, "Preallocated block rollback failed");
 			} else {
