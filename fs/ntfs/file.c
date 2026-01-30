@@ -496,12 +496,6 @@ static ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (ret <= 0)
 		goto out_lock;
 
-	if (NInoNonResident(ni) && (iocb->ki_flags & IOCB_DIRECT) &&
-	    ((iocb->ki_pos | ret) & (vi->i_sb->s_blocksize - 1))) {
-		ret = -EINVAL;
-		goto out_lock;
-	}
-
 	err = file_modified(iocb->ki_filp);
 	if (err) {
 		ret = err;
