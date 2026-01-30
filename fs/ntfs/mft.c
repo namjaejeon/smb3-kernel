@@ -163,7 +163,7 @@ static inline struct mft_record *map_mft_record_folio(struct ntfs_inode *ni)
 err_out:
 	ni->folio = NULL;
 	ni->folio_ofs = 0;
-	return (void *)folio;
+	return (struct mft_record *)folio;
 }
 
 /**
@@ -624,7 +624,7 @@ err_out:
 
 static int ntfs_test_inode_wb(struct inode *vi, unsigned long ino, void *data)
 {
-	struct ntfs_attr *na = (struct ntfs_attr *)data;
+	struct ntfs_attr *na = data;
 
 	if (!ntfs_test_inode(vi, na))
 		return 0;
