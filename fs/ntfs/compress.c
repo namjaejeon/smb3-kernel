@@ -62,7 +62,7 @@ static u8 *ntfs_compression_buffer;
  */
 static DEFINE_MUTEX(ntfs_cb_lock);
 
-/**
+/*
  * allocate_compression_buffers - allocate the decompression buffers
  *
  * Caller has to hold the ntfs_lock mutex.
@@ -80,7 +80,7 @@ int allocate_compression_buffers(void)
 	return 0;
 }
 
-/**
+/*
  * free_compression_buffers - free the decompression buffers
  *
  * Caller has to hold the ntfs_lock mutex.
@@ -98,7 +98,7 @@ void free_compression_buffers(void)
 	mutex_unlock(&ntfs_cb_lock);
 }
 
-/**
+/*
  * zero_partial_compressed_page - zero out of bounds compressed page region
  * @page: page to zero
  * @initialized_size: initialized size of the attribute
@@ -118,7 +118,7 @@ static void zero_partial_compressed_page(struct page *page,
 	memset(kp + kp_ofs, 0, PAGE_SIZE - kp_ofs);
 }
 
-/**
+/*
  * handle_bounds_compressed_page - test for&handle out of bounds compressed page
  * @page: page to check and handle
  * @i_size: file size
@@ -132,7 +132,7 @@ static inline void handle_bounds_compressed_page(struct page *page,
 		zero_partial_compressed_page(page, initialized_size);
 }
 
-/**
+/*
  * ntfs_decompress - decompress a compression block into an array of pages
  * @dest_pages:		destination array of pages
  * @completed_pages:	scratch space to track completed pages
@@ -444,7 +444,7 @@ return_overflow:
 	goto return_error;
 }
 
-/**
+/*
  * ntfs_read_compressed_block - read a compressed block into the page cache
  * @folio:	locked folio in the compression block(s) we need to read
  *

@@ -11,7 +11,7 @@
 #include "debug.h"
 #include "ntfs.h"
 
-/**
+/*
  * ntfs_mark_quotas_out_of_date - mark the quotas out of date on an ntfs volume
  * @vol:	ntfs volume on which to mark the quotas out of date
  *

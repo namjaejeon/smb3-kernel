@@ -101,7 +101,7 @@ out_free:
 	return ret;
 }
 
-/**
+/*
  * __ntfs_bitmap_set_bits_in_run - set a run of bits in a bitmap to a value
  * @vi:			vfs inode describing the bitmap
  * @start_bit:		first bit to set

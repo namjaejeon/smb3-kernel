@@ -269,7 +269,7 @@ struct big_ntfs_inode {
 	struct inode vfs_inode;		/* The vfs inode structure. */
 };
 
-/**
+/*
  * NTFS_I - return the ntfs inode given a vfs inode
  * @inode:	VFS inode
  *
@@ -285,7 +285,7 @@ static inline struct inode *VFS_I(struct ntfs_inode *ni)
 	return &container_of(ni, struct big_ntfs_inode, ntfs_inode)->vfs_inode;
 }
 
-/**
+/*
  * ntfs_attr - ntfs in memory attribute structure
  *
  * This structure exists only to provide a small structure for the

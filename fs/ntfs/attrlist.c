@@ -14,7 +14,7 @@
 #include "attrib.h"
 #include "attrlist.h"
 
-/**
+/*
  * ntfs_attrlist_need - check whether inode need attribute list
  * @ni:	opened ntfs inode for which perform check
  *
@@ -103,7 +103,7 @@ int ntfs_attrlist_update(struct ntfs_inode *base_ni)
 	return 0;
 }
 
-/**
+/*
  * ntfs_attrlist_entry_add - add an attribute list attribute entry
  * @ni:	opened ntfs inode, which contains that attribute
  * @attr: attribute record to add to attribute list
@@ -234,7 +234,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_attrlist_entry_rm - remove an attribute list attribute entry
  * @ctx:	attribute search context describing the attribute list entry
  *

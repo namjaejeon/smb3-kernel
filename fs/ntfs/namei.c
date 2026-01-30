@@ -99,7 +99,7 @@ static int ntfs_check_bad_windows_name(struct ntfs_volume *vol,
 	return 0;
 }
 
-/**
+/*
  * ntfs_lookup - find the inode represented by a dentry in a directory inode
  * @dir_ino:	directory inode in which to look for the inode
  * @dent:	dentry representing the inode to look for
@@ -819,7 +819,7 @@ static int ntfs_test_inode_attr(struct inode *vi, void *data)
 		return 0;
 }
 
-/**
+/*
  * ntfs_delete - delete file or directory from ntfs volume
  * @ni:         ntfs inode for object to delte
  * @dir_ni:     ntfs inode for directory in which delete object
@@ -1131,7 +1131,7 @@ out:
 	return err;
 }
 
-/**
+/*
  * __ntfs_link - create hard link for file or directory
  * @ni:		ntfs inode for object to create hard link
  * @dir_ni:	ntfs inode for directory in which new link should be placed
@@ -1588,7 +1588,7 @@ const struct inode_operations ntfs_dir_inode_ops = {
 	.link		= ntfs_link,
 };
 
-/**
+/*
  * ntfs_get_parent - find the dentry of the parent of a given directory dentry
  * @child_dent:		dentry of the directory whose parent directory to find
  *
@@ -1683,7 +1683,7 @@ static struct dentry *ntfs_fh_to_parent(struct super_block *sb, struct fid *fid,
 				    ntfs_nfs_get_inode);
 }
 
-/**
+/*
  * Export operations allowing NFS exporting of mounted NTFS partitions.
  */
 const struct export_operations ntfs_export_ops = {

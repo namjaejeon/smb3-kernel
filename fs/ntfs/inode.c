@@ -20,7 +20,7 @@
 #include "iomap.h"
 #include "object_id.h"
 
-/**
+/*
  * ntfs_test_inode - compare two (possibly fake) inodes for equality
  * @vi:		vfs inode which to test
  * @data:	data which is being tested with
@@ -66,7 +66,7 @@ int ntfs_test_inode(struct inode *vi, void *data)
 	return 1;
 }
 
-/**
+/*
  * ntfs_init_locked_inode - initialize an inode
  * @vi:		vfs inode to initialize
  * @data:	data which to initialize @vi to
@@ -133,7 +133,7 @@ static int ntfs_read_locked_attr_inode(struct inode *base_vi, struct inode *vi);
 static int ntfs_read_locked_index_inode(struct inode *base_vi,
 		struct inode *vi);
 
-/**
+/*
  * ntfs_iget - obtain a struct inode corresponding to a specific normal inode
  * @sb:		super block of mounted volume
  * @mft_no:	mft record number / inode number to obtain
@@ -183,7 +183,7 @@ struct inode *ntfs_iget(struct super_block *sb, unsigned long mft_no)
 	return vi;
 }
 
-/**
+/*
  * ntfs_attr_iget - obtain a struct inode corresponding to an attribute
  * @base_vi:	vfs base inode containing the attribute
  * @type:	attribute type
@@ -244,7 +244,7 @@ struct inode *ntfs_attr_iget(struct inode *base_vi, __le32 type,
 	return vi;
 }
 
-/**
+/*
  * ntfs_index_iget - obtain a struct inode corresponding to an index
  * @base_vi:	vfs base inode containing the index related attributes
  * @name:	Unicode name of the index
@@ -443,7 +443,7 @@ static struct lock_class_key attr_list_inode_mrec_lock_class;
  */
 static struct lock_class_key attr_list_rl_lock_class;
 
-/**
+/*
  * __ntfs_init_inode - initialize ntfs specific part of an inode
  * @sb:		super block of mounted volume
  * @ni:		freshly allocated ntfs inode which to initialize
@@ -518,7 +518,7 @@ inline struct ntfs_inode *ntfs_new_extent_inode(struct super_block *sb,
 	return ni;
 }
 
-/**
+/*
  * ntfs_is_extended_system_file - check if a file is in the $Extend directory
  * @ctx:	initialized attribute search context
  *
@@ -641,7 +641,7 @@ void ntfs_set_vfs_operations(struct inode *inode, mode_t mode, dev_t dev)
 	}
 }
 
-/**
+/*
  * ntfs_read_locked_inode - read an inode from its device
  * @vi:		inode to read
  *
@@ -1231,7 +1231,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_read_locked_attr_inode - read an attribute inode from its base inode
  * @base_vi:	base inode
  * @vi:		attribute inode to read
@@ -1458,7 +1458,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_read_locked_index_inode - read an index inode from its base inode
  * @base_vi:	base inode
  * @vi:		index inode to read
@@ -1715,7 +1715,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * load_attribute_list_mount - load an attribute list into memory
  * @vol:		ntfs volume from which to read
  * @rl:			runlist of the attribute list
@@ -1797,6 +1797,7 @@ err_out:
 	err = -EIO;
 	goto done;
 }
+
 /*
  * The MFT inode has special locking, so teach the lock validator
  * about this by splitting off the locking rules of the MFT from
@@ -1806,7 +1807,7 @@ err_out:
  */
 static struct lock_class_key mft_ni_runlist_lock_key, mft_ni_mrec_lock_key;
 
-/**
+/*
  * ntfs_read_inode_mount - special read_inode for mount time use only
  * @vi:		inode to read
  *
@@ -2280,7 +2281,7 @@ static int ntfs_delete_base_inode(struct ntfs_inode *ni)
 	return err;
 }
 
-/**
+/*
  * ntfs_evict_big_inode - clean up the ntfs specific part of an inode
  * @vi:		vfs inode pending annihilation
  *
@@ -2350,7 +2351,7 @@ release:
 	kvfree(ni->target);
 }
 
-/**
+/*
  * ntfs_show_options - show mount options in /proc/mounts
  * @sf:		seq_file in which to write our mount options
  * @root:	root of the mounted tree whose mount options to display
@@ -2458,7 +2459,7 @@ int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
 	return 0;
 }
 
-/**
+/*
  * ntfs_inode_sync_standard_information - update standard information attribute
  * @vi:	inode to update standard information
  * @m:	mft record
@@ -2552,7 +2553,7 @@ static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_rec
 	return err;
 }
 
-/**
+/*
  * ntfs_inode_sync_filename - update FILE_NAME attributes
  * @ni:	ntfs inode to update FILE_NAME attributes
  *
@@ -2714,7 +2715,7 @@ int ntfs_get_block_mft_record(struct ntfs_inode *mft_ni, struct ntfs_inode *ni)
 	return 0;
 }
 
-/**
+/*
  * __ntfs_write_inode - write out a dirty inode
  * @vi:		inode to write out
  * @sync:	if true, write out synchronously
@@ -2882,7 +2883,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_extent_inode_open - load an extent inode and attach it to its base
  * @base_ni:	base ntfs inode
  * @mref:	mft reference of the extent inode to load (in little endian)
@@ -2986,7 +2987,7 @@ err_out:
 	goto out;
 }
 
-/**
+/*
  * ntfs_inode_attach_all_extents - attach all extents for target inode
  * @ni:		opened ntfs inode for which perform attach
  *
@@ -3032,7 +3033,7 @@ int ntfs_inode_attach_all_extents(struct ntfs_inode *ni)
 	return 0;
 }
 
-/**
+/*
  * ntfs_inode_add_attrlist - add attribute list to inode and fill it
  * @ni: opened ntfs inode to which add attribute list
  *
@@ -3211,7 +3212,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_inode_close - close an ntfs inode and free all associated memory
  * @ni:		ntfs inode to close
  *
@@ -3344,7 +3345,7 @@ static int ntfs_attr_position(__le32 type, struct ntfs_attr_search_ctx *ctx)
 	return 0;
 }
 
-/**
+/*
  * ntfs_inode_free_space - free space in the MFT record of inode
  * @ni:		ntfs inode in which MFT record free space
  * @size:	amount of space needed to free

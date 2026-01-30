@@ -19,7 +19,7 @@
 #include "ntfs.h"
 #include "attrib.h"
 
-/**
+/*
  * ntfs_rl_mm - runlist memmove
  * @base: base runlist array
  * @dst: destination index in @base
@@ -34,7 +34,7 @@ static inline void ntfs_rl_mm(struct runlist_element *base, int dst, int src, in
 		memmove(base + dst, base + src, size * sizeof(*base));
 }
 
-/**
+/*
  * ntfs_rl_mc - runlist memory copy
  * @dstbase: destination runlist array
  * @dst: destination index in @dstbase
@@ -52,7 +52,7 @@ static inline void ntfs_rl_mc(struct runlist_element *dstbase, int dst,
 		memcpy(dstbase + dst, srcbase + src, size * sizeof(*dstbase));
 }
 
-/**
+/*
  * ntfs_rl_realloc - Reallocate memory for runlists
  * @rl:		original runlist
  * @old_size:	number of runlist elements in the original runlist @rl
@@ -93,7 +93,7 @@ struct runlist_element *ntfs_rl_realloc(struct runlist_element *rl,
 	return new_rl;
 }
 
-/**
+/*
  * ntfs_rl_realloc_nofail - Reallocate memory for runlists
  * @rl:		original runlist
  * @old_size:	number of runlist elements in the original runlist @rl
@@ -134,7 +134,7 @@ static inline struct runlist_element *ntfs_rl_realloc_nofail(struct runlist_elem
 	return new_rl;
 }
 
-/**
+/*
  * ntfs_are_rl_mergeable - test if two runlists can be joined together
  * @dst:	original runlist
  * @src:	new runlist to test for mergeability with @dst
@@ -170,7 +170,7 @@ static inline bool ntfs_are_rl_mergeable(struct runlist_element *dst,
 	return false;
 }
 
-/**
+/*
  * __ntfs_rl_merge - merge two runlists without testing if they can be merged
  * @dst:	original, destination runlist
  * @src:	new runlist to merge with @dst
@@ -186,7 +186,7 @@ static inline void __ntfs_rl_merge(struct runlist_element *dst, struct runlist_e
 	dst->length += src->length;
 }
 
-/**
+/*
  * ntfs_rl_append - append a runlist after a given element
  * @dst: destination runlist to append to
  * @dsize: number of elements in @dst
@@ -251,7 +251,7 @@ static inline struct runlist_element *ntfs_rl_append(struct runlist_element *dst
 	return dst;
 }
 
-/**
+/*
  * ntfs_rl_insert - insert a runlist into another
  * @dst: destination runlist to insert into
  * @dsize: number of elements in @dst
@@ -347,7 +347,7 @@ static inline struct runlist_element *ntfs_rl_insert(struct runlist_element *dst
 	return dst;
 }
 
-/**
+/*
  * ntfs_rl_replace - overwrite a runlist element with another runlist
  * @dst: destination runlist to replace in
  * @dsize: number of elements in @dst
@@ -433,7 +433,7 @@ static inline struct runlist_element *ntfs_rl_replace(struct runlist_element *ds
 	return dst;
 }
 
-/**
+/*
  * ntfs_rl_split - insert a runlist into the centre of a hole
  * @dst: destination runlist with a hole
  * @dsize: number of elements in @dst
@@ -482,7 +482,7 @@ static inline struct runlist_element *ntfs_rl_split(struct runlist_element *dst,
 	return dst;
 }
 
-/**
+/*
  * ntfs_runlists_merge - merge two runlists into one
  * @d_runlist: destination runlist structure to merge into
  * @srl: source runlist to merge from
@@ -709,7 +709,7 @@ finished:
 	return drl;
 }
 
-/**
+/*
  * ntfs_mapping_pairs_decompress - convert mapping pairs array to runlist
  * @vol: ntfs volume
  * @attr: attribute record whose mapping pairs to decompress
@@ -954,7 +954,7 @@ err_out:
 	return ERR_PTR(-EIO);
 }
 
-/**
+/*
  * ntfs_rl_vcn_to_lcn - convert a vcn into a lcn given a runlist
  * @rl:		runlist to use for conversion
  * @vcn:	vcn to convert
@@ -1011,7 +1011,7 @@ s64 ntfs_rl_vcn_to_lcn(const struct runlist_element *rl, const s64 vcn)
 	return LCN_ENOENT;
 }
 
-/**
+/*
  * ntfs_rl_find_vcn_nolock - find a vcn in a runlist
  * @rl:		runlist to search
  * @vcn:	vcn to find
@@ -1041,7 +1041,7 @@ struct runlist_element *ntfs_rl_find_vcn_nolock(struct runlist_element *rl, cons
 	return NULL;
 }
 
-/**
+/*
  * ntfs_get_nr_significant_bytes - get number of bytes needed to store a number
  * @n:		number for which to get the number of bytes for
  *
@@ -1072,7 +1072,7 @@ static inline int ntfs_get_nr_significant_bytes(const s64 n)
 	return i;
 }
 
-/**
+/*
  * ntfs_get_size_for_mapping_pairs - get bytes needed for mapping pairs array
  * @vol: ntfs volume
  * @rl: runlist to calculate the mapping pairs array size for
@@ -1208,7 +1208,7 @@ err_out:
 	return rls;
 }
 
-/**
+/*
  * ntfs_write_significant_bytes - write the significant bytes of a number
  * @dst:	destination buffer to write to
  * @dst_max:	pointer to last byte of destination buffer for bounds checking
@@ -1259,7 +1259,7 @@ err_out:
 	return -ENOSPC;
 }
 
-/**
+/*
  * ntfs_mapping_pairs_build - build the mapping pairs array from a runlist
  * @vol: ntfs volume
  * @dst: destination buffer to build mapping pairs array into
@@ -1456,7 +1456,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_rl_truncate_nolock - truncate a runlist starting at a specified vcn
  * @vol:	ntfs volume (needed for error output)
  * @runlist:	runlist to truncate
@@ -1582,7 +1582,7 @@ int ntfs_rl_truncate_nolock(const struct ntfs_volume *vol, struct runlist *const
 	return 0;
 }
 
-/**
+/*
  * ntfs_rl_sparse - check whether runlist have sparse regions or not.
  * @rl:         runlist to check
  *
@@ -1606,7 +1606,7 @@ int ntfs_rl_sparse(struct runlist_element *rl)
 	return 0;
 }
 
-/**
+/*
  * ntfs_rl_get_compressed_size - calculate length of non sparse regions
  * @vol:        ntfs volume (need for cluster size)
  * @rl:         runlist to calculate for

@@ -18,7 +18,7 @@
 #include "aops.h"
 #include "ntfs.h"
 
-/**
+/*
  * ntfs_cluster_free_from_rl_nolock - free clusters from runlist
  * @vol:	mounted ntfs volume on which to free the clusters
  * @rl:		runlist describing the clusters to free
@@ -115,7 +115,7 @@ static s64 max_empty_bit_range(unsigned char *buf, int size)
 	return start_pos;
 }
 
-/**
+/*
  * ntfs_cluster_alloc - allocate clusters on an ntfs volume
  * @vol:		mounted ntfs volume on which to allocate clusters
  * @start_vcn:		vcn of the first allocated cluster
@@ -768,7 +768,7 @@ out:
 	return ERR_PTR(err);
 }
 
-/**
+/*
  * __ntfs_cluster_free - free clusters on an ntfs volume
  * @ni:		ntfs inode whose runlist describes the clusters to free
  * @start_vcn:	vcn in the runlist of @ni at which to start freeing clusters

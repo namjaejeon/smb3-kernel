@@ -30,7 +30,7 @@
 
 __le16 AT_UNNAMED[] = { cpu_to_le16('\0') };
 
-/**
+/*
  * ntfs_map_runlist_nolock - map (a part of) a runlist of an ntfs inode
  * @ni:		ntfs inode for which to map (part of) a runlist
  * @vcn:	map runlist part containing this vcn
@@ -276,7 +276,7 @@ retry_map:
 	return err;
 }
 
-/**
+/*
  * ntfs_map_runlist - map (a part of) a runlist of an ntfs inode
  * @ni:		ntfs inode for which to map (part of) a runlist
  * @vcn:	map runlist part containing this vcn
@@ -334,7 +334,7 @@ remap_rl:
 	return rl;
 }
 
-/**
+/*
  * ntfs_attr_vcn_to_lcn_nolock - convert a vcn into a lcn given an ntfs inode
  * @ni:			ntfs inode of the attribute whose runlist to search
  * @vcn:		vcn to convert
@@ -482,7 +482,7 @@ struct runlist_element *__ntfs_attr_find_vcn_nolock(struct runlist *runlist, con
 	return ERR_PTR(-ENOENT);
 }
 
-/**
+/*
  * ntfs_attr_find_vcn_nolock - find a vcn in the runlist of an ntfs inode
  * @ni:		ntfs inode describing the runlist to search
  * @vcn:	vcn to find
@@ -571,7 +571,7 @@ retry_remap:
 	return ERR_PTR(err);
 }
 
-/**
+/*
  * ntfs_attr_find - find (next) attribute in mft record
  * @type:	attribute type to find
  * @name:	attribute name to find (optional, i.e. NULL means don't care)
@@ -825,7 +825,7 @@ int load_attribute_list(struct ntfs_inode *base_ni, u8 *al_start, const s64 size
 	return 0;
 }
 
-/**
+/*
  * ntfs_external_attr_find - find an attribute in the attribute list of an inode
  * @type:	attribute type to find
  * @name:	attribute name to find (optional, i.e. NULL means don't care)
@@ -1259,7 +1259,7 @@ not_found:
 	return err;
 }
 
-/**
+/*
  * ntfs_attr_lookup - find an attribute in an ntfs inode
  * @type:	attribute type to find
  * @name:	attribute name to find (optional, i.e. NULL means don't care)
@@ -1348,7 +1348,7 @@ static bool ntfs_attr_init_search_ctx(struct ntfs_attr_search_ctx *ctx,
 	return true;
 }
 
-/**
+/*
  * ntfs_attr_reinit_search_ctx - reinitialize an attribute search context
  * @ctx:	attribute search context to reinitialize
  *
@@ -1383,7 +1383,7 @@ void ntfs_attr_reinit_search_ctx(struct ntfs_attr_search_ctx *ctx)
 	ctx->mapped_mrec = mapped_mrec;
 }
 
-/**
+/*
  * ntfs_attr_get_search_ctx - allocate/initialize a new attribute search context
  * @ni:		ntfs inode with which to initialize the search context
  * @mrec:	mft record with which to initialize the search context
@@ -1409,7 +1409,7 @@ struct ntfs_attr_search_ctx *ntfs_attr_get_search_ctx(struct ntfs_inode *ni,
 	return ctx;
 }
 
-/**
+/*
  * ntfs_attr_put_search_ctx - release an attribute search context
  * @ctx:	attribute search context to free
  *
@@ -1427,7 +1427,7 @@ void ntfs_attr_put_search_ctx(struct ntfs_attr_search_ctx *ctx)
 	kmem_cache_free(ntfs_attr_ctx_cache, ctx);
 }
 
-/**
+/*
  * ntfs_attr_find_in_attrdef - find an attribute in the $AttrDef system file
  * @vol:	ntfs volume to which the attribute belongs
  * @type:	attribute type which to find
@@ -1460,7 +1460,7 @@ static struct attr_def *ntfs_attr_find_in_attrdef(const struct ntfs_volume *vol,
 	return NULL;
 }
 
-/**
+/*
  * ntfs_attr_size_bounds_check - check a size of an attribute type for validity
  * @vol:	ntfs volume to which the attribute belongs
  * @type:	attribute type which to check
@@ -1496,7 +1496,7 @@ int ntfs_attr_size_bounds_check(const struct ntfs_volume *vol, const __le32 type
 	return 0;
 }
 
-/**
+/*
  * ntfs_attr_can_be_non_resident - check if an attribute can be non-resident
  * @vol:	ntfs volume to which the attribute belongs
  * @type:	attribute type which to check
@@ -1519,7 +1519,7 @@ static int ntfs_attr_can_be_non_resident(const struct ntfs_volume *vol,
 	return 0;
 }
 
-/**
+/*
  * ntfs_attr_can_be_resident - check if an attribute can be resident
  * @vol:	ntfs volume to which the attribute belongs
  * @type:	attribute type which to check
@@ -1544,7 +1544,7 @@ int ntfs_attr_can_be_resident(const struct ntfs_volume *vol, const __le32 type)
 	return 0;
 }
 
-/**
+/*
  * ntfs_attr_record_resize - resize an attribute record
  * @m:		mft record containing attribute record
  * @a:		attribute record to resize
@@ -1596,7 +1596,7 @@ int ntfs_attr_record_resize(struct mft_record *m, struct attr_record *a, u32 new
 	return 0;
 }
 
-/**
+/*
  * ntfs_resident_attr_value_resize - resize the value of a resident attribute
  * @m:		mft record containing attribute record
  * @a:		attribute record whose value to resize
@@ -1627,7 +1627,7 @@ int ntfs_resident_attr_value_resize(struct mft_record *m, struct attr_record *a,
 	return 0;
 }
 
-/**
+/*
  * ntfs_attr_make_non_resident - convert a resident to a non-resident attribute
  * @ni:		ntfs inode describing the attribute to convert
  * @data_size:	size of the resident data to copy to the non-resident attribute
@@ -1961,7 +1961,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_attr_set - fill (a part of) an attribute with a byte
  * @ni:		ntfs inode describing the attribute to fill
  * @ofs:	offset inside the attribute at which to start to fill
@@ -2043,7 +2043,7 @@ out_ctx:
 	return err;
 }
 
-/**
+/*
  * ntfs_make_room_for_attr - make room for an attribute inside an mft record
  * @m:		mft record
  * @pos:	position at which to make space
@@ -2088,7 +2088,7 @@ static int ntfs_make_room_for_attr(struct mft_record *m, u8 *pos, u32 size)
 	return 0;
 }
 
-/**
+/*
  * ntfs_resident_attr_record_add - add resident attribute to inode
  * @ni:		opened ntfs inode to which MFT record add attribute
  * @type:	type of the new attribute
@@ -2209,7 +2209,7 @@ put_err_out:
 	return -EIO;
 }
 
-/**
+/*
  * ntfs_non_resident_attr_record_add - add extent of non-resident attribute
  * @ni:			opened ntfs inode to which MFT record add attribute
  * @type:		type of the new attribute extent
@@ -2348,7 +2348,7 @@ put_err_out:
 	return -1;
 }
 
-/**
+/*
  * ntfs_attr_record_rm - remove attribute extent
  * @ctx:	search context describing the attribute which should be removed
  *
@@ -2466,7 +2466,7 @@ int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx)
 	return 0;
 }
 
-/**
+/*
  * ntfs_attr_add - add attribute to inode
  * @ni:		opened ntfs inode to which add attribute
  * @type:	type of the new attribute
@@ -2713,7 +2713,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * __ntfs_attr_init - primary initialization of an ntfs attribute structure
  * @ni:		ntfs attribute inode to initialize
  * @ni:		ntfs inode with which to initialize the ntfs attribute
@@ -2735,7 +2735,7 @@ static void __ntfs_attr_init(struct ntfs_inode *ni,
 		ni->name_len = 0;
 }
 
-/**
+/*
  * ntfs_attr_init - initialize an ntfs_attr with data sizes and status
  * @ni: ntfs inode to initialize
  * @non_resident: true if attribute is non-resident
@@ -2785,7 +2785,7 @@ static void ntfs_attr_init(struct ntfs_inode *ni, const bool non_resident,
 	}
 }
 
-/**
+/*
  * ntfs_attr_open - open an ntfs attribute for access
  * @ni:		open ntfs inode in which the ntfs attribute resides
  * @type:	attribute type
@@ -2948,7 +2948,7 @@ err_out:
 	goto out;
 }
 
-/**
+/*
  * ntfs_attr_close - free an ntfs attribute structure
  * @ni:		ntfs inode to free
  *
@@ -2964,7 +2964,7 @@ void ntfs_attr_close(struct ntfs_inode *ni)
 		kfree(ni->name);
 }
 
-/**
+/*
  * ntfs_attr_map_whole_runlist - map the whole runlist of an ntfs attribute
  * @ni:		ntfs inode for which to map the runlist
  *
@@ -3089,7 +3089,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_attr_record_move_to - move attribute record to target inode
  * @ctx:	attribute search context describing the attribute record
  * @ni:		opened ntfs inode to which move attribute record
@@ -3179,7 +3179,7 @@ put_err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_attr_record_move_away - move away attribute record from it's mft record
  * @ctx:	attribute search context describing the attribute record
  * @extra:	minimum amount of free space in the new holder of record
@@ -3399,7 +3399,7 @@ out:
 }
 
 #define NTFS_VCN_DELETE_MARK -2
-/**
+/*
  * ntfs_attr_update_mapping_pairs - update mapping pairs for ntfs attribute
  * @ni:		non-resident ntfs inode for which we need update
  * @from_vcn:	update runlist starting this VCN
@@ -3761,7 +3761,7 @@ put_err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_attr_make_resident - convert a non-resident to a resident attribute
  * @ni:		open ntfs attribute to make resident
  * @ctx:	ntfs search context describing the attribute
@@ -3887,7 +3887,7 @@ static int ntfs_attr_make_resident(struct ntfs_inode *ni, struct ntfs_attr_searc
 	return 0;
 }
 
-/**
+/*
  * ntfs_non_resident_attr_shrink - shrink a non-resident, open ntfs attribute
  * @ni:		non-resident ntfs attribute to shrink
  * @newsize:	new size (in bytes) to which to shrink the attribute
@@ -4050,7 +4050,7 @@ put_err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_non_resident_attr_expand - expand a non-resident, open ntfs attribute
  * @ni:			non-resident ntfs attribute to expand
  * @prealloc_size:	preallocation size (in bytes) to which to expand the attribute
@@ -4318,7 +4318,7 @@ put_err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_resident_attr_resize - resize a resident, open ntfs attribute
  * @attr_ni:		resident ntfs inode to resize
  * @newsize:		new size (in bytes) to which to resize the attribute
@@ -4634,7 +4634,7 @@ int ntfs_attr_expand(struct ntfs_inode *ni, const s64 newsize, const s64 preallo
 	return err;
 }
 
-/**
+/*
  * ntfs_attr_truncate_i - resize an ntfs attribute
  * @ni:		open ntfs inode to resize
  * @newsize:	new size (in bytes) to which to resize the attribute
@@ -4854,7 +4854,7 @@ out:
 	return err;
 }
 
-/**
+/*
  * ntfs_attr_rm - remove attribute from ntfs inode
  * @ni:		opened ntfs attribute to delete
  *
@@ -4976,7 +4976,7 @@ int ntfs_attr_remove(struct ntfs_inode *ni, const __le32 type, __le16 *name,
 	return err;
 }
 
-/**
+/*
  * ntfs_attr_readall - read the entire data from an ntfs attribute
  * @ni:		open ntfs inode in which the ntfs attribute resides
  * @type:	attribute type

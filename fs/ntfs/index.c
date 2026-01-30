@@ -96,7 +96,7 @@ int ntfs_index_entry_inconsistent(struct ntfs_index_context *icx,
 	return 0;
 }
 
-/**
+/*
  * ntfs_index_entry_mark_dirty - mark an index entry dirty
  * @ictx:	ntfs index context describing the index entry
  *
@@ -185,7 +185,7 @@ int ntfs_icx_ib_sync_write(struct ntfs_index_context *icx)
 	return ret;
 }
 
-/**
+/*
  * ntfs_index_ctx_get - allocate and initialize a new index context
  * @ni:		ntfs inode with which to initialize the context
  * @name:	name of the which context describes
@@ -239,7 +239,7 @@ static void ntfs_index_ctx_free(struct ntfs_index_context *icx)
 	}
 }
 
-/**
+/*
  * ntfs_index_ctx_put - release an index context
  * @icx:	index context to free
  *
@@ -251,7 +251,7 @@ void ntfs_index_ctx_put(struct ntfs_index_context *icx)
 	kmem_cache_free(ntfs_index_ctx_cache, icx);
 }
 
-/**
+/*
  * ntfs_index_ctx_reinit - reinitialize an index context
  * @icx:	index context to reinitialize
  *
@@ -695,7 +695,7 @@ static int ntfs_icx_parent_dec(struct ntfs_index_context *icx)
 	return 0;
 }
 
-/**
+/*
  * ntfs_index_lookup - find a key in an index and return its index entry
  * @key:	key for which to search in the index
  * @key_len:	length of @key in bytes
@@ -1272,7 +1272,7 @@ clear_bmp:
 	goto err_out;
 }
 
-/**
+/*
  * ntfs_ir_truncate - Truncate index root attribute
  * @icx: index context
  * @data_size: new data size for the index root
@@ -1301,7 +1301,7 @@ static int ntfs_ir_truncate(struct ntfs_index_context *icx, int data_size)
 	return ret;
 }
 
-/**
+/*
  * ntfs_ir_make_space - Make more space for the index root attribute
  * @icx: index context
  * @data_size: required data size for the index root
@@ -1456,7 +1456,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_ib_split - Split an index block
  * @icx: index context
  * @ib: index block to split
@@ -1585,7 +1585,7 @@ err_out:
 	return ret;
 }
 
-/**
+/*
  * ntfs_index_add_filename - add filename to directory index
  * @ni:		ntfs inode describing directory to which index add filename
  * @fn:		FILE_NAME attribute to add
@@ -1879,7 +1879,7 @@ out:
 	return ret;
 }
 
-/**
+/*
  * ntfs_index_rm - remove entry from the index
  * @icx:	index context describing entry to delete
  *
@@ -1997,7 +1997,7 @@ struct index_entry *ntfs_index_walk_down(struct index_entry *ie, struct ntfs_ind
 	return entry;
 }
 
-/**
+/*
  * ntfs_index_walk_up - walk up the index tree (root bound) until
  * there is a valid data entry in parent returns the parent entry
  * or NULL if no more parent.
@@ -2047,7 +2047,7 @@ static struct index_entry *ntfs_index_walk_up(struct index_entry *ie,
 	return entry;
 }
 
-/**
+/*
  * ntfs_index_next - get next entry in an index according to collating sequence.
  * Returns next entry or NULL if none.
  *

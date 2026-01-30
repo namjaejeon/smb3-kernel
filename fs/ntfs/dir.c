@@ -21,7 +21,7 @@
 __le16 I30[5] = { cpu_to_le16('$'), cpu_to_le16('I'),
 		cpu_to_le16('3'),	cpu_to_le16('0'), 0 };
 
-/**
+/*
  * ntfs_lookup_inode_by_name - find an inode in a directory given its name
  * @dir_ni:	ntfs inode of the directory in which to search for the name
  * @uname:	Unicode name for which to search in the directory
@@ -599,7 +599,7 @@ dir_err_out:
 	goto err_out;
 }
 
-/**
+/*
  * ntfs_filldir - ntfs specific filldir method
  * @vol:	current ntfs volume
  * @ndir:	ntfs inode of current directory
@@ -1079,7 +1079,7 @@ int ntfs_check_empty_dir(struct ntfs_inode *ni, struct mft_record *ni_mrec)
 	return ret;
 }
 
-/**
+/*
  * ntfs_dir_open - called when an inode is about to be opened
  * @vi:		inode to be opened
  * @filp:	file structure describing the inode
@@ -1114,7 +1114,7 @@ static int ntfs_dir_release(struct inode *vi, struct file *filp)
 	return 0;
 }
 
-/**
+/*
  * ntfs_dir_fsync - sync a directory to disk
  * @filp:	file describing the directory to be synced
  * @start:	start offset to be synced

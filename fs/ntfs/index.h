@@ -19,7 +19,7 @@
 
 #define MAX_PARENT_VCN	32
 
-/**
+/*
  * @idx_ni:	index inode containing the @entry described by this context
  * @entry:	index entry (points into @ir or @ia)
  * @data:	index entry data (points into @entry)

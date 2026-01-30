@@ -12,7 +12,7 @@
 #include "logfile.h"
 #include "ntfs.h"
 
-/**
+/*
  * ntfs_check_restart_page_header - check the page header for consistency
  * @vi:		LogFile inode to which the restart page header belongs
  * @rp:		restart page header to check
@@ -115,7 +115,7 @@ skip_usa_checks:
 	return true;
 }
 
-/**
+/*
  * ntfs_check_restart_area - check the restart area for consistency
  * @vi:		LogFile inode to which the restart page belongs
  * @rp:		restart page whose restart area to check
@@ -227,7 +227,7 @@ static bool ntfs_check_restart_area(struct inode *vi, struct restart_page_header
 	return true;
 }
 
-/**
+/*
  * ntfs_check_log_client_array - check the log client array for consistency
  * @vi:		LogFile inode to which the restart page belongs
  * @rp:		restart page whose log client array to check
@@ -292,7 +292,7 @@ err_out:
 	return false;
 }
 
-/**
+/*
  * ntfs_check_and_load_restart_page - check the restart page for consistency
  * @vi:		LogFile inode to which the restart page belongs
  * @rp:		restart page to check
@@ -434,7 +434,7 @@ err_out:
 	return err;
 }
 
-/**
+/*
  * ntfs_check_logfile - check the journal for consistency
  * @log_vi:	struct inode of loaded journal LogFile to check
  * @rp:		[OUT] on success this is a copy of the current restart page
@@ -628,7 +628,7 @@ err_out:
 	return false;
 }
 
-/**
+/*
  * ntfs_empty_logfile - empty the contents of the LogFile journal
  * @log_vi:	struct inode of loaded journal LogFile to empty
  *

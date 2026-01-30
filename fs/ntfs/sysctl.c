@@ -34,7 +34,7 @@ static const struct ctl_table ntfs_sysctls[] = {
 /* Storage for the sysctls header. */
 static struct ctl_table_header *sysctls_root_table;
 
-/**
+/*
  * ntfs_sysctl - add or remove the debug sysctl
  * @add:	add (1) or remove (0) the sysctl
  *

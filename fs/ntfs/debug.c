@@ -7,7 +7,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 #include "debug.h"
 
-/**
+/*
  * __ntfs_warning - output a warning to the syslog
  * @function:	name of function outputting the warning
  * @sb:		super block of mounted ntfs filesystem
@@ -54,7 +54,7 @@ void __ntfs_warning(const char *function, const struct super_block *sb,
 	va_end(args);
 }
 
-/**
+/*
  * __ntfs_error - output an error to the syslog
  * @function:	name of function outputting the error
  * @sb:		super block of mounted ntfs filesystem

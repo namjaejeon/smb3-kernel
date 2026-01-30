@@ -19,7 +19,7 @@ extern int debug_msgs;
 extern __printf(4, 5)
 void __ntfs_debug(const char *file, int line, const char *function,
 		  const char *format, ...);
-/**
+/*
  * ntfs_debug - write a debug level message to syslog
  * @f:		a printf format string containing the message
  * @...:	the variables to substitute into @f

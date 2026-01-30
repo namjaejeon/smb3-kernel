@@ -186,7 +186,7 @@ extern const struct inode_operations ntfs_empty_inode_ops;
 
 extern const struct export_operations ntfs_export_ops;
 
-/**
+/*
  * NTFS_SB - return the ntfs volume given a vfs super block
  * @sb:		VFS super block
  *

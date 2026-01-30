@@ -13,7 +13,7 @@
 
 #include "volume.h"
 
-/**
+/*
  * runlist_element - in memory vcn to lcn mapping array element
  * @vcn:	starting vcn of the current array element
  * @lcn:	starting lcn of the current array element
@@ -35,7 +35,7 @@ struct runlist_element {
 	s64 length;
 };
 
-/**
+/*
  * runlist - in memory vcn to lcn mapping array including a read/write lock
  * @rl:		pointer to an array of runlist elements
  * @lock:	read/write spinlock for serializing access to @rl
