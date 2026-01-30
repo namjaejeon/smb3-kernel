@@ -30,9 +30,24 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#define NTFS_DEF_PREALLOC_SIZE		(64*1024*1024)
+/*
+ * Default pre-allocation size is optimize runlist merge overhead
+ * with small chunk size.
+ */
+#define NTFS_DEF_PREALLOC_SIZE		65536
 
+/*
+ * The log2 of the standard number of clusters per compression block.
+ * A value of 4 corresponds to 16 clusters (1 << 4), which is the
+ * default chunk size used by NTFS LZNT1 compression.
+ */
 #define STANDARD_COMPRESSION_UNIT	4
+
+/*
+ * The maximum cluster size (4KB) allowed for compression to be enabled.
+ * By design, NTFS does not support compression on volumes where the
+ * cluster size exceeds 4096 bytes.
+ */
 #define MAX_COMPRESSION_CLUSTER_SIZE 4096
 
 #define UCHAR_T_SIZE_BITS 1
