@@ -115,11 +115,11 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 			vi->i_ino, ni->type, folio->index);
 
 	/* We have to zero every time due to mmap-at-end-of-file. */
-	if (folio->index >= (i_size >> PAGE_SHIFT)) {
+	if (folio->index >= (i_size >> folio_shift(folio)))
 		/* The page straddles i_size. */
-		unsigned int ofs = i_size & ~PAGE_MASK;
-		folio_zero_segment(folio, ofs, PAGE_SIZE);
-	}
+		folio_zero_segment(folio,
+				   offset_in_folio(folio, i_size),
+				   folio_size(folio));
 
 	lcn = lcn_from_index(vol, ni, folio->index);
 	if (lcn <= LCN_HOLE) {
