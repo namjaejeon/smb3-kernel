@@ -92,10 +92,11 @@ void ntfs_bio_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
-static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
-		struct writeback_control *wbc)
+static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
 {
-	struct inode *vi = VFS_I(ni);
+	struct address_space *mapping = folio->mapping;
+	struct inode *vi = mapping->host;
+	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
 	u8 *kaddr;
 	struct ntfs_inode *locked_nis[PAGE_SIZE / NTFS_BLOCK_SIZE];
@@ -108,9 +109,17 @@ static int ntfs_write_mft_block(struct ntfs_inode *ni, struct folio *folio,
 	s64 end_vcn = ntfs_bytes_to_cluster(vol, ni->allocated_size);
 	unsigned int folio_sz;
 	struct runlist_element *rl;
+	loff_t i_size = i_size_read(vi);
 
 	ntfs_debug("Entering for inode 0x%lx, attribute type 0x%x, folio index 0x%lx.",
 			vi->i_ino, ni->type, folio->index);
+
+	/* We have to zero every time due to mmap-at-end-of-file. */
+	if (folio->index >= (i_size >> PAGE_SHIFT)) {
+		/* The page straddles i_size. */
+		unsigned int ofs = i_size & ~PAGE_MASK;
+		folio_zero_segment(folio, ofs, PAGE_SIZE);
+	}
 
 	lcn = lcn_from_index(vol, ni, folio->index);
 	if (lcn <= LCN_HOLE) {
@@ -400,29 +409,6 @@ static void ntfs_readahead(struct readahead_control *rac)
 	iomap_bio_readahead(rac, &ntfs_read_iomap_ops);
 }
 
-static int ntfs_mft_writepage(struct folio *folio, struct writeback_control *wbc)
-{
-	struct address_space *mapping = folio->mapping;
-	struct inode *vi = mapping->host;
-	struct ntfs_inode *ni = NTFS_I(vi);
-	loff_t i_size;
-	int ret;
-
-	i_size = i_size_read(vi);
-
-	/* We have to zero every time due to mmap-at-end-of-file. */
-	if (folio->index >= (i_size >> PAGE_SHIFT)) {
-		/* The page straddles i_size. */
-		unsigned int ofs = i_size & ~PAGE_MASK;
-
-		folio_zero_segment(folio, ofs, PAGE_SIZE);
-	}
-
-	ret = ntfs_write_mft_block(ni, folio, wbc);
-	mapping_set_error(mapping, ret);
-	return ret;
-}
-
 static int ntfs_mft_writepages(struct address_space *mapping,
 			       struct writeback_control *wbc)
 {
@@ -433,7 +419,7 @@ static int ntfs_mft_writepages(struct address_space *mapping,
 		return -EIO;
 
 	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
-		error = ntfs_mft_writepage(folio, wbc);
+		error = ntfs_write_mft_block(folio, wbc);
 	return error;
 }
 
