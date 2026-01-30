@@ -50,8 +50,6 @@
  */
 #define MAX_COMPRESSION_CLUSTER_SIZE 4096
 
-#define UCHAR_T_SIZE_BITS 1
-
 #define NTFS_B_TO_CLU(vol, b) ((b) >> (vol)->cluster_size_bits)
 #define NTFS_CLU_TO_B(vol, clu) ((u64)(clu) << (vol)->cluster_size_bits)
 #define NTFS_B_TO_CLU_OFS(vol, clu) ((u64)(clu) & (vol)->cluster_size_mask)

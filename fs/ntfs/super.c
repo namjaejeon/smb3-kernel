@@ -1344,7 +1344,7 @@ read_partial_upcase_page:
 		if (size)
 			goto read_partial_upcase_page;
 	}
-	vol->upcase_len = i_size >> UCHAR_T_SIZE_BITS;
+	vol->upcase_len = i_size >> sizeof(unsigned char);
 	ntfs_debug("Read %llu bytes from $UpCase (expected %zu bytes).",
 			i_size, 64 * 1024 * sizeof(__le16));
 	iput(ino);
