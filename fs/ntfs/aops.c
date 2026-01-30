@@ -415,6 +415,20 @@ static int ntfs_mft_writepage(struct folio *folio, struct writeback_control *wbc
 	return ret;
 }
 
+static int ntfs_mft_writepages(struct address_space *mapping,
+			       struct writeback_control *wbc)
+{
+	struct folio *folio = NULL;
+	int error;
+
+	if (NVolShutdown(NTFS_I(mapping->host)->vol))
+		return -EIO;
+
+	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
+		error = ntfs_mft_writepage(folio, wbc);
+	return error;
+}
+
 static int ntfs_writepages(struct address_space *mapping,
 		struct writeback_control *wbc)
 {
@@ -470,6 +484,19 @@ const struct address_space_operations ntfs_aops = {
 	.release_folio		= iomap_release_folio,
 	.invalidate_folio	= iomap_invalidate_folio,
 	.swap_activate          = ntfs_swap_activate,
+};
+
+const struct address_space_operations ntfs_mft_aops = {
+	.read_folio		= ntfs_read_folio,
+	.readahead		= ntfs_readahead,
+	.writepages		= ntfs_mft_writepages,
+	.dirty_folio		= iomap_dirty_folio,
+	.bmap			= ntfs_bmap,
+	.migrate_folio		= filemap_migrate_folio,
+	.is_partially_uptodate	= iomap_is_partially_uptodate,
+	.error_remove_folio	= generic_error_remove_folio,
+	.release_folio		= iomap_release_folio,
+	.invalidate_folio	= iomap_invalidate_folio,
 };
 
 void mark_ntfs_record_dirty(struct folio *folio)
