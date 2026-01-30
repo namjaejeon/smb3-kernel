@@ -610,7 +610,7 @@ err_out:
 	/*
 	 * Current state: all buffers are clean, unlocked, and uptodate.
 	 * The caller should mark the base inode as bad so that no more i/o
-	 * happens.  ->clear_inode() will still be invoked so all extent inodes
+	 * happens.  ->drop_inode() will still be invoked so all extent inodes
 	 * and other allocated memory will be freed.
 	 */
 	if (err == -ENOMEM) {

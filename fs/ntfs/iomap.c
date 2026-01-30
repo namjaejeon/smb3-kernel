@@ -79,7 +79,7 @@ const struct iomap_write_ops ntfs_iomap_folio_ops = {
 	.put_folio = ntfs_iomap_put_folio,
 };
 
-static int ntfs_read_iomap_begin_resident(struct inode *inode, loff_t offset,
+static int ntfs_read_iomap_begin_resident(struct inode *inode, loff_t offset, loff_t length,
 		unsigned int flags, struct iomap *iomap)
 {
 	struct ntfs_inode *base_ni, *ni = NTFS_I(inode);
@@ -118,10 +118,13 @@ static int ntfs_read_iomap_begin_resident(struct inode *inode, loff_t offset,
 	if (offset >= attr_len) {
 		if (flags & IOMAP_REPORT)
 			err = -ENOENT;
-		else
-			err = -EFAULT;
-		goto out;
-	}
+		else {
+			iomap->type = IOMAP_HOLE;
+			iomap->offset = offset;
+			iomap->length = length;
+		}
+                goto out;
+        }
 
 	kattr = (u8 *)ctx->attr + le16_to_cpu(ctx->attr->data.resident.value_offset);
 
@@ -133,7 +136,7 @@ static int ntfs_read_iomap_begin_resident(struct inode *inode, loff_t offset,
 
 	iomap->type = IOMAP_INLINE;
 	iomap->offset = 0;
-	iomap->length = min_t(loff_t, attr_len, PAGE_SIZE);
+	iomap->length = attr_len;
 
 out:
 	if (ctx)
@@ -228,7 +231,8 @@ static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t leng
 		ret = ntfs_read_iomap_begin_non_resident(inode, offset, length,
 				flags, iomap);
 	else
-		ret = ntfs_read_iomap_begin_resident(inode, offset, flags, iomap);
+		ret = ntfs_read_iomap_begin_resident(inode, offset, length,
+				flags, iomap);
 
 	return ret;
 }

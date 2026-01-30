@@ -494,7 +494,7 @@ static ssize_t ntfs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 		}
 
 		file_accessed(iocb->ki_filp);
-		ret = iomap_dio_rw(iocb, to, &ntfs_read_iomap_ops, NULL, IOMAP_DIO_PARTIAL,
+		ret = iomap_dio_rw(iocb, to, &ntfs_read_iomap_ops, NULL, 0,
 				NULL, 0);
 	} else {
 		ret = generic_file_read_iter(iocb, to);
