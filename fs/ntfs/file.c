@@ -240,6 +240,54 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 	return ret;
 }
 
+static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	int err;
+
+	if (NInoCompressed(ni) || NInoEncrypted(ni)) {
+		ntfs_warning(vi->i_sb,
+			"Changes in inode size are not supported yet for %s files, ignoring.",
+			NInoCompressed(ni) ? "compressed" : "encrypted");
+		return -EOPNOTSUPP;
+	} else {
+		loff_t old_size = vi->i_size;
+
+		err = inode_newsize_ok(vi, attr->ia_size);
+		if (err)
+			return err;
+
+		inode_dio_wait(vi);
+		/* Serialize against page faults */
+		if (NInoNonResident(NTFS_I(vi)) && attr->ia_size < old_size) {
+			err = iomap_truncate_page(vi, attr->ia_size, NULL,
+					&ntfs_read_iomap_ops,
+					&ntfs_iomap_folio_ops, NULL);
+			if (err)
+				return err;
+		}
+
+		truncate_setsize(vi, attr->ia_size);
+		err = ntfs_truncate_vfs(vi, attr->ia_size, old_size);
+		if (err) {
+			i_size_write(vi, old_size);
+			return err;
+		}
+
+		if (NInoNonResident(ni) && attr->ia_size > old_size &&
+		    old_size % PAGE_SIZE != 0) {
+			loff_t len = min_t(loff_t,
+					round_up(old_size, PAGE_SIZE) - old_size,
+					attr->ia_size - old_size);
+			err = iomap_zero_range(vi, old_size, len,
+					NULL, &ntfs_seek_iomap_ops,
+					&ntfs_iomap_folio_ops, NULL);
+		}
+	}
+
+	return err;
+}
+
 /*
  * ntfs_setattr
  *
@@ -268,49 +316,12 @@ int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
 
 	if (ia_valid & ATTR_SIZE) {
-		if (NInoCompressed(ni) || NInoEncrypted(ni)) {
-			ntfs_warning(vi->i_sb,
-				     "Changes in inode size are not supported yet for %s files, ignoring.",
-				     NInoCompressed(ni) ? "compressed" : "encrypted");
-			err = -EOPNOTSUPP;
-			goto out;
-		} else {
-			loff_t old_size = vi->i_size;
-
-			err = inode_newsize_ok(vi, attr->ia_size);
+		if (attr->ia_size != vi->i_size) {
+			err = ntfs_setattr_size(vi, attr);
 			if (err)
 				goto out;
-
-			inode_dio_wait(vi);
-			/* Serialize against page faults */
-			if (NInoNonResident(NTFS_I(vi)) &&
-			    attr->ia_size < old_size) {
-				err = iomap_truncate_page(vi, attr->ia_size, NULL,
-							  &ntfs_read_iomap_ops,
-							  &ntfs_iomap_folio_ops, NULL);
-				if (err)
-					goto out;
-			}
-
-			truncate_setsize(vi, attr->ia_size);
-			err = ntfs_truncate_vfs(vi, attr->ia_size, old_size);
-			if (err) {
-				i_size_write(vi, old_size);
-				goto out;
-			}
-
-			if (NInoNonResident(ni) && attr->ia_size > old_size &&
-				old_size % PAGE_SIZE != 0) {
-				loff_t len = min_t(loff_t,
-							round_up(old_size, PAGE_SIZE) - old_size,
-							attr->ia_size - old_size);
-				err = iomap_zero_range(vi, old_size, len,
-						       NULL, &ntfs_seek_iomap_ops,
-						       &ntfs_iomap_folio_ops, NULL);
-			}
 		}
-		if (ia_valid == ATTR_SIZE)
-			goto out;
+
 		ia_valid |= ATTR_MTIME | ATTR_CTIME;
 	}
 
