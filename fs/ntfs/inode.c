@@ -636,7 +636,10 @@ void ntfs_set_vfs_operations(struct inode *inode, mode_t mode, dev_t dev)
 			inode->i_op = &ntfs_file_inode_ops;
 			inode->i_fop = &ntfs_file_ops;
 		}
-		inode->i_mapping->a_ops = &ntfs_aops;
+		if (inode->i_ino == FILE_MFT)
+			inode->i_mapping->a_ops = &ntfs_mft_aops;
+		else
+			inode->i_mapping->a_ops = &ntfs_aops;
 	}
 }
 
@@ -1921,10 +1924,7 @@ int ntfs_read_inode_mount(struct inode *vi)
 	vi->i_generation = ni->seq_no = le16_to_cpu(m->sequence_number);
 
 	/* Provides read_folio() for map_mft_record(). */
-	if (vi->i_ino == FILE_MFT)
-		vi->i_mapping->a_ops = &ntfs_mft_aops;
-	else
-		vi->i_mapping->a_ops = &ntfs_aops;
+	vi->i_mapping->a_ops = &ntfs_mft_aops;
 
 	ctx = ntfs_attr_get_search_ctx(ni, m);
 	if (!ctx) {

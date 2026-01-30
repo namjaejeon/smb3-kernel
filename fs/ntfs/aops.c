@@ -454,15 +454,6 @@ static int ntfs_writepages(struct address_space *mapping,
 	if (!NInoNonResident(ni))
 		return 0;
 
-	if (NInoMstProtected(ni) && ni->mft_no == FILE_MFT) {
-		struct folio *folio = NULL;
-		int error;
-
-		while ((folio = writeback_iter(mapping, wbc, folio, &error)))
-			error = ntfs_mft_writepage(folio, wbc);
-		return error;
-	}
-
 	/* If file is encrypted, deny access, just like NT4. */
 	if (NInoEncrypted(ni)) {
 		ntfs_debug("Denying write access to encrypted file.");
