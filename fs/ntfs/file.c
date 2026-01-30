@@ -240,18 +240,13 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 	return ret;
 }
 
-/**
- * ntfs_setattr - called from notify_change() when an attribute is being changed
- * @idmap:	idmap of the mount the inode was found from
- * @dentry:	dentry whose attributes to change
- * @attr:	structure describing the attributes and the changes
+/*
+ * ntfs_setattr
  *
- * We have to trap VFS attempts to truncate the file described by @dentry as
- * soon as possible, because we do not implement changes in i_size yet.  So we
- * abort all i_size changes here.
+ * Called from notify_change() when an attribute is being changed.
  *
- * We also abort all changes of user, group, and mode as we do not implement
- * the NTFS ACLs yet.
+ * NOTE: Changes in inode size are not supported yet for compressed or
+ * encrypted files.
  */
 int ntfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct iattr *attr)
