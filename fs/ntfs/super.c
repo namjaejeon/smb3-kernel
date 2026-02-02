@@ -560,7 +560,7 @@ static char *read_ntfs_boot_sector(struct super_block *sb,
 	if (!boot_sector)
 		return NULL;
 
-	if (ntfs_rw_bdev(sb->s_bdev, 0, PAGE_SIZE, boot_sector, REQ_OP_READ)) {
+	if (ntfs_bdev_read(sb->s_bdev, 0, PAGE_SIZE, boot_sector)) {
 		if (!silent)
 			ntfs_error(sb, "Unable to read primary boot sector.");
 		kfree(boot_sector);

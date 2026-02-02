@@ -5,8 +5,6 @@
  * Copyright (c) 2002-2007 Anton Altaparmakov
  */
 
-#include <linux/bio.h>
-
 #include "attrib.h"
 #include "aops.h"
 #include "logfile.h"
@@ -729,7 +727,7 @@ map_vcn:
 			start >> PAGE_SHIFT, (end - start) >> PAGE_SHIFT);
 
 		do {
-			err = ntfs_dev_write(sb, empty_buf, start,
+			err = ntfs_bdev_write(sb, empty_buf, start,
 						  vol->cluster_size);
 			if (err) {
 				ntfs_error(sb, "ntfs_dev_write failed, err : %d\n", err);
