@@ -78,7 +78,7 @@ static inline int write_mft_record(struct ntfs_inode *ni, struct mft_record *m, 
 
 bool ntfs_may_write_mft_record(struct ntfs_volume *vol,
 		const unsigned long mft_no, const struct mft_record *m,
-		struct ntfs_inode **locked_ni);
+		struct ntfs_inode **locked_ni, struct inode **ref_vi);
 int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
 		struct ntfs_inode **ni, struct ntfs_inode *base_ni,
 		struct mft_record **ni_mrec);

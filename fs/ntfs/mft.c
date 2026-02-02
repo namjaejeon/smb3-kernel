@@ -673,6 +673,7 @@ static int ntfs_test_inode_wb(struct inode *vi, unsigned long ino, void *data)
  * @mft_no:	[IN]  mft record number of the mft record to check
  * @m:		[IN]  mapped mft record to check
  * @locked_ni:	[OUT] caller has to unlock this ntfs inode if one is returned
+ * @ref_vi:	[OUT] caller has to drop this vfs inode if one is returned
  *
  * Check if the mapped (base or extent) mft record @m with mft record number
  * @mft_no belonging to the ntfs volume @vol may be written out.  If necessary
@@ -680,6 +681,11 @@ static int ntfs_test_inode_wb(struct inode *vi, unsigned long ino, void *data)
  * inode is pinned.  The locked ntfs inode is then returned in @locked_ni.  The
  * caller is responsible for unlocking the ntfs inode and unpinning the base
  * vfs inode.
+ *
+ * To avoid deadlock when the caller holds a folio lock, if the function
+ * returns @ref_vi it defers dropping the vfs inode reference by returning
+ * it in @ref_vi instead of calling iput() directly.  The caller must call
+ * iput() on @ref_vi after releasing the folio lock.
  *
  * Return 'true' if the mft record may be written out and 'false' if not.
  *
@@ -728,7 +734,8 @@ static int ntfs_test_inode_wb(struct inode *vi, unsigned long ino, void *data)
  * record. We set @locked_ni to the now locked ntfs inode and return 'true'.
  */
 bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_no,
-		const struct mft_record *m, struct ntfs_inode **locked_ni)
+		const struct mft_record *m, struct ntfs_inode **locked_ni,
+		struct inode **ref_vi)
 {
 	struct super_block *sb = vol->sb;
 	struct inode *mft_vi = vol->mft_ino;
@@ -742,6 +749,8 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 	 * Normally we do not return a locked inode so set @locked_ni to NULL.
 	 */
 	*locked_ni = NULL;
+	*ref_vi = NULL;
+
 	/*
 	 * Check if the inode corresponding to this mft record is in the VFS
 	 * inode cache and obtain a reference to it if it is.
@@ -778,7 +787,7 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 			ntfs_debug("Inode 0x%lx is dirty, do not write it.",
 					mft_no);
 			atomic_dec(&ni->count);
-			iput(vi);
+			*ref_vi = vi;
 			return false;
 		}
 		ntfs_debug("Inode 0x%lx is not dirty.", mft_no);
@@ -786,7 +795,7 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 		if (unlikely(!mutex_trylock(&ni->mrec_lock))) {
 			ntfs_debug("Mft record 0x%lx is already locked, do not write it.", mft_no);
 			atomic_dec(&ni->count);
-			iput(vi);
+			*ref_vi = vi;
 			return false;
 		}
 		ntfs_debug("Managed to lock mft record 0x%lx, write it.",
@@ -846,7 +855,7 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 		 * extent mft record.
 		 */
 		mutex_unlock(&ni->extent_lock);
-		iput(vi);
+		*ref_vi = vi;
 		ntfs_debug("Base inode 0x%lx has no attached extent inodes, write the extent record.",
 				na.mft_no);
 		return true;
@@ -869,7 +878,7 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 	 */
 	if (!eni) {
 		mutex_unlock(&ni->extent_lock);
-		iput(vi);
+		*ref_vi = vi;
 		ntfs_debug("Extent inode 0x%lx is not attached to its base inode 0x%lx, write the extent record.",
 				mft_no, na.mft_no);
 		return true;
@@ -883,7 +892,7 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 	/* if extent inode is dirty, write_inode will write it */
 	if (NInoDirty(eni)) {
 		atomic_dec(&eni->count);
-		iput(vi);
+		*ref_vi = vi;
 		return false;
 	}
 
@@ -893,7 +902,7 @@ bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const unsigned long mft_
 	 */
 	if (unlikely(!mutex_trylock(&eni->mrec_lock))) {
 		atomic_dec(&eni->count);
-		iput(vi);
+		*ref_vi = vi;
 		ntfs_debug("Extent mft record 0x%lx is already locked, do not write it.",
 				mft_no);
 		return false;
@@ -2682,6 +2691,8 @@ int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
 	u8 *kaddr;
 	struct ntfs_inode *locked_nis[PAGE_SIZE / NTFS_BLOCK_SIZE];
 	int nr_locked_nis = 0, err = 0, mft_ofs, prev_mft_ofs;
+	struct inode *ref_inos[PAGE_SIZE / NTFS_BLOCK_SIZE];
+	int nr_ref_inos = 0;
 	struct bio *bio = NULL;
 	unsigned long mft_no;
 	struct ntfs_inode *tni;
@@ -2724,7 +2735,8 @@ int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
 		/* Check whether to write this mft record. */
 		tni = NULL;
 		if (ntfs_may_write_mft_record(vol, mft_no,
-					(struct mft_record *)(kaddr + mft_ofs), &tni)) {
+					(struct mft_record *)(kaddr + mft_ofs),
+					&tni, &ref_inos[nr_ref_inos])) {
 			unsigned int mft_record_off = 0;
 			s64 vcn_off = vcn;
 
@@ -2748,6 +2760,8 @@ int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
 			 */
 			if (tni)
 				locked_nis[nr_locked_nis++] = tni;
+			else if (ref_inos[nr_ref_inos])
+				nr_ref_inos++;
 
 			if (bio && (mft_ofs != prev_mft_ofs + vol->mft_record_size)) {
 flush_bio:
@@ -2811,7 +2825,8 @@ flush_bio:
 			if (mft_no < vol->mftmirr_size)
 				ntfs_sync_mft_mirror(vol, mft_no,
 						(struct mft_record *)(kaddr + mft_ofs));
-		}
+		} else if (ref_inos[nr_ref_inos])
+			nr_ref_inos++;
 	}
 
 	if (bio) {
@@ -2845,6 +2860,12 @@ unm_done:
 				tni->mft_no);
 		atomic_dec(&tni->count);
 		iput(VFS_I(base_tni));
+	}
+
+	/* Dropping deferred references */
+	while (nr_ref_inos-- > 0) {
+		if (ref_inos[nr_ref_inos])
+			iput(ref_inos[nr_ref_inos]);
 	}
 
 	if (unlikely(err && err != -ENOMEM))
