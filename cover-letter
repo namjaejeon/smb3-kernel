@@ -128,7 +128,7 @@ Write support                         Yes        Yes
 iomap support                         Yes        No
 No buffer head                        Yes        No
 Public utilities(mkfs, fsck, etc.)    Yes        No
-xfstests passed                       308        235
+xfstests passed                       326        256
 Idmapped mount                        Yes        No
 Delayed allocation                    Yes        No
 Bonnie++                              Pass       Fail
