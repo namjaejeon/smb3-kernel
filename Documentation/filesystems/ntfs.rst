@@ -16,10 +16,8 @@ Overview
 ========
 
 NTFS is a Linux kernel filesystem driver that provides full read and write
-support for NTFS volumes. It is designed for high performance, modern kernel
-infrastructure (iomap, folio), and stable long-term maintenance. The driver
-also supports filesystem utilities such as mkfs.ntfs and fsck.ntfs for
-creation and consistency checking.
+support for NTFS volumes. It is designed for high performance, modern
+kernel infrastructure (iomap, folio), and stable long-term maintenance.
 
 
 Utilities support
