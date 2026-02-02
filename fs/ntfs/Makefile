@@ -1,7 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0
-#
-# Makefile for the ntfs filesystem support.
-#
 
 obj-$(CONFIG_NTFS_FS) += ntfs.o
 
