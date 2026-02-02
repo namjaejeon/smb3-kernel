@@ -98,7 +98,7 @@ Key Features
 
 - Stability improvement:
    a. Pass more xfstests tests:
-      ntfs passed 308 tests, significantly higher than ntfs3's 235.
+      ntfs passed 326 tests, significantly higher than ntfs3's 256.
       ntfs passed tests are a complete superset of the tests passed
       by ntfs3. ntfs implement fallocate, idmapped mount and permission,
       etc, resulting in a significantly high number of xfstests passing
@@ -214,15 +214,15 @@ v2:
 Appendix: xfstests Results on ntfs
 
 Summary
-- Total tests run: 785
-- Passed: 304
-- Failed: 39 
-- Not run / skipped: 442
+- Total tests run: 787
+- Passed: 326
+- Failed: 38
+- Not run / skipped: 423
 
 Failed test cases and reasons
-  - Requires metadata journaling (35 tests)  
-    043, 056, 057, 065, 066, 073, 104, 225, 299, 335, 336, 341, 342, 343,
-    348, 376, 388, 417, 420, 439, 475, 498, 502, 510, 526, 527, 530, 552,
+  - Requires metadata journaling (34 tests)
+    043, 056, 051, 057, 065, 066, 073, 104, 225, 335, 336, 341, 342, 343,
+    348, 376, 388, 417, 475, 498, 502, 510, 526, 527, 530, 552,
     640, 690, 764, 771, 779, 782, 784, 785
 
   - Others (4 tests)
