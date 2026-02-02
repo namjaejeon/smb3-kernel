@@ -197,20 +197,6 @@ static void ntfs_readahead(struct readahead_control *rac)
 	iomap_bio_readahead(rac, &ntfs_read_iomap_ops);
 }
 
-static int ntfs_mft_writepages(struct address_space *mapping,
-			       struct writeback_control *wbc)
-{
-	struct folio *folio = NULL;
-	int error;
-
-	if (NVolShutdown(NTFS_I(mapping->host)->vol))
-		return -EIO;
-
-	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
-		error = ntfs_write_mft_block(folio, wbc);
-	return error;
-}
-
 static int ntfs_writepages(struct address_space *mapping,
 		struct writeback_control *wbc)
 {

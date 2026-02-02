@@ -8,6 +8,7 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
+#include <linux/writeback.h>
 #include <linux/bio.h>
 
 #include "aops.h"
@@ -2694,7 +2695,7 @@ static s64 lcn_from_index(struct ntfs_volume *vol, struct ntfs_inode *ni,
  *
  * Return: 0 on success, or -errno on error.
  */
-int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
+static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc)
 {
 	struct address_space *mapping = folio->mapping;
 	struct inode *vi = mapping->host;
@@ -2885,4 +2886,30 @@ unm_done:
 	if (likely(!err))
 		ntfs_debug("Done.");
 	return err;
+}
+
+/*
+ * ntfs_mft_writepages - Write back dirty folios for the $MFT inode
+ * @mapping:	address space of the $MFT inode
+ * @wbc:	writeback control
+ *
+ * Writeback iterator for MFT records. Iterates over dirty folios and
+ * delegates actual writing to ntfs_write_mft_block() for each folio.
+ * Called from the address_space_operations .writepages vector of the
+ * $MFT inode.
+ *
+ * Returns 0 on success, or the first error encountered.
+ */
+int ntfs_mft_writepages(struct address_space *mapping,
+		struct writeback_control *wbc)
+{
+	struct folio *folio = NULL;
+	int error;
+
+	if (NVolShutdown(NTFS_I(mapping->host)->vol))
+		return -EIO;
+
+	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
+		error = ntfs_write_mft_block(folio, wbc);
+	return error;
 }

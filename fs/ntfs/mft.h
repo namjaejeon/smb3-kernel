@@ -87,6 +87,7 @@ int ntfs_mft_records_write(const struct ntfs_volume *vol, const u64 mref,
 		const s64 count, struct mft_record *b);
 int ntfs_mft_record_check(const struct ntfs_volume *vol, struct mft_record *m,
 			  unsigned long mft_no);
-int ntfs_write_mft_block(struct folio *folio, struct writeback_control *wbc);
+int ntfs_mft_writepages(struct address_space *mapping,
+		struct writeback_control *wbc);
 
 #endif /* _LINUX_NTFS_MFT_H */
