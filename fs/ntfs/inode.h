@@ -51,7 +51,6 @@ enum ntfs_inode_mutex_lock_class {
  *   is resident (file and fake inode) or there is no $I30 index allocation
  *   attribute (small directory). In the latter case runlist.rl is always
  *   NULL.
- * @lcn_seek_trunc: lcn for seek when opened with O_TRUNC.
  * @data_size: Copy from the attribute record.
  * @initialized_size: Copy from the attribute record.
  * @allocated_size: Copy from the attribute record.
@@ -109,7 +108,6 @@ struct ntfs_inode {
 	__le16 *name;
 	u32 name_len;
 	struct runlist runlist;
-	s64 lcn_seek_trunc;
 	s64 data_size;
 	s64 initialized_size;
 	s64 allocated_size;

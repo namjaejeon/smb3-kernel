@@ -461,7 +461,6 @@ void __ntfs_init_inode(struct super_block *sb, struct ntfs_inode *ni)
 	atomic_set(&ni->count, 1);
 	ni->vol = NTFS_SB(sb);
 	ntfs_init_runlist(&ni->runlist);
-	ni->lcn_seek_trunc = LCN_RL_NOT_MAPPED;
 	mutex_init(&ni->mrec_lock);
 	if (ni->type == AT_ATTRIBUTE_LIST) {
 		lockdep_set_class(&ni->mrec_lock,

@@ -54,24 +54,6 @@ static int ntfs_file_open(struct inode *vi, struct file *filp)
 			return -EOVERFLOW;
 	}
 
-	if (filp->f_flags & O_TRUNC && NInoNonResident(ni)) {
-		int err;
-
-		mutex_lock(&ni->mrec_lock);
-		down_read(&ni->runlist.lock);
-		if (!ni->runlist.rl) {
-			err = ntfs_attr_map_whole_runlist(ni);
-			if (err) {
-				up_read(&ni->runlist.lock);
-				mutex_unlock(&ni->mrec_lock);
-				return err;
-			}
-		}
-		ni->lcn_seek_trunc = ni->runlist.rl->lcn;
-		up_read(&ni->runlist.lock);
-		mutex_unlock(&ni->mrec_lock);
-	}
-
 	filp->f_mode |= FMODE_NOWAIT | FMODE_CAN_ODIRECT;
 
 	return generic_file_open(vi, filp);
