@@ -40,38 +40,38 @@ Supported mount options
 The NTFS+ driver supports the following mount options:
 
 ======================= ===================================================
-iocharset=name		Character set to use for converting between
+iocharset=name          Character set to use for converting between
                         the encoding is used for user visible filename and
                         16 bit Unicode characters.
 
-nls=name		Deprecated option.  Still supported but please use
+nls=name                Deprecated option.  Still supported but please use
                         iocharset=name in the future.
 
 uid=
 gid=
-umask=			Provide default owner, group, and access mode mask.
-			These options work as documented in mount(8).  By
-			default, the files/directories are owned by root
+umask=                  Provide default owner, group, and access mode mask.
+                        These options work as documented in mount(8).  By
+                        default, the files/directories are owned by root
                         and he/she has read and write permissions, as well
                         as browse permission for directories.  No one else
                         has any access permissions.  I.e. the mode on all
                         files is by default rw------- and
                         for directories rwx------, a consequence of
                         the default fmask=0177 and dmask=0077.
-			Using a umask of zero will grant all permissions to
-			everyone, i.e. all files and directories will have
+                        Using a umask of zero will grant all permissions to
+                        everyone, i.e. all files and directories will have
                         mode rwxrwxrwx.
 
 fmask=
-dmask=			Instead of specifying umask which applies both to
-			files and directories, fmask applies only to files
+dmask=                  Instead of specifying umask which applies both to
+                        files and directories, fmask applies only to files
                         and dmask only to directories.
 
 showmeta=<BOOL>
-show_sys_files=<BOOL>	If show_sys_files is specified, show the system
+show_sys_files=<BOOL>   If show_sys_files is specified, show the system
                         files in directory listings.  Otherwise the default
                         behaviour is to hide the system files.
-			Note that even when show_sys_files is specified,
+                        Note that even when show_sys_files is specified,
                         "$MFT" will not be visible due to bugs/mis-features
                         in glibc. Further, note that irrespective of
                         show_sys_files, all files are accessible by name,
@@ -79,7 +79,7 @@ show_sys_files=<BOOL>	If show_sys_files is specified, show the system
                         to specifically show the system file containing
                         the Unicode upcase table.
 
-case_sensitive=<BOOL>	If case_sensitive is specified, treat all filenames
+case_sensitive=<BOOL>   If case_sensitive is specified, treat all filenames
                         as case sensitive and create file names in
                         the POSIX namespace (default behavior). Note,
                         the Linux NTFS driver will never create short
@@ -88,23 +88,23 @@ case_sensitive=<BOOL>	If case_sensitive is specified, treat all filenames
                         remain accessible via their short file name, if it
                         exists.
 
-nocase=<BOOL>		If nocase is specified, treat filenames
+nocase=<BOOL>           If nocase is specified, treat filenames
                         case-insensitively.
 
-disable_sparse=<BOOL>	If disable_sparse is specified, creation of sparse
-			regions, i.e. holes, inside files is disabled for
+disable_sparse=<BOOL>   If disable_sparse is specified, creation of sparse
+                        regions, i.e. holes, inside files is disabled for
                         the volume (for the duration of this mount only).
                         By default, creation of sparse regions is enabled,
                         which is consistent with the behaviour of
                         traditional Unix filesystems.
 
-errors=opt		Specify NTFS+ behavior on critical errors: panic,
+errors=opt              Specify NTFS+ behavior on critical errors: panic,
                         remount the partition in read-only mode or
                         continue without doing anything (default behavior).
 
-mft_zone_multiplier=	Set the MFT zone multiplier for the volume (this
-			setting is not persistent across mounts and can be
-			changed from mount to mount but cannot be changed
+mft_zone_multiplier=    Set the MFT zone multiplier for the volume (this
+                        setting is not persistent across mounts and can be
+                        changed from mount to mount but cannot be changed
                         on remount).  Values of 1 to 4 are allowed, 1 being
                         the default.  The MFT zone multiplier determines
                         how much space is reserved for the MFT on the
@@ -117,43 +117,43 @@ mft_zone_multiplier=	Set the MFT zone multiplier for the volume (this
                         a higher value.  The values have the following
                         meaning:
 
-			      =====	 =================================
-			      Value	  MFT zone size (% of volume size)
-			      =====	 =================================
-				1	        12.5%
-				2		25%
-				3		37.5%
-				4		50%
-			      =====	 =================================
+                        =====   =================================
+                        Value   MFT zone size (% of volume size)
+                        =====   =================================
+                          1             12.5%
+                          2             25%
+                          3             37.5%
+                          4             50%
+                        =====   =================================
 
-			Note this option is irrelevant for read-only mount.
+                        Note this option is irrelevant for read-only mount.
 
-preallocated_size=	Set preallocated size to optimize runlist merge
+preallocated_size=      Set preallocated size to optimize runlist merge
                         overhead with small chunck size.(64KB size by
                         default)
 
-acl=<BOOL>		Enable POSIX ACL support. When specified, POSIX
+acl=<BOOL>              Enable POSIX ACL support. When specified, POSIX
                         ACLs stored in extended attributes are enforced.
                         Default is off. Requires kernel config
                         NTFS_FS_POSIX_ACL enabled.
 
-sys_immutable=<BOOL>	Make NTFS system files (e.g. $MFT, $LogFile,
+sys_immutable=<BOOL>    Make NTFS system files (e.g. $MFT, $LogFile,
                         $Bitmap, $UpCase, etc.) immutable to user initiated
                         modifications for extra safety. Default is off.
 
-nohidden=<BOOL>		Hide files and directories marked with the Windows
-			"hidden" attribute. By default hidden items are
+nohidden=<BOOL>         Hide files and directories marked with the Windows
+                        "hidden" attribute. By default hidden items are
                         shown.
 
-hide_dot_files=<BOOL>	Hide names beginning with a dot ("."). By default
+hide_dot_files=<BOOL>   Hide names beginning with a dot ("."). By default
                         dot files are shown. When enabled, files and
                         directories created with a leading '.' will be
                         hidden from directory listings.
 
-windows_names=<BOOL>	Refuse creation/rename of files with characters or
-			reserved device names disallowed on Windows (e.g.
+windows_names=<BOOL>    Refuse creation/rename of files with characters or
+                        reserved device names disallowed on Windows (e.g.
                         CON, NUL, AUX, COM1, LPT1, etc.). Default is off.
-discard=<BOOL>		Issue block device discard for clusters freed on
-			file deletion/truncation to inform underlying
+discard=<BOOL>          Issue block device discard for clusters freed on
+                        file deletion/truncation to inform underlying
                         storage.
 ======================= ==================================================
