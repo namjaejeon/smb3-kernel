@@ -59,48 +59,69 @@ static int ntfs_file_open(struct inode *vi, struct file *filp)
 	return generic_file_open(vi, filp);
 }
 
-static int ntfs_file_release(struct inode *vi, struct file *filp)
+/*
+ * Trim preallocated space on file release.
+ *
+ * When the preallo_size mount option is set (default 64KB), writes extend
+ * allocated_size and runlist in units of preallocated size to reduce
+ * runlist merge overhead for small writes. This can leave
+ * allocated_size > data_size if not all preallocated space is used.
+ *
+ * We perform the trim here because ->release() is called only when
+ * the file is no longer open. At this point, no further writes can occur,
+ * so it is safe to reclaim the unused preallocated space.
+ *
+ * Returns 0 on success, or negative error on failure.
+ */
+static int ntfs_trim_prealloc(struct inode *vi)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
+	struct runlist_element *rl = ni->runlist.rl;
 	s64 aligned_data_size = round_up(ni->data_size, vol->cluster_size);
-
-	if (NInoCompressed(ni))
-		return 0;
+	s64 vcn_ds = ntfs_bytes_to_cluster(vol, aligned_data_size);
+	s64 vcn_tr = -1;
+	ssize_t rc = ni->runlist.count - 2;
+	int err = 0;
 
 	inode_lock(vi);
 	mutex_lock(&ni->mrec_lock);
 	down_write(&ni->runlist.lock);
-	if (aligned_data_size < ni->allocated_size) {
-		int err;
-		s64 vcn_ds = ntfs_bytes_to_cluster(vol, aligned_data_size);
-		s64 vcn_tr = -1;
-		struct runlist_element *rl = ni->runlist.rl;
-		ssize_t rc = ni->runlist.count - 2;
+	if (aligned_data_size >= ni->allocated_size)
+		goto out_unlock;
 
-		while (rc >= 0 && rl[rc].lcn == LCN_HOLE && vcn_ds <= rl[rc].vcn) {
-			vcn_tr = rl[rc].vcn;
-			rc--;
-		}
+	while (rc >= 0 && rl[rc].lcn == LCN_HOLE && vcn_ds <= rl[rc].vcn) {
+		vcn_tr = rl[rc].vcn;
+		rc--;
+	}
 
-		if (vcn_tr >= 0) {
-			err = ntfs_rl_truncate_nolock(vol, &ni->runlist, vcn_tr);
-			if (err) {
-				kvfree(ni->runlist.rl);
-				ni->runlist.rl = NULL;
-				ntfs_error(vol->sb, "Preallocated block rollback failed");
-			} else {
-				ni->allocated_size = ntfs_cluster_to_bytes(vol, vcn_tr);
-				err = ntfs_attr_update_mapping_pairs(ni, 0);
-				if (err)
-					ntfs_error(vol->sb,
-						   "Failed to rollback mapping pairs for prealloc");
-			}
+	if (vcn_tr >= 0) {
+		err = ntfs_rl_truncate_nolock(vol, &ni->runlist, vcn_tr);
+		if (err) {
+			kvfree(ni->runlist.rl);
+			ni->runlist.rl = NULL;
+			ntfs_error(vol->sb, "Preallocated block rollback failed");
+		} else {
+			ni->allocated_size = ntfs_cluster_to_bytes(vol, vcn_tr);
+			err = ntfs_attr_update_mapping_pairs(ni, 0);
+			if (err)
+				ntfs_error(vol->sb,
+					   "Failed to rollback mapping pairs for prealloc");
 		}
 	}
+
+out_unlock:
 	up_write(&ni->runlist.lock);
 	mutex_unlock(&ni->mrec_lock);
 	inode_unlock(vi);
+
+	return err;
+}
+
+static int ntfs_file_release(struct inode *vi, struct file *filp)
+{
+	if (!NInoCompressed(NTFS_I(vi)))
+		return ntfs_trim_prealloc(vi);
 
 	return 0;
 }
