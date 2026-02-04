@@ -263,17 +263,11 @@ static int __ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t le
 		unsigned int flags, struct iomap *iomap, struct iomap *srcmap,
 		bool need_unwritten)
 {
-	struct ntfs_inode *ni = NTFS_I(inode);
-	int ret;
-
-	if (NInoNonResident(ni))
-		ret = ntfs_read_iomap_begin_non_resident(inode, offset, length,
+	if (NInoNonResident(NTFS_I(inode)))
+		return ntfs_read_iomap_begin_non_resident(inode, offset, length,
 				flags, iomap, need_unwritten);
-	else
-		ret = ntfs_read_iomap_begin_resident(inode, offset, length,
-				flags, iomap);
-
-	return ret;
+	return ntfs_read_iomap_begin_resident(inode, offset, length,
+					     flags, iomap);
 }
 
 static int ntfs_read_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
