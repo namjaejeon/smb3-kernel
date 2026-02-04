@@ -81,7 +81,7 @@ static bool valid_reparse_data(struct ntfs_inode *ni,
 {
 	const struct wsl_link_reparse_data *wsl_reparse_data =
 		(const struct wsl_link_reparse_data *)reparse_attr->reparse_data;
-	unsigned int data_len = reparse_attr->reparse_data_length;
+	unsigned int data_len = le16_to_cpu(reparse_attr->reparse_data_length);
 
 	if (ntfs_is_valid_reparse_buffer(ni, reparse_attr, size) == false)
 		return false;
