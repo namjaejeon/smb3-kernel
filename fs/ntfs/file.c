@@ -76,18 +76,24 @@ static int ntfs_trim_prealloc(struct inode *vi)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
-	struct runlist_element *rl = ni->runlist.rl;
-	s64 aligned_data_size = round_up(ni->data_size, vol->cluster_size);
-	s64 vcn_ds = ntfs_bytes_to_cluster(vol, aligned_data_size);
-	s64 vcn_tr = -1;
-	ssize_t rc = ni->runlist.count - 2;
+	struct runlist_element *rl;
+	s64 aligned_data_size;
+	s64 vcn_ds, vcn_tr;
+	ssize_t rc;
 	int err = 0;
 
 	inode_lock(vi);
 	mutex_lock(&ni->mrec_lock);
 	down_write(&ni->runlist.lock);
+
+	aligned_data_size = round_up(ni->data_size, vol->cluster_size);
 	if (aligned_data_size >= ni->allocated_size)
 		goto out_unlock;
+
+	vcn_ds = ntfs_bytes_to_cluster(vol, aligned_data_size);
+	vcn_tr = -1;
+	rc = ni->runlist.count - 2;
+	rl = ni->runlist.rl;
 
 	while (rc >= 0 && rl[rc].lcn == LCN_HOLE && vcn_ds <= rl[rc].vcn) {
 		vcn_tr = rl[rc].vcn;
