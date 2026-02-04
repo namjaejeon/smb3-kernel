@@ -25,7 +25,6 @@
 #include "debug.h"
 #include "mft.h"
 #include "ntfs.h"
-#include "aops.h"
 #include "iomap.h"
 
 __le16 AT_UNNAMED[] = { cpu_to_le16('\0') };

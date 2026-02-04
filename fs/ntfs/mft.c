@@ -10,8 +10,8 @@
 
 #include <linux/writeback.h>
 #include <linux/bio.h>
+#include <linux/iomap.h>
 
-#include "aops.h"
 #include "bitmap.h"
 #include "lcnalloc.h"
 #include "mft.h"
