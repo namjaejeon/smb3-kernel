@@ -8,10 +8,7 @@
  */
 
 #include <linux/writeback.h>
-#include <linux/mpage.h>
-#include <linux/uio.h>
 
-#include "aops.h"
 #include "attrib.h"
 #include "mft.h"
 #include "ntfs.h"
@@ -192,11 +189,12 @@ static void ntfs_readahead(struct readahead_control *rac)
 	struct inode *inode = mapping->host;
 	struct ntfs_inode *ni = NTFS_I(inode);
 
-	if (!NInoNonResident(ni) || NInoCompressed(ni)) {
-		/* No readahead for resident and compressed. */
+	/*
+	 * Resident files are not cached in the page cache,
+	 * and readahead is not implemented for compressed files.
+	 */
+	if (!NInoNonResident(ni) || NInoCompressed(ni))
 		return;
-	}
-
 	iomap_bio_readahead(rac, &ntfs_read_iomap_ops);
 }
 
@@ -263,8 +261,3 @@ const struct address_space_operations ntfs_mft_aops = {
 	.release_folio		= iomap_release_folio,
 	.invalidate_folio	= iomap_invalidate_folio,
 };
-
-void mark_ntfs_record_dirty(struct folio *folio)
-{
-	iomap_dirty_folio(folio->mapping, folio);
-}

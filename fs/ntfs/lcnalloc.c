@@ -13,9 +13,10 @@
  * Copyright (c) 2008-2009 Jean-Pierre Andre
  */
 
+#include <linux/blkdev.h>
+
 #include "lcnalloc.h"
 #include "bitmap.h"
-#include "aops.h"
 #include "ntfs.h"
 
 /*
