@@ -349,19 +349,20 @@ const struct iomap_ops ntfs_seek_iomap_ops = {
 	.iomap_end = ntfs_read_iomap_end,
 };
 
-int ntfs_zero_range(struct inode *inode, loff_t offset, loff_t length, bool bdirect)
+int ntfs_dio_zero_range(struct inode *inode, loff_t offset, loff_t length)
 {
-	if (bdirect) {
-		if ((offset | length) & (SECTOR_SIZE - 1))
-			return -EINVAL;
+	if ((offset | length) & (SECTOR_SIZE - 1))
+		return -EINVAL;
 
-		return  blkdev_issue_zeroout(inode->i_sb->s_bdev,
-					     offset >> SECTOR_SHIFT,
-					     length >> SECTOR_SHIFT,
-					     GFP_NOFS,
-					     BLKDEV_ZERO_NOUNMAP);
-	}
+	return  blkdev_issue_zeroout(inode->i_sb->s_bdev,
+				     offset >> SECTOR_SHIFT,
+				     length >> SECTOR_SHIFT,
+				     GFP_NOFS,
+				     BLKDEV_ZERO_NOUNMAP);
+}
 
+static int ntfs_zero_range(struct inode *inode, loff_t offset, loff_t length)
+{
 	return iomap_zero_range(inode,
 				offset, length,
 				NULL,
@@ -506,8 +507,7 @@ remap_rl:
 				if (z_end > z_start)
 					err = ntfs_zero_range(inode,
 							      z_start,
-							      z_end - z_start,
-							      false);
+							      z_end - z_start);
 			}
 			if ((!err || err == -EPERM) &&
 			    max_clu_count > 1 &&
@@ -522,8 +522,7 @@ remap_rl:
 				if (z_end > z_start)
 					err = ntfs_zero_range(inode,
 							      z_start,
-							      z_end - z_start,
-							      false);
+							      z_end - z_start);
 			}
 
 			if (err == -EPERM)
@@ -609,19 +608,17 @@ static int ntfs_write_da_iomap_begin_non_resident(struct inode *inode,
 
 			if (vcn_ofs || ((vol->cluster_size > iomap->length) &&
 					end < ni->initialized_size))
-				err = ntfs_zero_range(inode,
-						      start_lcn <<
-						      vol->cluster_size_bits,
-						      vol->cluster_size,
-						      true);
+				err = ntfs_dio_zero_range(inode,
+							  start_lcn <<
+							  vol->cluster_size_bits,
+							  vol->cluster_size);
 			if (!err && lcn_count > 1 &&
 			    (iomap->length & vol->cluster_size_mask &&
 			     end < ni->initialized_size))
-				err = ntfs_zero_range(inode,
-						      (start_lcn + lcn_count - 1) <<
-						      vol->cluster_size_bits,
-						      vol->cluster_size,
-						      true);
+				err = ntfs_dio_zero_range(inode,
+							  (start_lcn + lcn_count - 1) <<
+							  vol->cluster_size_bits,
+							  vol->cluster_size);
 		} else {
 			if (lcn_count > ni->i_dealloc_clusters)
 				ni->i_dealloc_clusters = 0;
