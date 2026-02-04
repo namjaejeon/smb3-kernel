@@ -757,48 +757,56 @@ static int ntfs_write_iomap_begin(struct inode *inode, loff_t offset,
 			NTFS_IOMAP_FLAGS_BEGIN);
 }
 
-static int ntfs_write_iomap_end(struct inode *inode, loff_t pos, loff_t length,
-		ssize_t written, unsigned int flags, struct iomap *iomap)
+static int ntfs_write_iomap_end_resident(struct inode *inode, loff_t pos,
+					 loff_t length, ssize_t written,
+					 unsigned int flags, struct iomap *iomap)
 {
-	if (iomap->type == IOMAP_INLINE) {
-		struct ntfs_inode *ni = NTFS_I(inode);
-		struct ntfs_attr_search_ctx *ctx;
-		u32 attr_len;
-		int err;
-		char *kattr;
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct ntfs_attr_search_ctx *ctx;
+	u32 attr_len;
+	int err;
+	char *kattr;
 
-		mutex_lock(&ni->mrec_lock);
-		ctx = ntfs_attr_get_search_ctx(ni, NULL);
-		if (!ctx) {
-			written = -ENOMEM;
-			mutex_unlock(&ni->mrec_lock);
-			goto out;
-		}
-
-		err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-				CASE_SENSITIVE, 0, NULL, 0, ctx);
-		if (err) {
-			if (err == -ENOENT)
-				err = -EIO;
-			written = err;
-			goto err_out;
-		}
-
-		/* The total length of the attribute value. */
-		attr_len = le32_to_cpu(ctx->attr->data.resident.value_length);
-		if (pos >= attr_len || pos + written > attr_len)
-			goto err_out;
-
-		kattr = (u8 *)ctx->attr + le16_to_cpu(ctx->attr->data.resident.value_offset);
-		memcpy(kattr + pos, iomap_inline_data(iomap, pos), written);
-		mark_mft_record_dirty(ctx->ntfs_ino);
-err_out:
-		ntfs_attr_put_search_ctx(ctx);
-		kfree(iomap->inline_data);
+	mutex_lock(&ni->mrec_lock);
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx) {
+		written = -ENOMEM;
 		mutex_unlock(&ni->mrec_lock);
+		return written;
 	}
 
-out:
+	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+			       CASE_SENSITIVE, 0, NULL, 0, ctx);
+	if (err) {
+		if (err == -ENOENT)
+			err = -EIO;
+		written = err;
+		goto err_out;
+	}
+
+	/* The total length of the attribute value. */
+	attr_len = le32_to_cpu(ctx->attr->data.resident.value_length);
+	if (pos >= attr_len || pos + written > attr_len)
+		goto err_out;
+
+	kattr = (u8 *)ctx->attr + le16_to_cpu(ctx->attr->data.resident.value_offset);
+	memcpy(kattr + pos, iomap_inline_data(iomap, pos), written);
+	mark_mft_record_dirty(ctx->ntfs_ino);
+err_out:
+	ntfs_attr_put_search_ctx(ctx);
+	kfree(iomap->inline_data);
+	mutex_unlock(&ni->mrec_lock);
+	return written;
+
+}
+
+static int ntfs_write_iomap_end(struct inode *inode, loff_t pos, loff_t length,
+				ssize_t written, unsigned int flags,
+				struct iomap *iomap)
+{
+	if (iomap->type == IOMAP_INLINE)
+		return ntfs_write_iomap_end_resident(inode, pos, length,
+						     written, flags, iomap);
 	return written;
 }
 
