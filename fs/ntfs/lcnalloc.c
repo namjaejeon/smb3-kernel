@@ -226,8 +226,8 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 		free_clusters -= atomic64_read(&vol->dirty_clusters);
 
 	if (free_clusters < count) {
-		up_write(&vol->lcnbmp_lock);
-		return ERR_PTR(-ENOSPC);
+		err = -ENOSPC;
+		goto out_restore;
 	}
 
 	/*
@@ -733,10 +733,10 @@ out:
 	if (likely(!err)) {
 		if (is_dealloc == true)
 			ntfs_release_dirty_clusters(vol, rl->length);
-		up_write(&vol->lcnbmp_lock);
-		memalloc_nofs_restore(memalloc_flags);
 		ntfs_debug("Done.");
-		return rl == NULL ? ERR_PTR(-EIO) : rl;
+		if (rl == NULL)
+			err = -EIO;
+		goto out_restore;
 	}
 	if (err != -ENOSPC)
 		ntfs_error(vol->sb,
@@ -763,9 +763,12 @@ out:
 		ntfs_debug("No space left at all, err = -ENOSPC, first free lcn = 0x%llx.",
 				vol->data1_zone_pos);
 	atomic64_set(&vol->dirty_clusters, 0);
+
+out_restore:
 	up_write(&vol->lcnbmp_lock);
 	memalloc_nofs_restore(memalloc_flags);
-	return ERR_PTR(err);
+
+	return err < 0 ? ERR_PTR(err) : rl;
 }
 
 /*
