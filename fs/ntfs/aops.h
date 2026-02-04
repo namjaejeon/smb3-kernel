@@ -17,5 +17,4 @@
 #include "volume.h"
 #include "inode.h"
 
-void mark_ntfs_record_dirty(struct folio *folio);
 #endif /* _LINUX_NTFS_AOPS_H */

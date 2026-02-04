@@ -1990,7 +1990,7 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 	 * ilookup5() to check if an inode is in icache and so on but this is
 	 * unnecessary as ntfs_writepage() will write the dirty record anyway.
 	 */
-	mark_ntfs_record_dirty(folio);
+	ntfs_mft_mark_dirty(folio);
 	folio_unlock(folio);
 	kunmap_local(m);
 	folio_put(folio);
@@ -2460,7 +2460,7 @@ mft_rec_already_initialized:
 			m->flags &= cpu_to_le16(
 					~le16_to_cpu(MFT_RECORD_IN_USE));
 			/* Make sure the mft record is written out to disk. */
-			mark_ntfs_record_dirty(folio);
+			   ntfs_mft_mark_dirty(folio);
 			folio_unlock(folio);
 			kunmap_local(m);
 			folio_put(folio);
@@ -2474,7 +2474,7 @@ mft_rec_already_initialized:
 		 * record (e.g. at a minimum a new attribute will be added to
 		 * the mft record.
 		 */
-		mark_ntfs_record_dirty(folio);
+		ntfs_mft_mark_dirty(folio);
 		folio_unlock(folio);
 		/*
 		 * Need to unmap the page since map_extent_mft_record() mapped
@@ -2509,7 +2509,7 @@ mft_rec_already_initialized:
 
 		memcpy((*ni)->mrec, m, vol->mft_record_size);
 		post_read_mst_fixup((struct ntfs_record *)(*ni)->mrec, vol->mft_record_size);
-		mark_ntfs_record_dirty(folio);
+		ntfs_mft_mark_dirty(folio);
 		folio_unlock(folio);
 		(*ni)->folio = folio;
 		(*ni)->folio_ofs = ofs;
@@ -2912,4 +2912,9 @@ int ntfs_mft_writepages(struct address_space *mapping,
 	while ((folio = writeback_iter(mapping, wbc, folio, &error)))
 		error = ntfs_write_mft_block(folio, wbc);
 	return error;
+}
+
+void ntfs_mft_mark_dirty(struct folio *folio)
+{
+	iomap_dirty_folio(folio->mapping, folio);
 }

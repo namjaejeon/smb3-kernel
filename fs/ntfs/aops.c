@@ -262,8 +262,3 @@ const struct address_space_operations ntfs_mft_aops = {
 	.release_folio		= iomap_release_folio,
 	.invalidate_folio	= iomap_invalidate_folio,
 };
-
-void mark_ntfs_record_dirty(struct folio *folio)
-{
-	iomap_dirty_folio(folio->mapping, folio);
-}
