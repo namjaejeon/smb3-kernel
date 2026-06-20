@@ -99,6 +99,8 @@ struct ksmbd_work {
 	bool                            compress_response:1;
 	/* Is this SYNC or ASYNC ksmbd_work */
 	bool                            asynchronous:1;
+	/* Credits were already granted in this request's interim response */
+	bool                            credits_granted_on_interim:1;
 	bool                            need_invalidate_rkey:1;
 
 	unsigned int                    remote_key;

@@ -330,29 +330,21 @@ int init_smb2_neg_rsp(struct ksmbd_work *work)
 	return 0;
 }
 
-/**
- * smb2_set_rsp_credits() - set number of credits in response buffer
- * @work:	smb work containing smb response buffer
+/*
+ * __smb2_grant_credits() - consume the request's credit charge and grant new
+ * credits to the client.  Must be called with
+ * conn->credits_lock held.  Returns the number of credits granted, or a
+ * negative errno.
  */
-int smb2_set_rsp_credits(struct ksmbd_work *work)
+static int __smb2_grant_credits(struct ksmbd_work *work,
+				struct smb2_hdr *req_hdr)
 {
-	struct smb2_hdr *req_hdr = ksmbd_req_buf_next(work);
-	struct smb2_hdr *hdr = ksmbd_resp_buf_next(work);
 	struct ksmbd_conn *conn = work->conn;
 	unsigned short credits_requested, aux_max;
-	unsigned short credit_charge, credits_granted = 0;
+	unsigned short credit_charge, credits_granted;
 	u64 window_room, i;
 
-	BUILD_BUG_ON(KSMBD_CMD_SEQ_WINDOW != SMB2_MAX_CREDITS);
-	BUILD_BUG_ON(KSMBD_CMD_SEQ_WINDOW & (KSMBD_CMD_SEQ_WINDOW - 1));
-
-	if (work->send_no_response)
-		return 0;
-
-	hdr->CreditCharge = req_hdr->CreditCharge;
-
 	if (conn->total_credits > conn->vals->max_credits) {
-		hdr->CreditRequest = 0;
 		pr_err("Total credits overflow: %d\n", conn->total_credits);
 		return -EINVAL;
 	}
@@ -377,7 +369,7 @@ int smb2_set_rsp_credits(struct ksmbd_work *work)
 	 * TODO: Need to adjuct CreditRequest value according to
 	 * current cpu load
 	 */
-	if (hdr->Command == SMB2_NEGOTIATE)
+	if (req_hdr->Command == SMB2_NEGOTIATE)
 		aux_max = 1;
 	else
 		aux_max = conn->vals->max_credits - conn->total_credits;
@@ -401,14 +393,50 @@ int smb2_set_rsp_credits(struct ksmbd_work *work)
 		__set_bit(i & (KSMBD_CMD_SEQ_WINDOW - 1), conn->seq_bitmap);
 	conn->seq_high += credits_granted;
 
+	ksmbd_debug(SMB,
+		    "credits: requested[%d] granted[%d] total_granted[%d]\n",
+		    credits_requested, credits_granted, conn->total_credits);
+	return credits_granted;
+}
+
+/**
+ * smb2_set_rsp_credits() - set number of credits in response buffer
+ * @work:	smb work containing smb response buffer
+ */
+int smb2_set_rsp_credits(struct ksmbd_work *work)
+{
+	struct smb2_hdr *req_hdr = ksmbd_req_buf_next(work);
+	struct smb2_hdr *hdr = ksmbd_resp_buf_next(work);
+	int credits_granted;
+
+	BUILD_BUG_ON(KSMBD_CMD_SEQ_WINDOW != SMB2_MAX_CREDITS);
+	BUILD_BUG_ON(KSMBD_CMD_SEQ_WINDOW & (KSMBD_CMD_SEQ_WINDOW - 1));
+
+	if (work->send_no_response)
+		return 0;
+
+	hdr->CreditCharge = req_hdr->CreditCharge;
+
+	/*
+	 * For an asynchronously processed request the credits were already
+	 * granted in the interim response, so don't grant (or consume) them
+	 * a second time here.
+	 */
+	if (work->credits_granted_on_interim) {
+		hdr->CreditRequest = 0;
+		return 0;
+	}
+
+	credits_granted = __smb2_grant_credits(work, req_hdr);
+	if (credits_granted < 0) {
+		hdr->CreditRequest = 0;
+		return -EINVAL;
+	}
+
 	if (!req_hdr->NextCommand) {
 		/* Update CreditRequest in last request */
 		hdr->CreditRequest = cpu_to_le16(work->credits_granted);
 	}
-	ksmbd_debug(SMB,
-		    "credits: requested[%d] granted[%d] total_granted[%d]\n",
-		    credits_requested, credits_granted,
-		    conn->total_credits);
 	return 0;
 }
 
@@ -834,6 +862,32 @@ void smb2_send_interim_resp(struct ksmbd_work *work, __le32 status)
 	rsp_hdr->Id.AsyncId = cpu_to_le64(work->async_id);
 	smb2_set_err_rsp(in_work);
 	rsp_hdr->Status = status;
+
+	/*
+	 * Credits to be granted for an asynchronously processed request must
+	 * be granted in its interim response.  Do so
+	 * on the first (STATUS_PENDING) interim of a standalone request, and
+	 * mark the work so smb2_set_rsp_credits() does not grant them again on
+	 * the final response.  Compound requests keep granting on the final
+	 * response, where credits are accumulated across the chain.
+	 */
+	if (status == STATUS_PENDING && !work->credits_granted_on_interim &&
+	    !work->next_smb2_rcv_hdr_off) {
+		struct smb2_hdr *req_hdr = ksmbd_req_buf_next(work);
+		struct ksmbd_conn *conn = work->conn;
+		int granted;
+
+		if (!req_hdr->NextCommand) {
+			spin_lock(&conn->credits_lock);
+			granted = __smb2_grant_credits(work, req_hdr);
+			spin_unlock(&conn->credits_lock);
+			if (granted >= 0) {
+				rsp_hdr->CreditCharge = req_hdr->CreditCharge;
+				rsp_hdr->CreditRequest = cpu_to_le16(granted);
+				work->credits_granted_on_interim = 1;
+			}
+		}
+	}
 
 	ksmbd_conn_write(in_work);
 	ksmbd_free_work_struct(in_work);
