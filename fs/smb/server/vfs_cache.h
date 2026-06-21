@@ -134,6 +134,9 @@ struct ksmbd_file {
 
 	bool                            is_posix_ctxt;
 	struct durable_owner		owner;
+
+	/* Deferred free so lock-free RCU lookups never touch freed memory. */
+	struct rcu_head			rcu_head;
 };
 
 static inline void set_ctx_actor(struct dir_context *ctx,

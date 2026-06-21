@@ -493,6 +493,13 @@ static void __ksmbd_remove_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp
 	write_unlock(&ft->lock);
 }
 
+static void ksmbd_fp_free_rcu(struct rcu_head *rcu)
+{
+	struct ksmbd_file *fp = container_of(rcu, struct ksmbd_file, rcu_head);
+
+	kmem_cache_free(filp_cache, fp);
+}
+
 static void __ksmbd_close_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp)
 {
 	struct file *filp;
@@ -544,7 +551,12 @@ static void __ksmbd_close_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp)
 		kfree(fp->stream.name);
 	kfree(fp->owner.name);
 
-	kmem_cache_free(filp_cache, fp);
+	/*
+	 * Defer the actual free past a grace period: a concurrent lock-free
+	 * lookup may still hold this pointer from idr_find() and is about to
+	 * test fp->refcount, which it now finds zero.
+	 */
+	call_rcu(&fp->rcu_head, ksmbd_fp_free_rcu);
 }
 
 /**
@@ -606,7 +618,12 @@ bool ksmbd_close_disconnected_durable_delete_on_close(struct dentry *dentry)
 
 static struct ksmbd_file *ksmbd_fp_get(struct ksmbd_file *fp)
 {
-	if (fp->f_state != FP_INITED)
+	/*
+	 * Pairs with the smp_store_release() in ksmbd_update_fstate(): once
+	 * FP_INITED is observed, all of the opener's stores to @fp are visible
+	 * to a lock-free lookup as well.
+	 */
+	if (smp_load_acquire(&fp->f_state) != FP_INITED)
 		return NULL;
 
 	if (!atomic_inc_not_zero(&fp->refcount))
@@ -622,11 +639,17 @@ static struct ksmbd_file *__ksmbd_lookup_fd(struct ksmbd_file_table *ft,
 	if (!has_file_id(id))
 		return NULL;
 
-	read_lock(&ft->lock);
+	/*
+	 * Lock-free lookup: the idr is RCU-safe against concurrent
+	 * idr_alloc()/idr_remove() done under ft->lock, and ksmbd_file objects
+	 * are freed via call_rcu(), so the fp stays valid for the duration of
+	 * this RCU read-side section even if it is being closed concurrently.
+	 */
+	rcu_read_lock();
 	fp = idr_find(ft->idr, id);
 	if (fp)
 		fp = ksmbd_fp_get(fp);
-	read_unlock(&ft->lock);
+	rcu_read_unlock();
 	return fp;
 }
 
@@ -1092,7 +1115,12 @@ int ksmbd_update_fstate(struct ksmbd_file_table *ft, struct ksmbd_file *fp,
 	    (fp->f_state != FP_NEW || !has_file_id(fp->volatile_id))) {
 		ret = -ENOENT;
 	} else {
-		fp->f_state = state;
+		/*
+		 * Publish the state with release semantics so a lock-free
+		 * lookup that observes FP_INITED via smp_load_acquire() in
+		 * ksmbd_fp_get() also sees the fully initialized fp.
+		 */
+		smp_store_release(&fp->f_state, state);
 		ret = 0;
 	}
 	write_unlock(&ft->lock);
@@ -1742,5 +1770,7 @@ out:
 
 void ksmbd_exit_file_cache(void)
 {
+	/* Wait for any pending call_rcu(ksmbd_fp_free_rcu) before teardown. */
+	rcu_barrier();
 	kmem_cache_destroy(filp_cache);
 }
