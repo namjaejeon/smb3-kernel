@@ -5,6 +5,8 @@
  */
 
 #include <linux/freezer.h>
+#include <linux/bvec.h>
+#include <linux/uio.h>
 
 #include "smb_common.h"
 #include "server.h"
@@ -427,6 +429,47 @@ static int ksmbd_tcp_writev(struct ksmbd_transport *t, struct kvec *iov,
 	return kernel_sendmsg(TCP_TRANS(t)->sock, &smb_msg, iov, nvecs, size);
 }
 
+/*
+ * Send a response whose header is in @iov (kvecs) and whose payload is carried
+ * by @bvec page-cache pages. The header is sent first, corked with MSG_MORE so
+ * it coalesces with the payload, and the payload is spliced into the socket via
+ * MSG_SPLICE_PAGES to avoid copying the file data.
+ */
+static int ksmbd_tcp_writev_aux(struct ksmbd_transport *t, struct kvec *iov,
+				int niov, struct bio_vec *bvec, int nbvec,
+				int size)
+{
+	struct socket *sock = TCP_TRANS(t)->sock;
+	struct msghdr msg = {.msg_flags = MSG_NOSIGNAL};
+	size_t hdr_size = 0;
+	int i, ret;
+
+	for (i = 0; i < niov; i++)
+		hdr_size += iov[i].iov_len;
+
+	if (size > hdr_size)
+		msg.msg_flags |= MSG_MORE;
+
+	ret = kernel_sendmsg(sock, &msg, iov, niov, hdr_size);
+	if (ret < 0)
+		return ret;
+
+	if (size <= hdr_size)
+		return size;
+
+	msg.msg_flags = MSG_NOSIGNAL | MSG_SPLICE_PAGES;
+	iov_iter_bvec(&msg.msg_iter, ITER_SOURCE, bvec, nbvec, size - hdr_size);
+	while (msg_data_left(&msg)) {
+		ret = sock_sendmsg(sock, &msg);
+		if (ret < 0)
+			return ret;
+		if (ret == 0)
+			return -EPIPE;
+	}
+
+	return size;
+}
+
 static void ksmbd_tcp_disconnect(struct ksmbd_transport *t)
 {
 	free_transport(TCP_TRANS(t));
@@ -679,6 +722,7 @@ int ksmbd_tcp_set_interfaces(char *ifc_list, int ifc_list_sz)
 static const struct ksmbd_transport_ops ksmbd_tcp_transport_ops = {
 	.read		= ksmbd_tcp_read,
 	.writev		= ksmbd_tcp_writev,
+	.writev_aux	= ksmbd_tcp_writev_aux,
 	.disconnect	= ksmbd_tcp_disconnect,
 	.free_transport = ksmbd_tcp_free_transport,
 };

@@ -140,6 +140,8 @@ struct ksmbd_transport_ops {
 	int (*writev)(struct ksmbd_transport *t, struct kvec *iovs, int niov,
 		      int size, bool need_invalidate_rkey,
 		      unsigned int remote_key);
+	int (*writev_aux)(struct ksmbd_transport *t, struct kvec *iovs,
+			  int niov, struct bio_vec *bvec, int nbvec, int size);
 	int (*rdma_read)(struct ksmbd_transport *t,
 			 void *buf, unsigned int len,
 			 struct smbdirect_buffer_descriptor_v1 *desc,

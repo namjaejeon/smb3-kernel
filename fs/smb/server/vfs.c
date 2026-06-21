@@ -20,6 +20,7 @@
 #include <linux/sched/xacct.h>
 #include <linux/crc32c.h>
 #include <linux/splice.h>
+#include <linux/bvec.h>
 #include <linux/fileattr.h>
 
 #include "glob.h"
@@ -378,6 +379,103 @@ int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
 	}
 
 	filp->f_pos = *pos;
+	ksmbd_counter_add(KSMBD_COUNTER_READ_BYTES, (s64)nbytes);
+	return nbytes;
+}
+
+struct ksmbd_splice_ctx {
+	struct bio_vec	*bvec;
+	unsigned int	nr;
+	unsigned int	max;
+};
+
+static int ksmbd_splice_actor(struct pipe_inode_info *pipe,
+			      struct pipe_buffer *buf,
+			      struct splice_desc *sd)
+{
+	struct ksmbd_splice_ctx *ctx = sd->u.data;
+
+	if (ctx->nr >= ctx->max)
+		return -EIO;
+
+	get_page(buf->page);
+	bvec_set_page(&ctx->bvec[ctx->nr++], buf->page, sd->len, buf->offset);
+	return sd->len;
+}
+
+static int ksmbd_direct_splice_actor(struct pipe_inode_info *pipe,
+				     struct splice_desc *sd)
+{
+	return __splice_from_pipe(pipe, sd, ksmbd_splice_actor);
+}
+
+/**
+ * ksmbd_vfs_read_splice() - zero-copy vfs helper for smb file read
+ * @work:	smb work
+ * @fp:		ksmbd file pointer
+ * @count:	read byte count
+ * @pos:	file pos (advanced by the number of bytes read)
+ *
+ * Harvest page-cache pages covering [*pos, *pos + count) into work->aux_bvec
+ * without copying the data. The pages are later handed to the socket directly
+ * via MSG_SPLICE_PAGES. A reference is held on each harvested page until the
+ * work item is freed.
+ *
+ * Return:	number of read bytes on success, otherwise a negative error
+ */
+ssize_t ksmbd_vfs_read_splice(struct ksmbd_work *work, struct ksmbd_file *fp,
+			      size_t count, loff_t *pos)
+{
+	struct file *filp = fp->filp;
+	struct ksmbd_splice_ctx ctx;
+	struct bio_vec *bvec;
+	struct splice_desc sd;
+	unsigned int max_pages;
+	ssize_t nbytes;
+
+	if (work->conn->connection_type &&
+	    !(fp->daccess & (FILE_READ_DATA_LE | FILE_EXECUTE_LE))) {
+		pr_err("no right to read(%pD)\n", filp);
+		return -EACCES;
+	}
+
+	if (!work->tcon->posix_extensions &&
+	    check_lock_range(filp, *pos, *pos + count - 1, READ)) {
+		pr_err("unable to read due to lock\n");
+		return -EAGAIN;
+	}
+
+	nbytes = rw_verify_area(READ, filp, pos, count);
+	if (nbytes < 0)
+		return nbytes;
+
+	max_pages = DIV_ROUND_UP(count, PAGE_SIZE) + 1;
+	bvec = kvmalloc_array(max_pages, sizeof(*bvec), KSMBD_DEFAULT_GFP);
+	if (!bvec)
+		return -ENOMEM;
+
+	ctx.bvec = bvec;
+	ctx.nr = 0;
+	ctx.max = max_pages;
+
+	sd = (struct splice_desc) {
+		.len		= 0,
+		.total_len	= count,
+		.pos		= *pos,
+		.u.data		= &ctx,
+	};
+
+	nbytes = splice_direct_to_actor(filp, &sd, ksmbd_direct_splice_actor);
+	if (nbytes < 0) {
+		while (ctx.nr--)
+			put_page(bvec[ctx.nr].bv_page);
+		kvfree(bvec);
+		return nbytes;
+	}
+
+	*pos += nbytes;
+	work->aux_bvec = bvec;
+	work->aux_bvec_cnt = ctx.nr;
 	ksmbd_counter_add(KSMBD_COUNTER_READ_BYTES, (s64)nbytes);
 	return nbytes;
 }

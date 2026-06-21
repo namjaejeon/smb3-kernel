@@ -7216,6 +7216,41 @@ static ssize_t smb2_read_rdma_channel(struct ksmbd_work *work,
  *
  * Return:	0 on success, otherwise error
  */
+/*
+ * Decide whether an SMB2 read response can be served zero-copy by splicing
+ * page-cache pages directly into the socket. This is only safe when the
+ * payload does not have to be transformed in a CPU-readable buffer first
+ * (signing, encryption, compression) and is carried over the plain TCP
+ * transport as a single, non-compound response.
+ */
+static bool smb2_read_allow_splice(struct ksmbd_work *work,
+				   struct ksmbd_file *fp,
+				   bool is_rdma_channel,
+				   struct smb2_read_req *req)
+{
+	struct ksmbd_conn *conn = work->conn;
+
+	/* Zero-copy splice is only wired up for the TCP transport. */
+	if (is_rdma_channel || !conn->transport->ops->writev_aux)
+		return false;
+	/* Signing and encryption need the data in a CPU-readable buffer. */
+	if (work->encrypted || (work->sess && work->sess->sign) ||
+	    smb2_is_sign_req(work, SMB2_READ))
+		return false;
+	/* Compression rewrites the payload into a transform buffer. */
+	if (req->Flags & SMB2_READFLAG_REQUEST_COMPRESSED)
+		return false;
+	/* Compound responses interleave payloads between SMB2 headers. */
+	if (work->next_smb2_rcv_hdr_off || req->hdr.NextCommand)
+		return false;
+	/* Alternate data streams live in xattrs, not the page cache. */
+	if (ksmbd_stream_fd(fp))
+		return false;
+	if (S_ISDIR(file_inode(fp->filp)->i_mode))
+		return false;
+	return true;
+}
+
 int smb2_read(struct ksmbd_work *work)
 {
 	struct ksmbd_conn *conn = work->conn;
@@ -7323,6 +7358,38 @@ int smb2_read(struct ksmbd_work *work)
 
 	ksmbd_debug(SMB, "filename %pD, offset %lld, len %zu\n",
 		    fp->filp, offset, length);
+
+	if (smb2_read_allow_splice(work, fp, is_rdma_channel, req)) {
+		nbytes = ksmbd_vfs_read_splice(work, fp, length, &offset);
+		if (nbytes < 0) {
+			err = nbytes;
+			goto out;
+		}
+
+		if ((nbytes == 0 && length != 0) || nbytes < mincount) {
+			rsp->hdr.Status = STATUS_END_OF_FILE;
+			smb2_set_err_rsp(work);
+			ksmbd_fd_put(work, fp);
+			return -ENODATA;
+		}
+
+		ksmbd_debug(SMB, "nbytes %zu, offset %lld mincount %zu\n",
+			    nbytes, offset, mincount);
+
+		rsp->StructureSize = cpu_to_le16(17);
+		rsp->DataOffset = 80;
+		rsp->Reserved = 0;
+		rsp->DataLength = cpu_to_le32(nbytes);
+		rsp->DataRemaining = 0;
+		rsp->Flags = 0;
+		err = ksmbd_iov_pin_rsp_splice(work, (void *)rsp,
+					offsetof(struct smb2_read_rsp, Buffer),
+					nbytes);
+		if (err)
+			goto out;
+		ksmbd_fd_put(work, fp);
+		return 0;
+	}
 
 	/*
 	 * No need to zero-fill: ksmbd_vfs_read() overwrites the buffer with the

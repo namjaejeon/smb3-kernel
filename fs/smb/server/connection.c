@@ -367,11 +367,17 @@ int ksmbd_conn_write(struct ksmbd_work *work)
 		return -EINVAL;
 
 	ksmbd_conn_lock(conn);
-	sent = conn->transport->ops->writev(conn->transport, work->iov,
-			work->iov_cnt,
-			get_rfc1002_len(work->iov[0].iov_base) + 4,
-			work->need_invalidate_rkey,
-			work->remote_key);
+	if (work->aux_bvec && conn->transport->ops->writev_aux)
+		sent = conn->transport->ops->writev_aux(conn->transport,
+				work->iov, work->iov_cnt,
+				work->aux_bvec, work->aux_bvec_cnt,
+				get_rfc1002_len(work->iov[0].iov_base) + 4);
+	else
+		sent = conn->transport->ops->writev(conn->transport, work->iov,
+				work->iov_cnt,
+				get_rfc1002_len(work->iov[0].iov_base) + 4,
+				work->need_invalidate_rkey,
+				work->remote_key);
 	ksmbd_conn_unlock(conn);
 
 	if (sent < 0) {

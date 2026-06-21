@@ -77,6 +77,14 @@ void ksmbd_free_work_struct(struct ksmbd_work *work)
 		kfree(ar);
 	}
 
+	if (work->aux_bvec) {
+		unsigned int i;
+
+		for (i = 0; i < work->aux_bvec_cnt; i++)
+			put_page(work->aux_bvec[i].bv_page);
+		kvfree(work->aux_bvec);
+	}
+
 	kfree(work->tr_buf);
 	kvfree(work->compress_buf);
 	kvfree(work->request_buf);
@@ -179,6 +187,33 @@ int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
 			   void *aux_buf, unsigned int aux_size)
 {
 	return __ksmbd_iov_pin_rsp(work, ib, len, aux_buf, aux_size);
+}
+
+/*
+ * Pin only the response header for a zero-copy read. The @aux_size payload is
+ * carried by work->aux_bvec (page-cache pages) and appended by the transport
+ * at send time, so it is accounted in the RFC1001 length but not added as an
+ * iov here.
+ */
+int ksmbd_iov_pin_rsp_splice(struct ksmbd_work *work, void *ib, int len,
+			     unsigned int aux_size)
+{
+	if (ksmbd_reserve_iov(work, 1))
+		return -ENOMEM;
+
+	/* Plus rfc_length size on first iov */
+	if (!work->iov_idx) {
+		work->iov[work->iov_idx].iov_base = work->response_buf;
+		*(__be32 *)work->iov[0].iov_base = 0;
+		work->iov[work->iov_idx].iov_len = 4;
+		work->iov_cnt++;
+	}
+
+	__ksmbd_iov_pin(work, ib, len);
+	inc_rfc1001_len(work->iov[0].iov_base, len);
+	inc_rfc1001_len(work->iov[0].iov_base, aux_size);
+
+	return 0;
 }
 
 int allocate_interim_rsp_buf(struct ksmbd_work *work)

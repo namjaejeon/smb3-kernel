@@ -8,6 +8,7 @@
 
 #include <linux/ctype.h>
 #include <linux/workqueue.h>
+#include <linux/bvec.h>
 
 struct ksmbd_conn;
 struct ksmbd_session;
@@ -74,6 +75,14 @@ struct ksmbd_work {
 	/* Contiguous SMB2 compression transform owned by this work item. */
 	void				*compress_buf;
 
+	/*
+	 * Page-cache pages harvested for a zero-copy SMB2 read response. The
+	 * pages are sent directly to the socket via MSG_SPLICE_PAGES and a
+	 * reference is held on each until the work item is freed.
+	 */
+	struct bio_vec			*aux_bvec;
+	unsigned int			aux_bvec_cnt;
+
 	unsigned char			state;
 	/* No response for cancelled request */
 	bool                            send_no_response:1;
@@ -137,6 +146,8 @@ void ksmbd_workqueue_destroy(void);
 bool ksmbd_queue_work(struct ksmbd_work *work);
 int ksmbd_iov_pin_rsp_read(struct ksmbd_work *work, void *ib, int len,
 			   void *aux_buf, unsigned int aux_size);
+int ksmbd_iov_pin_rsp_splice(struct ksmbd_work *work, void *ib, int len,
+			     unsigned int aux_size);
 int ksmbd_iov_pin_rsp(struct ksmbd_work *work, void *ib, int len);
 int allocate_interim_rsp_buf(struct ksmbd_work *work);
 #endif /* __KSMBD_WORK_H__ */
