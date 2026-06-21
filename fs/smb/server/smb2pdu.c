@@ -7324,7 +7324,13 @@ int smb2_read(struct ksmbd_work *work)
 	ksmbd_debug(SMB, "filename %pD, offset %lld, len %zu\n",
 		    fp->filp, offset, length);
 
-	aux_payload_buf = kvzalloc(ALIGN(length, 8), KSMBD_DEFAULT_GFP);
+	/*
+	 * No need to zero-fill: ksmbd_vfs_read() overwrites the buffer with the
+	 * file data, and only the actually read 'nbytes' bytes are ever pinned
+	 * into the response or consumed by the RDMA/compression paths. The
+	 * ALIGN() tail padding is never read or transmitted.
+	 */
+	aux_payload_buf = kvmalloc(ALIGN(length, 8), KSMBD_DEFAULT_GFP);
 	if (!aux_payload_buf) {
 		err = -ENOMEM;
 		goto out;
