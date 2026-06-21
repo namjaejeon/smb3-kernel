@@ -29,6 +29,17 @@ static bool lease_state_valid(__le32 state)
 	return !(state & ~SMB2_LEASE_STATE_MASK_LE);
 }
 
+static __le32 lease_state_grantable(__le32 state)
+{
+	if (state == SMB2_LEASE_READ_CACHING_LE ||
+	    state == (SMB2_LEASE_READ_CACHING_LE | SMB2_LEASE_HANDLE_CACHING_LE) ||
+	    state == (SMB2_LEASE_READ_CACHING_LE | SMB2_LEASE_WRITE_CACHING_LE) ||
+	    state == SMB2_LEASE_STATE_MASK_LE)
+		return state;
+
+	return 0;
+}
+
 static bool lease_v2_flags_valid(__le32 flags)
 {
 	return !(flags & ~SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET_LE);
@@ -1758,6 +1769,7 @@ struct lease_ctx_info *parse_lease_state(void *open_req)
 		if (!lease_state_valid(lreq->req_state) ||
 		    !lease_v2_flags_valid(lreq->flags))
 			goto err_out;
+		lreq->req_state = lease_state_grantable(lreq->req_state);
 		if (lreq->flags == SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET_LE)
 			memcpy(lreq->parent_lease_key, lc->lcontext.ParentLeaseKey,
 			       SMB2_LEASE_KEY_SIZE);
@@ -1775,6 +1787,7 @@ struct lease_ctx_info *parse_lease_state(void *open_req)
 		lreq->duration = lc->lcontext.LeaseDuration;
 		if (!lease_state_valid(lreq->req_state))
 			goto err_out;
+		lreq->req_state = lease_state_grantable(lreq->req_state);
 		lreq->version = 1;
 	} else
 		goto err_out;
