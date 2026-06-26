@@ -554,6 +554,8 @@ static void init_chained_smb2_rsp(struct ksmbd_work *work)
 	 */
 	rsp_hdr->Flags = (SMB2_FLAGS_SERVER_TO_REDIR |
 				SMB2_FLAGS_RELATED_OPERATIONS);
+	if (rcv_hdr->Flags & SMB2_FLAGS_REPLAY_OPERATION)
+		rsp_hdr->Flags |= SMB2_FLAGS_REPLAY_OPERATION;
 	rsp_hdr->NextCommand = 0;
 	rsp_hdr->MessageId = rcv_hdr->MessageId;
 	rsp_hdr->Id.SyncId.ProcessId = rcv_hdr->Id.SyncId.ProcessId;
@@ -646,6 +648,8 @@ int init_smb2_rsp_hdr(struct ksmbd_work *work)
 	 * Message is response. We don't grant oplock yet.
 	 */
 	rsp_hdr->Flags = (SMB2_FLAGS_SERVER_TO_REDIR);
+	if (rcv_hdr->Flags & SMB2_FLAGS_REPLAY_OPERATION)
+		rsp_hdr->Flags |= SMB2_FLAGS_REPLAY_OPERATION;
 	rsp_hdr->NextCommand = 0;
 	rsp_hdr->MessageId = rcv_hdr->MessageId;
 	rsp_hdr->Id.SyncId.ProcessId = rcv_hdr->Id.SyncId.ProcessId;
@@ -654,6 +658,136 @@ int init_smb2_rsp_hdr(struct ksmbd_work *work)
 	memcpy(rsp_hdr->Signature, rcv_hdr->Signature, 16);
 
 	return 0;
+}
+
+static __le16 smb3_hdr_channel_sequence(struct smb2_hdr *hdr)
+{
+	return ((struct smb3_hdr_req *)hdr)->ChannelSequence;
+}
+
+static bool smb3_hdr_replay(struct smb2_hdr *hdr)
+{
+	return hdr->Flags & SMB2_FLAGS_REPLAY_OPERATION;
+}
+
+static int smb3_verify_channel_sequence(struct ksmbd_work *work,
+					struct ksmbd_file *fp,
+					struct smb2_hdr *hdr)
+{
+	__le16 chseq_le;
+	u16 chseq, old_chseq;
+	int ret = 0;
+
+	if (work->conn->dialect < SMB30_PROT_ID)
+		return 0;
+
+	chseq_le = smb3_hdr_channel_sequence(hdr);
+	chseq = le16_to_cpu(chseq_le);
+
+	spin_lock(&fp->f_lock);
+	old_chseq = le16_to_cpu(fp->channel_sequence);
+	if (smb3_hdr_replay(hdr)) {
+		if (chseq == old_chseq && fp->outstanding_pre_requests == 0) {
+			fp->outstanding_requests++;
+		} else if ((u16)(chseq - old_chseq) <= 0x7fff &&
+			   fp->outstanding_pre_requests == 0) {
+			fp->outstanding_pre_requests += fp->outstanding_requests;
+			fp->outstanding_requests = 1;
+			fp->channel_sequence = chseq_le;
+		} else {
+			ret = -EAGAIN;
+		}
+	} else {
+		if (chseq == old_chseq) {
+			fp->outstanding_requests++;
+		} else if ((u16)(chseq - old_chseq) <= 0x7fff) {
+			fp->outstanding_pre_requests += fp->outstanding_requests;
+			fp->outstanding_requests = 1;
+			fp->channel_sequence = chseq_le;
+		} else {
+			ret = -EAGAIN;
+		}
+	}
+	spin_unlock(&fp->f_lock);
+
+	return ret;
+}
+
+static void smb3_complete_channel_sequence(struct ksmbd_work *work,
+					   struct ksmbd_file *fp,
+					   struct smb2_hdr *hdr)
+{
+	u16 chseq;
+
+	if (work->conn->dialect < SMB30_PROT_ID)
+		return;
+
+	chseq = le16_to_cpu(smb3_hdr_channel_sequence(hdr));
+
+	spin_lock(&fp->f_lock);
+	if (chseq == le16_to_cpu(fp->channel_sequence)) {
+		if (fp->outstanding_requests)
+			fp->outstanding_requests--;
+	} else {
+		if (fp->outstanding_pre_requests)
+			fp->outstanding_pre_requests--;
+	}
+	spin_unlock(&fp->f_lock);
+}
+
+static bool smb2_lock_sequence_applicable(struct ksmbd_work *work,
+					  struct ksmbd_file *fp)
+{
+	return fp->is_resilient || fp->is_durable || fp->is_persistent ||
+	       (work->conn->dialect >= SMB30_PROT_ID &&
+		(work->conn->cli_cap & SMB2_GLOBAL_CAP_MULTI_CHANNEL));
+}
+
+static void smb2_verify_lock_sequence(struct ksmbd_work *work,
+				      struct ksmbd_file *fp,
+				      struct smb2_lock_req *req)
+{
+	u32 val, index;
+	u8 sequence;
+
+	if (work->conn->dialect == SMB20_PROT_ID ||
+	    !smb2_lock_sequence_applicable(work, fp))
+		return;
+
+	val = le32_to_cpu(req->LockSequenceNumber);
+	sequence = val & 0xf;
+	index = val >> 4;
+	if (!index || index > KSMBD_LOCK_SEQ_ARRAY_SIZE)
+		return;
+
+	spin_lock(&fp->f_lock);
+	if (fp->lock_seq[index - 1].valid &&
+	    fp->lock_seq[index - 1].sequence != sequence)
+		fp->lock_seq[index - 1].valid = false;
+	spin_unlock(&fp->f_lock);
+}
+
+static void smb2_update_lock_sequence(struct ksmbd_work *work,
+				      struct ksmbd_file *fp,
+				      struct smb2_lock_req *req)
+{
+	u32 val, index;
+	u8 sequence;
+
+	if (work->conn->dialect == SMB20_PROT_ID ||
+	    !smb2_lock_sequence_applicable(work, fp))
+		return;
+
+	val = le32_to_cpu(req->LockSequenceNumber);
+	sequence = val & 0xf;
+	index = val >> 4;
+	if (!index || index > KSMBD_LOCK_SEQ_ARRAY_SIZE)
+		return;
+
+	spin_lock(&fp->f_lock);
+	fp->lock_seq[index - 1].valid = true;
+	fp->lock_seq[index - 1].sequence = sequence;
+	spin_unlock(&fp->f_lock);
 }
 
 /**
@@ -2967,11 +3101,59 @@ struct durable_info {
 	unsigned short int type;
 	bool persistent;
 	bool reconnected;
+	bool replay;
 	bool app_instance_id;
 	unsigned int timeout;
 	char *CreateGuid;
 	char AppInstanceId[SMB2_CREATE_GUID_SIZE];
 };
+
+static int smb2_check_durable_replay(struct ksmbd_work *work,
+				     struct ksmbd_file *fp,
+				     struct lease_ctx_info *lc,
+				     bool persistent)
+{
+	struct oplock_info *opinfo;
+	int ret = 0;
+
+	if (!fp->is_durable && !fp->is_persistent)
+		return -EACCES;
+
+	if (ksmbd_vfs_compare_durable_owner(fp, work->sess->user) == false)
+		return -EACCES;
+
+	if (fp->is_persistent && !persistent)
+		return -EINVAL;
+
+	opinfo = opinfo_get(fp);
+	if (!opinfo)
+		return 0;
+
+	if (opinfo->sess && opinfo->sess->id != work->sess->id) {
+		ret = -ENOEXEC;
+		goto out;
+	}
+
+	if (opinfo->is_lease) {
+		if (!lc ||
+		    memcmp(opinfo->o_lease->lease_key, lc->lease_key,
+			   SMB2_LEASE_KEY_SIZE)) {
+			ret = -EACCES;
+			goto out;
+		}
+	} else {
+		if (lc) {
+			ret = -EACCES;
+			goto out;
+		}
+
+		if (fp->is_durable && opinfo->level != SMB2_OPLOCK_LEVEL_BATCH)
+			ret = -EACCES;
+	}
+out:
+	opinfo_put(opinfo);
+	return ret;
+}
 
 static int parse_durable_handle_context(struct ksmbd_work *work,
 					struct smb2_create_req *req,
@@ -3100,6 +3282,9 @@ static int parse_durable_handle_context(struct ksmbd_work *work,
 			durable_v2_blob =
 				(struct create_durable_req_v2 *)context;
 			ksmbd_debug(SMB, "Request for durable v2 open\n");
+			dh_info->persistent =
+				le32_to_cpu(durable_v2_blob->dcontext.Flags) &
+				SMB2_DHANDLE_FLAG_PERSISTENT;
 			dh_info->fp = ksmbd_lookup_fd_cguid(durable_v2_blob->dcontext.CreateGuid);
 			if (dh_info->fp) {
 				if (!memcmp(conn->ClientGUID, dh_info->fp->client_guid,
@@ -3110,12 +3295,27 @@ static int parse_durable_handle_context(struct ksmbd_work *work,
 						goto out;
 					}
 
-					if (dh_info->fp->conn) {
+					if (!dh_info->fp->is_durable &&
+					    !dh_info->fp->is_persistent) {
 						ksmbd_put_durable_fd(dh_info->fp);
-						err = -EBADF;
+						err = -EACCES;
 						goto out;
 					}
-					dh_info->reconnected = true;
+
+					err = smb2_check_durable_replay(work,
+									dh_info->fp,
+									lc,
+									dh_info->persistent);
+					if (err) {
+						ksmbd_put_durable_fd(dh_info->fp);
+						goto out;
+					}
+
+					if (dh_info->fp->conn)
+						dh_info->replay = true;
+					else
+						dh_info->reconnected = true;
+					dh_info->type = dh_idx;
 					goto out;
 				}
 				ksmbd_put_durable_fd(dh_info->fp);
@@ -3126,8 +3326,6 @@ static int parse_durable_handle_context(struct ksmbd_work *work,
 			    req_op_level == SMB2_OPLOCK_LEVEL_BATCH) {
 				dh_info->CreateGuid =
 					durable_v2_blob->dcontext.CreateGuid;
-				dh_info->persistent =
-					le32_to_cpu(durable_v2_blob->dcontext.Flags);
 				dh_info->timeout =
 					le32_to_cpu(durable_v2_blob->dcontext.Timeout);
 				dh_info->type = dh_idx;
@@ -3325,6 +3523,21 @@ int smb2_open(struct ksmbd_work *work)
 		rc = parse_app_instance_id(req, &dh_info);
 		if (rc)
 			goto err_out2;
+
+		if (dh_info.replay == true) {
+			fp = dh_info.fp;
+			if (ksmbd_override_fsids(work)) {
+				rc = -ENOMEM;
+				goto err_out2;
+			}
+
+			file_info = FILE_OPENED;
+			rc = ksmbd_vfs_getattr(&fp->filp->f_path, &stat);
+			if (rc)
+				goto err_out2;
+
+			goto reconnected_fp;
+		}
 
 		if (dh_info.reconnected == true) {
 			rc = smb2_check_durable_oplock(conn, share, dh_info.fp,
@@ -4155,8 +4368,9 @@ err_out1:
 
 err_out2:
 	if (!rc) {
-		rc = ksmbd_update_fstate(&work->sess->file_table, fp,
-					 FP_INITED);
+		if (!dh_info.replay)
+			rc = ksmbd_update_fstate(&work->sess->file_table, fp,
+						 FP_INITED);
 		if (!rc)
 			rc = ksmbd_iov_pin_rsp(work, (void *)rsp, iov_len);
 	}
@@ -4186,11 +4400,14 @@ err_out2:
 		if (!rsp->hdr.Status)
 			rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
 
-		if (fp)
+		if (fp && !dh_info.replay)
 			ksmbd_fd_put(work, fp);
 		smb2_set_err_rsp(work);
 		ksmbd_debug(SMB, "Error response: %x\n", rsp->hdr.Status);
 	}
+
+	if (dh_info.replay)
+		ksmbd_put_durable_fd(dh_info.fp);
 
 	if (dh_info.reconnected) {
 		/*
@@ -7077,6 +7294,7 @@ int smb2_set_info(struct ksmbd_work *work)
 	struct ksmbd_file *fp = NULL;
 	int rc = 0;
 	unsigned int id = KSMBD_NO_FID, pid = KSMBD_NO_FID;
+	bool chseq_tracked = false;
 
 	ksmbd_debug(SMB, "Received smb2 set info request\n");
 
@@ -7115,6 +7333,13 @@ int smb2_set_info(struct ksmbd_work *work)
 		goto err_out;
 	}
 
+	rc = smb3_verify_channel_sequence(work, fp, &req->hdr);
+	if (rc) {
+		rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
+		goto err_out;
+	}
+	chseq_tracked = true;
+
 	saved_cred = override_creds(fp->filp->f_cred);
 	switch (req->InfoType) {
 	case SMB2_O_INFO_FILE:
@@ -7141,6 +7366,8 @@ int smb2_set_info(struct ksmbd_work *work)
 			       sizeof(struct smb2_set_info_rsp));
 	if (rc)
 		goto err_out;
+	if (chseq_tracked)
+		smb3_complete_channel_sequence(work, fp, &req->hdr);
 	ksmbd_fd_put(work, fp);
 	return 0;
 
@@ -7166,6 +7393,8 @@ err_out:
 	else if (rsp->hdr.Status == 0 || rc == -EOPNOTSUPP)
 		rsp->hdr.Status = STATUS_INVALID_INFO_CLASS;
 	smb2_set_err_rsp(work);
+	if (chseq_tracked)
+		smb3_complete_channel_sequence(work, fp, &req->hdr);
 	ksmbd_fd_put(work, fp);
 	ksmbd_debug(SMB, "error while processing smb2 query rc = %d\n", rc);
 	return rc;
@@ -7680,6 +7909,7 @@ int smb2_write(struct ksmbd_work *work)
 	int err = 0;
 	unsigned int max_write_size = work->conn->vals->max_write_size;
 	unsigned int id = KSMBD_NO_FID, pid = KSMBD_NO_FID;
+	bool chseq_tracked = false;
 
 	ksmbd_debug(SMB, "Received smb2 write request\n");
 
@@ -7751,6 +7981,13 @@ int smb2_write(struct ksmbd_work *work)
 		goto out;
 	}
 
+	err = smb3_verify_channel_sequence(work, fp, &req->hdr);
+	if (err) {
+		rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
+		goto out;
+	}
+	chseq_tracked = true;
+
 	if (!(fp->daccess & (FILE_WRITE_DATA_LE | FILE_READ_ATTRIBUTES_LE))) {
 		pr_err("Not permitted to write : 0x%x\n", fp->daccess);
 		err = -EACCES;
@@ -7815,6 +8052,8 @@ int smb2_write(struct ksmbd_work *work)
 		goto out;
 	if (async_interim)
 		release_async_work(work);
+	if (chseq_tracked)
+		smb3_complete_channel_sequence(work, fp, &req->hdr);
 	ksmbd_fd_put(work, fp);
 	return 0;
 
@@ -7834,10 +8073,12 @@ out:
 		rsp->hdr.Status = STATUS_SHARING_VIOLATION;
 	else if (err == -EINVAL)
 		rsp->hdr.Status = STATUS_INVALID_PARAMETER;
-	else
+	else if (rsp->hdr.Status == 0)
 		rsp->hdr.Status = STATUS_INVALID_HANDLE;
 
 	smb2_set_err_rsp(work);
+	if (chseq_tracked)
+		smb3_complete_channel_sequence(work, fp, &req->hdr);
 	ksmbd_fd_put(work, fp);
 	return err;
 }
@@ -8123,6 +8364,8 @@ int smb2_lock(struct ksmbd_work *work)
 		goto out2;
 	}
 
+	smb2_verify_lock_sequence(work, fp, req);
+
 	filp = fp->filp;
 	lock_count = le16_to_cpu(req->LockCount);
 	lock_ele = req->locks;
@@ -8407,6 +8650,7 @@ skip:
 	err = ksmbd_iov_pin_rsp(work, rsp, sizeof(struct smb2_lock_rsp));
 	if (err)
 		goto out;
+	smb2_update_lock_sequence(work, fp, req);
 
 	ksmbd_fd_put(work, fp);
 	return 0;
@@ -8914,8 +9158,10 @@ int smb2_ioctl(struct ksmbd_work *work)
 	unsigned int cnt_code, nbytes = 0, out_buf_len, in_buf_len;
 	u64 id = KSMBD_NO_FID;
 	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_file *chseq_fp = NULL;
 	int ret = 0;
 	char *buffer;
+	bool chseq_tracked = false, no_fileid_ioctl = false;
 
 	ksmbd_debug(SMB, "Received smb2 ioctl request\n");
 
@@ -8945,6 +9191,33 @@ int smb2_ioctl(struct ksmbd_work *work)
 	buffer = (char *)req + le32_to_cpu(req->InputOffset);
 
 	cnt_code = le32_to_cpu(req->CtlCode);
+	switch (cnt_code) {
+	case FSCTL_DFS_GET_REFERRALS:
+	case FSCTL_DFS_GET_REFERRALS_EX:
+	case FSCTL_QUERY_NETWORK_INTERFACE_INFO:
+	case FSCTL_VALIDATE_NEGOTIATE_INFO:
+	case FSCTL_PIPE_WAIT:
+		no_fileid_ioctl = true;
+		break;
+	default:
+		break;
+	}
+
+	if (!no_fileid_ioctl && has_file_id(id)) {
+		chseq_fp = ksmbd_lookup_fd_slow(work, id, req->PersistentFileId);
+		if (!chseq_fp) {
+			ret = -ENOENT;
+			goto out;
+		}
+
+		ret = smb3_verify_channel_sequence(work, chseq_fp, &req->hdr);
+		if (ret) {
+			rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
+			goto out;
+		}
+		chseq_tracked = true;
+	}
+
 	ret = smb2_calc_max_out_buf_len(work,
 			offsetof(struct smb2_ioctl_rsp, Buffer),
 			le32_to_cpu(req->MaxOutputResponse));
@@ -9323,8 +9596,12 @@ dup_ext_out:
 	rsp->Flags = cpu_to_le32(0);
 	rsp->Reserved2 = cpu_to_le32(0);
 	ret = ksmbd_iov_pin_rsp(work, rsp, sizeof(struct smb2_ioctl_rsp) + nbytes);
-	if (!ret)
+	if (!ret) {
+		if (chseq_tracked)
+			smb3_complete_channel_sequence(work, chseq_fp, &req->hdr);
+		ksmbd_fd_put(work, chseq_fp);
 		return ret;
+	}
 
 out:
 	if (ret == -EACCES)
@@ -9340,6 +9617,9 @@ out:
 
 out2:
 	smb2_set_err_rsp(work);
+	if (chseq_tracked)
+		smb3_complete_channel_sequence(work, chseq_fp, &req->hdr);
+	ksmbd_fd_put(work, chseq_fp);
 	return ret;
 }
 
@@ -9387,6 +9667,22 @@ static void smb20_oplock_break_ack(struct ksmbd_work *work)
 	if (opinfo->op_state != OPLOCK_ACK_WAIT) {
 		ksmbd_debug(SMB, "unexpected oplock state 0x%x\n",
 			    opinfo->op_state);
+		if (smb3_hdr_replay(&req->hdr) &&
+		    opinfo->op_state == OPLOCK_STATE_NONE) {
+			rsp->StructureSize = cpu_to_le16(24);
+			rsp->OplockLevel = opinfo->level;
+			rsp->Reserved = 0;
+			rsp->Reserved2 = 0;
+			rsp->VolatileFid = volatile_id;
+			rsp->PersistentFid = persistent_id;
+			ret = ksmbd_iov_pin_rsp(work, rsp,
+						 sizeof(struct smb2_oplock_break));
+			if (ret)
+				ksmbd_debug(SMB,
+					    "failed to pin replayed oplock break response: %d\n",
+					    ret);
+			goto out_no_state_change;
+		}
 		if (opinfo->level == SMB2_OPLOCK_LEVEL_NONE)
 			status = STATUS_INVALID_OPLOCK_PROTOCOL;
 		else
@@ -9455,6 +9751,7 @@ err_out:
 out:
 	opinfo->op_state = OPLOCK_STATE_NONE;
 	wake_up_interruptible_all(&opinfo->oplock_q);
+out_no_state_change:
 	opinfo_put(opinfo);
 	ksmbd_fd_put(work, fp);
 }
@@ -9507,11 +9804,15 @@ static void smb21_lease_break_ack(struct ksmbd_work *work)
 	if (opinfo->op_state == OPLOCK_STATE_NONE) {
 		pr_err("unexpected lease break state 0x%x\n",
 		       opinfo->op_state);
+		if (smb3_hdr_replay(&req->hdr))
+			goto replay_rsp;
 		rsp->hdr.Status = STATUS_UNSUCCESSFUL;
 		goto err_out;
 	}
 
 	if (!atomic_read(&opinfo->breaking_cnt)) {
+		if (smb3_hdr_replay(&req->hdr))
+			goto replay_rsp;
 		rsp->hdr.Status = STATUS_UNSUCCESSFUL;
 		goto err_out;
 	}
@@ -9543,6 +9844,19 @@ static void smb21_lease_break_ack(struct ksmbd_work *work)
 	wake_up_interruptible_all(&opinfo->oplock_q);
 	atomic_dec(&opinfo->breaking_cnt);
 	wake_up_interruptible_all(&opinfo->oplock_brk);
+	opinfo_put(opinfo);
+	return;
+
+replay_rsp:
+	rsp->StructureSize = cpu_to_le16(36);
+	rsp->Reserved = 0;
+	rsp->Flags = 0;
+	memcpy(rsp->LeaseKey, req->LeaseKey, 16);
+	rsp->LeaseState = lease->state;
+	rsp->LeaseDuration = 0;
+	ret = ksmbd_iov_pin_rsp(work, rsp, sizeof(struct smb2_lease_ack));
+	if (ret)
+		goto err_out;
 	opinfo_put(opinfo);
 	return;
 

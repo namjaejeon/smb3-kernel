@@ -82,6 +82,13 @@ struct durable_owner {
 	char *name;
 };
 
+#define KSMBD_LOCK_SEQ_ARRAY_SIZE	64
+
+struct ksmbd_lock_sequence {
+	bool				valid;
+	u8				sequence;
+};
+
 struct ksmbd_file {
 	struct file			*filp;
 	u64				persistent_id;
@@ -134,6 +141,10 @@ struct ksmbd_file {
 
 	bool                            is_posix_ctxt;
 	struct durable_owner		owner;
+	__le16				channel_sequence;
+	unsigned int			outstanding_requests;
+	unsigned int			outstanding_pre_requests;
+	struct ksmbd_lock_sequence	lock_seq[KSMBD_LOCK_SEQ_ARRAY_SIZE];
 
 	/* Deferred free so lock-free RCU lookups never touch freed memory. */
 	struct rcu_head			rcu_head;
