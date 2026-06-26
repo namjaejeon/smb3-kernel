@@ -631,6 +631,11 @@ static struct ksmbd_file *ksmbd_fp_get(struct ksmbd_file *fp)
 	return fp;
 }
 
+struct ksmbd_file *ksmbd_file_get(struct ksmbd_file *fp)
+{
+	return ksmbd_fp_get(fp);
+}
+
 static struct ksmbd_file *__ksmbd_lookup_fd(struct ksmbd_file_table *ft,
 					    u64 id)
 {

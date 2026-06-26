@@ -715,14 +715,14 @@ static int smb3_verify_channel_sequence(struct ksmbd_work *work,
 
 static void smb3_complete_channel_sequence(struct ksmbd_work *work,
 					   struct ksmbd_file *fp,
-					   struct smb2_hdr *hdr)
+					   __le16 chseq_le)
 {
 	u16 chseq;
 
 	if (work->conn->dialect < SMB30_PROT_ID)
 		return;
 
-	chseq = le16_to_cpu(smb3_hdr_channel_sequence(hdr));
+	chseq = le16_to_cpu(chseq_le);
 
 	spin_lock(&fp->f_lock);
 	if (chseq == le16_to_cpu(fp->channel_sequence)) {
@@ -733,6 +733,48 @@ static void smb3_complete_channel_sequence(struct ksmbd_work *work,
 			fp->outstanding_pre_requests--;
 	}
 	spin_unlock(&fp->f_lock);
+}
+
+static int smb2_set_request_open(struct ksmbd_work *work, struct ksmbd_file *fp,
+				 struct smb2_hdr *hdr, bool verify_chseq)
+{
+	struct ksmbd_file *open;
+	int ret;
+
+	smb2_complete_request_open(work);
+
+	open = ksmbd_file_get(fp);
+	if (!open)
+		return -ESTALE;
+
+	if (verify_chseq) {
+		ret = smb3_verify_channel_sequence(work, fp, hdr);
+		if (ret) {
+			ksmbd_fd_put(work, open);
+			return ret;
+		}
+		work->request_open_chseq_tracked = true;
+	}
+
+	work->request_open = open;
+	work->request_open_chseq = smb3_hdr_channel_sequence(hdr);
+	return 0;
+}
+
+void smb2_complete_request_open(struct ksmbd_work *work)
+{
+	struct ksmbd_file *open = work->request_open;
+
+	if (!open)
+		return;
+
+	if (work->request_open_chseq_tracked)
+		smb3_complete_channel_sequence(work, open,
+					       work->request_open_chseq);
+
+	work->request_open = NULL;
+	work->request_open_chseq_tracked = false;
+	ksmbd_fd_put(work, open);
 }
 
 static bool smb2_lock_sequence_applicable(struct ksmbd_work *work,
@@ -4372,6 +4414,8 @@ err_out2:
 			rc = ksmbd_update_fstate(&work->sess->file_table, fp,
 						 FP_INITED);
 		if (!rc)
+			rc = smb2_set_request_open(work, fp, &req->hdr, false);
+		if (!rc)
 			rc = ksmbd_iov_pin_rsp(work, (void *)rsp, iov_len);
 	}
 	if (rc) {
@@ -7294,7 +7338,6 @@ int smb2_set_info(struct ksmbd_work *work)
 	struct ksmbd_file *fp = NULL;
 	int rc = 0;
 	unsigned int id = KSMBD_NO_FID, pid = KSMBD_NO_FID;
-	bool chseq_tracked = false;
 
 	ksmbd_debug(SMB, "Received smb2 set info request\n");
 
@@ -7333,12 +7376,11 @@ int smb2_set_info(struct ksmbd_work *work)
 		goto err_out;
 	}
 
-	rc = smb3_verify_channel_sequence(work, fp, &req->hdr);
+	rc = smb2_set_request_open(work, fp, &req->hdr, true);
 	if (rc) {
 		rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
 		goto err_out;
 	}
-	chseq_tracked = true;
 
 	saved_cred = override_creds(fp->filp->f_cred);
 	switch (req->InfoType) {
@@ -7366,8 +7408,6 @@ int smb2_set_info(struct ksmbd_work *work)
 			       sizeof(struct smb2_set_info_rsp));
 	if (rc)
 		goto err_out;
-	if (chseq_tracked)
-		smb3_complete_channel_sequence(work, fp, &req->hdr);
 	ksmbd_fd_put(work, fp);
 	return 0;
 
@@ -7393,8 +7433,6 @@ err_out:
 	else if (rsp->hdr.Status == 0 || rc == -EOPNOTSUPP)
 		rsp->hdr.Status = STATUS_INVALID_INFO_CLASS;
 	smb2_set_err_rsp(work);
-	if (chseq_tracked)
-		smb3_complete_channel_sequence(work, fp, &req->hdr);
 	ksmbd_fd_put(work, fp);
 	ksmbd_debug(SMB, "error while processing smb2 query rc = %d\n", rc);
 	return rc;
@@ -7909,7 +7947,6 @@ int smb2_write(struct ksmbd_work *work)
 	int err = 0;
 	unsigned int max_write_size = work->conn->vals->max_write_size;
 	unsigned int id = KSMBD_NO_FID, pid = KSMBD_NO_FID;
-	bool chseq_tracked = false;
 
 	ksmbd_debug(SMB, "Received smb2 write request\n");
 
@@ -7981,12 +8018,11 @@ int smb2_write(struct ksmbd_work *work)
 		goto out;
 	}
 
-	err = smb3_verify_channel_sequence(work, fp, &req->hdr);
+	err = smb2_set_request_open(work, fp, &req->hdr, true);
 	if (err) {
 		rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
 		goto out;
 	}
-	chseq_tracked = true;
 
 	if (!(fp->daccess & (FILE_WRITE_DATA_LE | FILE_READ_ATTRIBUTES_LE))) {
 		pr_err("Not permitted to write : 0x%x\n", fp->daccess);
@@ -8052,8 +8088,6 @@ int smb2_write(struct ksmbd_work *work)
 		goto out;
 	if (async_interim)
 		release_async_work(work);
-	if (chseq_tracked)
-		smb3_complete_channel_sequence(work, fp, &req->hdr);
 	ksmbd_fd_put(work, fp);
 	return 0;
 
@@ -8077,8 +8111,6 @@ out:
 		rsp->hdr.Status = STATUS_INVALID_HANDLE;
 
 	smb2_set_err_rsp(work);
-	if (chseq_tracked)
-		smb3_complete_channel_sequence(work, fp, &req->hdr);
 	ksmbd_fd_put(work, fp);
 	return err;
 }
@@ -8363,6 +8395,10 @@ int smb2_lock(struct ksmbd_work *work)
 		err = -ENOENT;
 		goto out2;
 	}
+
+	err = smb2_set_request_open(work, fp, &req->hdr, false);
+	if (err)
+		goto out2;
 
 	smb2_verify_lock_sequence(work, fp, req);
 
@@ -9158,10 +9194,9 @@ int smb2_ioctl(struct ksmbd_work *work)
 	unsigned int cnt_code, nbytes = 0, out_buf_len, in_buf_len;
 	u64 id = KSMBD_NO_FID;
 	struct ksmbd_conn *conn = work->conn;
-	struct ksmbd_file *chseq_fp = NULL;
 	int ret = 0;
 	char *buffer;
-	bool chseq_tracked = false, no_fileid_ioctl = false;
+	bool no_fileid_ioctl = false;
 
 	ksmbd_debug(SMB, "Received smb2 ioctl request\n");
 
@@ -9204,18 +9239,20 @@ int smb2_ioctl(struct ksmbd_work *work)
 	}
 
 	if (!no_fileid_ioctl && has_file_id(id)) {
-		chseq_fp = ksmbd_lookup_fd_slow(work, id, req->PersistentFileId);
-		if (!chseq_fp) {
+		struct ksmbd_file *fp;
+
+		fp = ksmbd_lookup_fd_slow(work, id, req->PersistentFileId);
+		if (!fp) {
 			ret = -ENOENT;
 			goto out;
 		}
 
-		ret = smb3_verify_channel_sequence(work, chseq_fp, &req->hdr);
+		ret = smb2_set_request_open(work, fp, &req->hdr, true);
+		ksmbd_fd_put(work, fp);
 		if (ret) {
 			rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
 			goto out;
 		}
-		chseq_tracked = true;
 	}
 
 	ret = smb2_calc_max_out_buf_len(work,
@@ -9596,12 +9633,8 @@ dup_ext_out:
 	rsp->Flags = cpu_to_le32(0);
 	rsp->Reserved2 = cpu_to_le32(0);
 	ret = ksmbd_iov_pin_rsp(work, rsp, sizeof(struct smb2_ioctl_rsp) + nbytes);
-	if (!ret) {
-		if (chseq_tracked)
-			smb3_complete_channel_sequence(work, chseq_fp, &req->hdr);
-		ksmbd_fd_put(work, chseq_fp);
+	if (!ret)
 		return ret;
-	}
 
 out:
 	if (ret == -EACCES)
@@ -9617,9 +9650,6 @@ out:
 
 out2:
 	smb2_set_err_rsp(work);
-	if (chseq_tracked)
-		smb3_complete_channel_sequence(work, chseq_fp, &req->hdr);
-	ksmbd_fd_put(work, chseq_fp);
 	return ret;
 }
 
@@ -9652,6 +9682,14 @@ static void smb20_oplock_break_ack(struct ksmbd_work *work)
 	if (!fp) {
 		rsp->hdr.Status = STATUS_FILE_CLOSED;
 		smb2_set_err_rsp(work);
+		return;
+	}
+
+	ret = smb2_set_request_open(work, fp, &req->hdr, false);
+	if (ret) {
+		rsp->hdr.Status = STATUS_FILE_CLOSED;
+		smb2_set_err_rsp(work);
+		ksmbd_fd_put(work, fp);
 		return;
 	}
 
