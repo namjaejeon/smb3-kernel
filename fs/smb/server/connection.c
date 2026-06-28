@@ -27,33 +27,113 @@ DECLARE_RWSEM(conn_list_lock);
 #ifdef CONFIG_PROC_FS
 static struct proc_dir_entry *proc_clients;
 
+static const char *ksmbd_conn_state_string(struct ksmbd_conn *conn)
+{
+	switch (READ_ONCE(conn->status)) {
+	case KSMBD_SESS_NEW:
+		return "new";
+	case KSMBD_SESS_GOOD:
+		return "good";
+	case KSMBD_SESS_EXITING:
+		return "exiting";
+	case KSMBD_SESS_NEED_RECONNECT:
+		return "reconnect";
+	case KSMBD_SESS_NEED_NEGOTIATE:
+		return "negotiate";
+	case KSMBD_SESS_NEED_SETUP:
+		return "setup";
+	case KSMBD_SESS_RELEASING:
+		return "releasing";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *ksmbd_conn_transport_string(struct ksmbd_conn *conn)
+{
+	if (conn->transport->ops->rdma_read || conn->transport->ops->rdma_write)
+		return "smbdirect";
+	return "tcp";
+}
+
+static void proc_show_conn_feature(struct seq_file *m, bool *separator,
+				   bool enabled, const char *name)
+{
+	if (!enabled)
+		return;
+	seq_printf(m, "%s%s", *separator ? "," : "", name);
+	*separator = true;
+}
+
+static void proc_show_conn_features(struct seq_file *m,
+				    struct ksmbd_conn *conn)
+{
+	bool separator = false;
+
+	proc_show_conn_feature(m, &separator,
+			       conn->sign || conn->signing_negotiated, "sign");
+	proc_show_conn_feature(m, &separator, conn->cipher_type, "encrypt");
+	proc_show_conn_feature(m, &separator,
+			       conn->compress_algorithm != SMB3_COMPRESS_NONE,
+			       "compress");
+	proc_show_conn_feature(m, &separator, conn->posix_ext_supported, "posix");
+	if (!separator)
+		seq_puts(m, "none");
+}
+
 static int proc_show_clients(struct seq_file *m, void *v)
 {
 	struct ksmbd_conn *conn;
 	struct timespec64 now, t;
 	int i;
 
-	seq_printf(m, "#%-40s %-10s %-10s %-12s %-10s %s\n",
-		   "<client>", "<dialect>", "<credits>", "<open files>",
-		   "<requests>", "<last active>");
+	seq_printf(m, "#%-40s %-9s %-10s %-10s %-20s %-8s %-12s %-12s %-28s %s\n",
+		   "<client>", "<transport>", "<state>", "<dialect>",
+		   "<credits used/total>", "<sessions>", "<open files>",
+		   "<requests>", "<features>", "<last active>");
 
 	down_read(&conn_list_lock);
 	hash_for_each(conn_list, i, conn, hlist) {
+		unsigned int outstanding_credits, total_credits;
+		size_t features_start, features_len;
+		unsigned long id;
+		void *entry;
+		unsigned int sessions = 0;
+
 		jiffies_to_timespec64(jiffies - conn->last_active, &t);
 		ktime_get_real_ts64(&now);
 		t = timespec64_sub(now, t);
+
+		spin_lock(&conn->credits_lock);
+		outstanding_credits = conn->outstanding_credits;
+		total_credits = conn->total_credits;
+		spin_unlock(&conn->credits_lock);
+
+		rcu_read_lock();
+		xa_for_each(&conn->sessions, id, entry)
+			sessions++;
+		rcu_read_unlock();
 #if IS_ENABLED(CONFIG_IPV6)
 		if (!conn->inet_addr)
 			seq_printf(m, " %-40pI6c", &conn->inet6_addr);
 		else
 #endif
 			seq_printf(m, " %-40pI4", &conn->inet_addr);
-		seq_printf(m, " 0x%-8x %-10u %-12d %-10d %ptT\n",
+		seq_printf(m, " %-9s %-10s 0x%-8x %8u/%-11u %-8u %-12d %-12lld ",
+			   ksmbd_conn_transport_string(conn),
+			   ksmbd_conn_state_string(conn),
 			   conn->dialect,
-			   conn->total_credits,
+			   outstanding_credits,
+			   total_credits,
+			   sessions,
 			   atomic_read(&conn->stats.open_files_count),
-			   atomic_read(&conn->req_running),
-			   &t);
+			   atomic64_read(&conn->stats.request_served));
+		features_start = m->count;
+		proc_show_conn_features(m, conn);
+		features_len = m->count - features_start;
+		if (features_len < 28)
+			seq_printf(m, "%*s", 28 - (int)features_len, "");
+		seq_printf(m, " %ptT\n", &t);
 	}
 	up_read(&conn_list_lock);
 	return 0;
