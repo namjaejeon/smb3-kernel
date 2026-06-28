@@ -28,6 +28,62 @@ struct ksmbd_veto_pattern {
 	struct list_head	list;
 };
 
+#ifdef CONFIG_PROC_FS
+static const struct ksmbd_const_name ksmbd_share_flag_names[] = {
+	{KSMBD_SHARE_FLAG_AVAILABLE, "available"},
+	{KSMBD_SHARE_FLAG_BROWSEABLE, "browseable"},
+	{KSMBD_SHARE_FLAG_WRITEABLE, "writeable"},
+	{KSMBD_SHARE_FLAG_READONLY, "read-only"},
+	{KSMBD_SHARE_FLAG_GUEST_OK, "guest-ok"},
+	{KSMBD_SHARE_FLAG_GUEST_ONLY, "guest-only"},
+	{KSMBD_SHARE_FLAG_STORE_DOS_ATTRS, "store-dos-attrs"},
+	{KSMBD_SHARE_FLAG_OPLOCKS, "oplocks"},
+	{KSMBD_SHARE_FLAG_PIPE, "pipe"},
+	{KSMBD_SHARE_FLAG_HIDE_DOT_FILES, "hide-dot-files"},
+	{KSMBD_SHARE_FLAG_INHERIT_OWNER, "inherit-owner"},
+	{KSMBD_SHARE_FLAG_STREAMS, "streams"},
+	{KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS, "follow-symlinks"},
+	{KSMBD_SHARE_FLAG_ACL_XATTR, "acl-xattr"},
+	{KSMBD_SHARE_FLAG_UPDATE, "update"},
+	{KSMBD_SHARE_FLAG_CROSSMNT, "crossmnt"},
+	{KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY, "continuous-availability"},
+};
+
+static int proc_show_shares(struct seq_file *m, void *v)
+{
+	struct ksmbd_share_config *share;
+	int i;
+
+	seq_printf(m, "#%-32s %-8s %-12s %-8s %-8s %s\n", "<name>",
+		   "<type>", "<tree conns>", "<file mask>", "<dir mask>",
+		   "<flags>");
+
+	down_read(&shares_table_lock);
+	hash_for_each(shares_table, i, share, hlist) {
+		seq_printf(m, " %-32s %-8s %-12d 0%07o 0%07o ", share->name,
+			   test_share_config_flag(share, KSMBD_SHARE_FLAG_PIPE) ?
+			   "pipe" : "disk",
+			   atomic_read(&share->tree_connections),
+			   share->create_mask, share->directory_mask);
+		ksmbd_proc_show_flag_names(m, ksmbd_share_flag_names,
+					   ARRAY_SIZE(ksmbd_share_flag_names),
+					   share->flags);
+		seq_putc(m, '\n');
+	}
+	up_read(&shares_table_lock);
+	return 0;
+}
+
+int create_proc_shares(void)
+{
+	if (!ksmbd_proc_create("shares", proc_show_shares, NULL))
+		return -ENOMEM;
+	return 0;
+}
+#else
+int create_proc_shares(void) { return 0; }
+#endif
+
 static unsigned int share_name_hash(const char *name)
 {
 	return jhash(name, strlen(name), 0);
@@ -156,6 +212,7 @@ static struct ksmbd_share_config *share_config_request(struct ksmbd_work *work,
 
 	share->flags = resp->flags;
 	atomic_set(&share->refcount, 1);
+	ksmbd_share_tree_conn_init(share);
 	INIT_LIST_HEAD(&share->veto_list);
 	share->name = kstrdup(name, KSMBD_DEFAULT_GFP);
 
