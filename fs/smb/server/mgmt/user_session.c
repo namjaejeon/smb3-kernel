@@ -78,6 +78,28 @@ static const char *session_user_name(struct ksmbd_session *session)
 	return session->user->name;
 }
 
+static const char *session_account_type(struct ksmbd_session *session)
+{
+	if (user_guest(session->user))
+		return "guest";
+	if (ksmbd_anonymous_user(session->user))
+		return "anonymous";
+	return "user";
+}
+
+static unsigned int session_open_file_count(struct ksmbd_session *session)
+{
+	struct ksmbd_file *fp;
+	unsigned int count = 0;
+	unsigned int id;
+
+	read_lock(&session->file_table.lock);
+	idr_for_each_entry(session->file_table.idr, fp, id)
+		count++;
+	read_unlock(&session->file_table.lock);
+	return count;
+}
+
 static int show_proc_session(struct seq_file *m, void *v)
 {
 	struct ksmbd_session *sess;
@@ -91,8 +113,15 @@ static int show_proc_session(struct seq_file *m, void *v)
 	ksmbd_user_session_get(sess);
 
 	seq_printf(m, "%-20s\t%s\n", "user", session_user_name(sess));
+	seq_printf(m, "%-20s\t%s\n", "account type",
+		   session_account_type(sess));
 	seq_printf(m, "%-20s\t%llu\n", "id", sess->id);
 	seq_printf(m, "%-20s\t%s\n", "state", session_state_string(sess));
+	seq_printf(m, "%-20s\t0x%04x\n", "dialect", sess->dialect);
+	seq_printf(m, "%-20s\t%lu\n", "last active (sec)",
+		   jiffies_to_msecs(jiffies - sess->last_active) / MSEC_PER_SEC);
+	seq_printf(m, "%-20s\t%u\n", "open files",
+		   session_open_file_count(sess));
 
 	i = 0;
 	down_read(&sess->chann_lock);
@@ -116,6 +145,8 @@ static int show_proc_session(struct seq_file *m, void *v)
 				ARRAY_SIZE(ksmbd_sess_cap_const_names),
 				chan->conn->vals->req_capabilities);
 		seq_putc(m, '\n');
+		seq_printf(m, "%-20s\t%s\n", "posix extensions",
+			   chan->conn->posix_ext_supported ? "yes" : "no");
 
 		if (sess->sign) {
 			unsigned int algorithm =
@@ -159,8 +190,10 @@ static int show_proc_session(struct seq_file *m, void *v)
 		else
 			seq_printf(m, " %s ", "disk");
 		seq_putc(m, '\n');
+		i++;
 	}
 	up_read(&sess->tree_conns_lock);
+	seq_printf(m, "%-20s\t%d\n", "tree connects", i);
 
 	ksmbd_user_session_put(sess);
 	return 0;
