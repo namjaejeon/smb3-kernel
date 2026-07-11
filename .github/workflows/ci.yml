@@ -1,0 +1,373 @@
+name: ksmbd xfstests CI
+
+on:
+  push:
+    branches: [ksmbd-for-next]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  # xfstests over cifs.ko against the in-kernel SMB server (ksmbd), driven
+  # directly by this workflow. The repository is the kernel under test;
+  # ksmbd-tools and xfstests are fetched next to it.
+  #
+  # One parallel leg per sanitizer, starting from defconfig and enabling
+  # only the sanitizer and filesystem options needed by this test.
+  # KFENCE is off next to full KASAN coverage and on for KCSAN.
+  ksmbd-xfstests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: kasan
+            config_check: CONFIG_KASAN=y
+          - sanitizer: kcsan
+            config_check: CONFIG_KCSAN=y
+          # kmsan leg deactivated for now (too slow for the 6h job limit);
+          # uncomment and add its compiler probe before re-enabling.
+          # - sanitizer: kmsan
+          #   config_check: CONFIG_KMSAN=y
+    name: ksmbd-xfstests (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    # GitHub-hosted maximum; the VM timeout below is 4h so reporting and
+    # uploads still run after a sanitizer-slow leg exhausts the VM time.
+    timeout-minutes: 360
+    steps:
+      # The kernel under test: this repository, at the workspace root.
+      - uses: actions/checkout@v4
+
+      # First thing after the checkouts: everything below (toolchains,
+      # clones, sanitizer kernel build, xfstests exports) shares this
+      # filesystem, and a KASAN/KMSAN build with debug info alone can
+      # eat 15-25GB.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install kernel, VM, and xfstests dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            attr autoconf automake bc bison build-essential busybox-static \
+            cifs-utils cpio dbench dwarves e2fsprogs fio flex gawk \
+            libacl1-dev libaio-dev libattr1-dev libcap-dev libdw-dev \
+            libelf-dev libgdbm-dev libgdbm-compat-dev libglib2.0-dev \
+            libmount-dev libnl-3-dev libnl-genl-3-dev libssl-dev \
+            iproute2 libtool libtool-bin liburing-dev pkg-config quota \
+            python3-venv qemu-system-x86 qemu-utils rsync sqlite3 \
+            uuid-dev uuid-runtime xfsprogs xfslibs-dev clang lld cargo rustc \
+            wget
+          # xfstests secondary users must exist on the host. They are shared
+          # into the guest by virtme-ng.
+          sudo useradd -m fsgqa || true
+          sudo useradd 123456-fsgqa || true
+
+      # Latest LLVM snapshot from apt.llvm.org (llvm-toolchain-noble = trunk);
+      # packages are versioned (clang-N), so prepend /usr/lib/llvm-N/bin to
+      # PATH where the unversioned clang/ld.lld/llvm-* live, for LLVM=1 builds.
+      - name: Install latest LLVM toolchain
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt-llvm-org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble main" | sudo tee /etc/apt/sources.list.d/apt-llvm-org.list
+          echo "deb-src http://apt.llvm.org/noble/ llvm-toolchain-noble main" | sudo tee -a /etc/apt/sources.list.d/apt-llvm-org.list
+          sudo apt-get update -qq
+          # Keep the LLVM selection in one place so both sanitizer legs use
+          # the same compiler family.
+          for LLVM_VER in $(apt-cache search --names-only '^clang-[0-9]+$' | awk -F'[- ]' '{print $2}' | sort -rn); do
+            sudo apt-get install -y -qq clang-$LLVM_VER lld-$LLVM_VER llvm-$LLVM_VER
+            break
+          done
+          echo "/usr/lib/llvm-$LLVM_VER/bin" >> $GITHUB_PATH
+          /usr/lib/llvm-$LLVM_VER/bin/clang --version
+
+      - name: Install virtme-ng
+        run: |
+          python3 -m venv "$RUNNER_TEMP/virtme-ng"
+          "$RUNNER_TEMP/virtme-ng/bin/pip" install --upgrade pip
+          BUILD_VIRTME_NG_INIT=1 "$RUNNER_TEMP/virtme-ng/bin/pip" install \
+            --upgrade git+https://github.com/arighi/virtme-ng.git
+          echo "$RUNNER_TEMP/virtme-ng/bin" >> $GITHUB_PATH
+
+      - name: Checkout ksmbd-tools
+        uses: actions/checkout@v4
+        with:
+          repository: cifsd-team/ksmbd-tools
+          path: ksmbd-tools
+
+      - name: Build and install ksmbd-tools
+        run: |
+          cd ksmbd-tools
+          ./autogen.sh
+          ./configure --sysconfdir=/etc --with-rundir=/run
+          make CC=clang -j`nproc`
+          sudo make install
+
+      # xfstests is hosted on git.kernel.org; actions/checkout can only
+      # fetch GitHub repositories, so plain git clone stays here.
+      - name: Build xfstests
+        run: |
+          git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
+          make -j`nproc` -C xfstests-dev
+
+      - name: Configure kernel
+        run: |
+          make LLVM=1 defconfig
+          ./scripts/config --disable CONFIG_KUNIT
+          ./scripts/config --enable CONFIG_CIFS
+          ./scripts/config --enable CONFIG_CIFS_XATTR
+          ./scripts/config --enable CONFIG_CIFS_POSIX
+          ./scripts/config --enable CONFIG_CIFS_ALLOW_INSECURE_LEGACY
+          ./scripts/config --enable CONFIG_CIFS_DEBUG
+          ./scripts/config --enable CONFIG_SMB_SERVER
+          ./scripts/config --enable CONFIG_SMB_SERVER_CHECK_CAP_NET_ADMIN
+          ./scripts/config --enable CONFIG_DEBUG_KERNEL
+          if [ "${{ matrix.sanitizer }}" = "kasan" ]; then
+            ./scripts/config --enable CONFIG_KASAN
+            ./scripts/config --disable CONFIG_KFENCE
+          else
+            ./scripts/config --enable CONFIG_KCSAN
+            ./scripts/config --enable CONFIG_KCSAN_EARLY_ENABLE
+            ./scripts/config --enable CONFIG_KFENCE
+          fi
+          make LLVM=1 olddefconfig
+
+      - name: Verify kernel configuration
+        run: |
+          grep -x "CONFIG_CIFS=y" .config
+          grep -x "CONFIG_SMB_SERVER=y" .config
+          grep -x "${{ matrix.config_check }}" .config
+          grep -E "CONFIG_(CC_IS_CLANG|CC_VERSION_TEXT|DEBUG_KERNEL|KASAN|KCSAN|KCSAN_EARLY_ENABLE|KFENCE)[= ]" .config || true
+
+      - name: Build kernel
+        run: make -j"$(nproc)" LLVM=1
+
+      # olddefconfig drops sanitizer options whose dependencies are unmet;
+      # fail loudly instead of silently testing an unsanitized kernel,
+      # and dump the dependency state so the cause is visible in the log.
+      - name: Verify ${{ matrix.sanitizer }} is enabled
+        run: |
+          grep -x "${{ matrix.config_check }}" .config && exit 0
+          echo "::error::${{ matrix.sanitizer }} was dropped by olddefconfig; dependency state:"
+          grep -E "CONFIG_(CC_IS_CLANG|CC_VERSION_TEXT|HAVE_ARCH_KMSAN|HAVE_KMSAN_COMPILER|HAVE_ARCH_KCSAN|HAVE_KCSAN_COMPILER|DEBUG_KERNEL|PREEMPT_RT|KASAN|KCSAN|KMSAN|KFENCE)[= ]" .config || true
+          exit 1
+
+      - name: Prepare ksmbd xfstests guest script
+        run: |
+          mkdir -p .github
+          cat > .github/xfstests-ksmbd.sh <<'KSMBD_SCRIPT'
+          #!/usr/bin/env bash
+          set -u
+
+          XFSTESTS_DIR="${XFSTESTS_DIR:-$PWD/xfstests-dev}"
+          EXPORT_BASE="${EXPORT_BASE:-/var/tmp/kci-ksmbd}"
+          SMB_USER=linkinjeon
+          SMB_PASS=1234
+          CIFS_MOUNT_OPTIONS='-ousername=linkinjeon,password=1234,noperm,vers=3.11,actimeo=0,mfsymlinks'
+          TEST_FS_MOUNT_OPTIONS='-ousername=linkinjeon,noperm,vers=3.11,actimeo=0,password=1234,mfsymlinks'
+          # xfstests uses the shorter _OPTS spelling; keep both names.
+          TEST_FS_MOUNT_OPTS="$TEST_FS_MOUNT_OPTIONS"
+          TESTS=(
+              cifs/001 cifs/100 cifs/102 cifs/105 cifs/106
+              generic/001 generic/002 generic/005 generic/006 generic/007 generic/008
+              generic/010 generic/011 generic/013 generic/014 generic/020 generic/023
+              generic/024 generic/028 generic/029 generic/030 generic/032 generic/033
+              generic/036 generic/037 generic/043 generic/044 generic/045 generic/046
+              generic/051 generic/069 generic/070 generic/071 generic/072 generic/074
+              generic/080 generic/084 generic/086 generic/095 generic/098 generic/100
+              generic/103 generic/109 generic/113 generic/117 generic/124 generic/125
+              generic/129 generic/130 generic/132 generic/133 generic/135 generic/141
+              generic/169 generic/198 generic/207 generic/208 generic/210 generic/211
+              generic/212 generic/214 generic/215 generic/221 generic/225 generic/228
+              generic/236 generic/239 generic/241 generic/245 generic/246 generic/247
+              generic/248 generic/249 generic/257 generic/258 generic/286 generic/308
+              generic/309 generic/310 generic/313 generic/315 generic/316 generic/323
+              generic/337 generic/339 generic/340 generic/344 generic/345 generic/346
+              generic/349 generic/350 generic/354 generic/360 generic/377 generic/391
+              generic/393 generic/394 generic/406 generic/412 generic/420 generic/422
+              generic/428 generic/430 generic/431 generic/432 generic/433 generic/436
+              generic/437 generic/438 generic/439 generic/443 generic/445 generic/446
+              generic/448 generic/451 generic/452 generic/454 generic/460 generic/461
+              generic/464 generic/465 generic/469 generic/490 generic/504 generic/523
+              generic/524 generic/528 generic/532 generic/533 generic/539 generic/565
+              generic/567 generic/568 generic/590 generic/591 generic/599
+          )
+
+          log() { echo "[ksmbd-xfstests] $*"; }
+          fail() {
+              echo "[ksmbd-xfstests] FATAL: $*"
+              dmesg | tail -80 || true
+              exit 1
+          }
+
+          mount -t tmpfs tmpfs /run 2>/dev/null || true
+          ip link set lo up || fail "cannot bring up loopback"
+          command -v ksmbd.mountd >/dev/null || fail "ksmbd.mountd not found"
+          command -v ksmbd.adduser >/dev/null || fail "ksmbd.adduser not found"
+          command -v mount.cifs >/dev/null || fail "mount.cifs not found"
+          [ -x "$XFSTESTS_DIR/check" ] || fail "xfstests check not found at $XFSTESTS_DIR"
+
+          mkdir -m 777 -p "$EXPORT_BASE/test" "$EXPORT_BASE/scratch" || \
+              fail "cannot create SMB export directories"
+          mkdir -p "$EXPORT_BASE/mnt-test" "$EXPORT_BASE/mnt-scratch" || \
+              fail "cannot create mount points"
+          cat > "$EXPORT_BASE/smb.conf" <<SMB_CONF
+          [global]
+              netbios name = KSMBD-CI
+
+          [test]
+              path = $EXPORT_BASE/test
+              writeable = yes
+              read only = no
+
+          [scratch]
+              path = $EXPORT_BASE/scratch
+              writeable = yes
+              read only = no
+          SMB_CONF
+
+          ksmbd.adduser -P "$EXPORT_BASE/ksmbdpwd.db" -a "$SMB_USER" -p "$SMB_PASS" || \
+              fail "ksmbd.adduser failed"
+          mkdir -p /etc/ksmbd
+          ksmbd.mountd -n -C "$EXPORT_BASE/smb.conf" -P "$EXPORT_BASE/ksmbdpwd.db" \
+              > "$EXPORT_BASE/ksmbd.mountd.log" 2>&1 &
+          mountd_pid=$!
+          trap 'ksmbd.control -s 2>/dev/null || true; kill "$mountd_pid" 2>/dev/null || true' EXIT
+          sleep 2
+          kill -0 "$mountd_pid" 2>/dev/null || fail "ksmbd.mountd exited"
+
+          mount -t cifs "$CIFS_MOUNT_OPTIONS" "//127.0.0.1/test" \
+              "$EXPORT_BASE/mnt-test" || fail "CIFS smoke mount failed"
+          touch "$EXPORT_BASE/mnt-test/.kci-smoke" || fail "CIFS smoke write failed"
+          rm -f "$EXPORT_BASE/mnt-test/.kci-smoke"
+          umount "$EXPORT_BASE/mnt-test" || fail "CIFS smoke unmount failed"
+
+          cd "$XFSTESTS_DIR" || fail "cannot enter xfstests directory"
+          cat > local.config <<XFS_CONFIG
+          export FSTYP=cifs
+          export TEST_DEV=//127.0.0.1/test
+          export TEST_DIR=$EXPORT_BASE/mnt-test
+          export SCRATCH_DEV=//127.0.0.1/scratch
+          export SCRATCH_MNT=$EXPORT_BASE/mnt-scratch
+          export CIFS_MOUNT_OPTIONS='$CIFS_MOUNT_OPTIONS'
+          export TEST_FS_MOUNT_OPTIONS='$TEST_FS_MOUNT_OPTIONS'
+          export TEST_FS_MOUNT_OPTS='$TEST_FS_MOUNT_OPTS'
+          XFS_CONFIG
+          log "running ${#TESTS[@]} xfstests"
+          echo "=== XFSTESTS START ==="
+          set +e
+          ./check -d -T -R xunit "${TESTS[@]}"
+          status=$?
+          set -e
+          echo "=== XFSTESTS END ==="
+          echo "=== FULL DMESG ==="
+          dmesg || true
+          exit "$status"
+          KSMBD_SCRIPT
+          chmod 755 .github/xfstests-ksmbd.sh
+
+      # Run the kernel built above in a copy-on-write virtme-ng guest. The
+      # guest sees the checked-out tree, ksmbd-tools, and xfstests directory.
+      - name: Run xfstests
+        run: |
+          mkdir -p test-results
+          set +e
+          timeout 14400 vng --rw --verbose \
+            --memory 8G --cpus "$(nproc)" \
+            --append 'panic_on_warn=0' --network user --user root \
+            --kdir "$GITHUB_WORKSPACE" \
+            --exec "cd $GITHUB_WORKSPACE && bash .github/xfstests-ksmbd.sh" \
+            2>&1 | tee test-results/vng-output.txt
+          vm_status=${PIPESTATUS[0]}
+          set -e
+
+          awk '/^=== XFSTESTS START ===$/ {in_xfs=1; next} \
+               /^=== XFSTESTS END ===$/ {in_xfs=0} in_xfs' \
+            test-results/vng-output.txt > test-results/xfstests-ksmbd.txt
+          awk '/^=== FULL DMESG ===$/ {in_dmesg=1; next} in_dmesg' \
+            test-results/vng-output.txt > test-results/dmesg.txt
+          cp -f xfstests-dev/local.config test-results/local.config 2>/dev/null || true
+
+          if [ -d xfstests-dev/results ]; then
+            mkdir -p test-results/xfstests-results
+            cp -a xfstests-dev/results/. test-results/xfstests-results/
+          fi
+          : > test-results/xfstests-failures.txt
+          while IFS= read -r -d '' bad; do
+            rel=${bad#xfstests-dev/results/}
+            test=${rel%.out.bad}
+            {
+              echo "===== $test ====="
+              echo "--- $test.out.bad ---"
+              cat "$bad"
+              for suffix in .dmesg .full; do
+                detail="${bad%.out.bad}${suffix}"
+                if [ -f "$detail" ]; then
+                  echo "--- $test$suffix ---"
+                  cat "$detail"
+                fi
+              done
+            } >> test-results/xfstests-failures.txt
+          done < <(find xfstests-dev/results -type f -name '*.out.bad' -print0 2>/dev/null)
+          [ -s test-results/xfstests-failures.txt ] || \
+            echo "all tests passed" > test-results/xfstests-failures.txt
+
+          if ! grep -q '=== XFSTESTS END ===' test-results/vng-output.txt; then
+            echo "::error::xfstests did not complete (virtme-ng status: $vm_status)"
+            tail -80 test-results/vng-output.txt
+            exit 1
+          fi
+          echo "virtme-ng exited with status $vm_status after xfstests completed"
+
+      # Individual test failures must NOT fail the job (they are reported
+      # instead); only a broken harness. xfstests never reached its
+      # summary line (boot panic, mount failure) is a CI failure.
+      - name: Verify xfstests completed
+        run: |
+          grep -qE "^(Failed [0-9]+ of|Passed all)" test-results/xfstests-ksmbd.txt 2>/dev/null && exit 0
+          echo "::error::xfstests never completed -- guest environment failure. Last guest output:"
+          tail -80 test-results/vng-output.txt 2>/dev/null || echo "(no vng output at all -- VM did not boot?)"
+          exit 1
+
+      - name: Show results
+        if: always()
+        run: |
+          echo "=== XFSTESTS SUMMARY ==="
+          grep -E "^(Failures:|Failed [0-9]+ of|Passed all|Not run:)" test-results/xfstests-ksmbd.txt 2>/dev/null || echo "(no summary)"
+          echo ""
+          echo "=== FAILED TEST DETAILS ==="
+          cat test-results/xfstests-failures.txt 2>/dev/null || echo "(no report)"
+          echo ""
+          echo "=== KERNEL DMESG BUGS ==="
+          grep -E "(BUG:|KASAN:|KCSAN:|KMSAN:|UBSAN:|Oops:|WARNING:)" test-results/dmesg.txt 2>/dev/null || echo "(none)"
+          {
+            echo "## xfstests over ksmbd (${{ matrix.sanitizer }})"
+            echo '```'
+            grep -E "^(Failures:|Failed [0-9]+ of|Passed all|Not run:)" test-results/xfstests-ksmbd.txt 2>/dev/null || echo "xfstests did not complete"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload xfstests results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfstests-results-${{ matrix.sanitizer }}
+          path: |
+            test-results/xfstests-ksmbd.txt
+            test-results/xfstests-failures.txt
+            test-results/xfstests-results/
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksmbd-test-results-${{ matrix.sanitizer }}
+          path: test-results/
