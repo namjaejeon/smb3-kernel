@@ -31,6 +31,7 @@ int ksmbd_decompress_request(struct ksmbd_conn *conn)
 	unsigned int pdu_size = get_rfc1002_len(conn->request_buf);
 	u32 orig_size, offset, out_size;
 	u32 max_allowed_pdu_size;
+	unsigned int out_buf_sz;
 	char *buf, *out;
 	int rc;
 
@@ -61,7 +62,8 @@ int ksmbd_decompress_request(struct ksmbd_conn *conn)
 	    out_size > MAX_STREAM_PROT_LEN)
 		return -EINVAL;
 
-	out = kvmalloc(out_size + 4 + 1, KSMBD_DEFAULT_GFP);
+	out_buf_sz = out_size + 4 + 1;
+	out = ksmbd_conn_get_request_buf(conn, &out_buf_sz);
 	if (!out)
 		return -ENOMEM;
 
@@ -71,12 +73,14 @@ int ksmbd_decompress_request(struct ksmbd_conn *conn)
 					conn->compress_chained,
 					buf, pdu_size, out + 4, out_size);
 	if (rc) {
-		kvfree(out);
+		ksmbd_conn_put_request_buf(conn, out, out_buf_sz);
 		return rc;
 	}
 
-	kvfree(conn->request_buf);
+	ksmbd_conn_put_request_buf(conn, conn->request_buf,
+				   conn->request_buf_sz);
 	conn->request_buf = out;
+	conn->request_buf_sz = out_buf_sz;
 	return 0;
 }
 

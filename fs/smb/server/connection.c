@@ -255,6 +255,7 @@ void ksmbd_conn_free(struct ksmbd_conn *conn)
 	 */
 	xa_destroy(&conn->sessions);
 	kvfree(conn->request_buf);
+	kvfree(conn->request_cache_buf);
 	kfree(conn->preauth_info);
 	kfree(conn->mechToken);
 	ksmbd_conn_put(conn);
@@ -305,6 +306,7 @@ struct ksmbd_conn *ksmbd_conn_alloc(void)
 	INIT_LIST_HEAD(&conn->async_requests);
 	spin_lock_init(&conn->request_lock);
 	spin_lock_init(&conn->credits_lock);
+	spin_lock_init(&conn->request_cache_lock);
 	ida_init(&conn->async_ida);
 	xa_init(&conn->sessions);
 
@@ -570,8 +572,10 @@ int ksmbd_conn_handler_loop(void *p)
 		if (try_to_freeze())
 			continue;
 
-		kvfree(conn->request_buf);
+		ksmbd_conn_put_request_buf(conn, conn->request_buf,
+					   conn->request_buf_sz);
 		conn->request_buf = NULL;
+		conn->request_buf_sz = 0;
 
 recheck:
 		if (atomic_read(&conn->req_running) + 1 > max_req) {
@@ -611,8 +615,9 @@ recheck:
 
 		/* 4 for rfc1002 length field */
 		/* 1 for implied bcc[0] */
-		size = pdu_size + 4 + 1;
-		conn->request_buf = kvmalloc(size, KSMBD_DEFAULT_GFP);
+		conn->request_buf_sz = pdu_size + 4 + 1;
+		conn->request_buf = ksmbd_conn_get_request_buf(conn,
+							&conn->request_buf_sz);
 		if (!conn->request_buf)
 			break;
 
@@ -706,6 +711,61 @@ void ksmbd_conn_r_count_dec(struct ksmbd_conn *conn)
 		wake_up(&conn->r_count_q);
 
 	ksmbd_conn_put(conn);
+}
+
+/**
+ * ksmbd_conn_get_request_buf() - get a buffer for receiving a PDU
+ * @conn:	connection instance
+ * @sizep:	in: minimum size needed, out: capacity of returned buffer
+ *
+ * Reuse the connection's cached PDU buffer when it is large enough,
+ * otherwise fall back to kvmalloc().
+ *
+ * Return:	buffer of at least *@sizep bytes, or NULL on allocation failure
+ */
+void *ksmbd_conn_get_request_buf(struct ksmbd_conn *conn, unsigned int *sizep)
+{
+	void *buf = NULL;
+
+	spin_lock(&conn->request_cache_lock);
+	if (conn->request_cache_buf && conn->request_cache_sz >= *sizep) {
+		buf = conn->request_cache_buf;
+		*sizep = conn->request_cache_sz;
+		conn->request_cache_buf = NULL;
+		conn->request_cache_sz = 0;
+	}
+	spin_unlock(&conn->request_cache_lock);
+
+	if (buf)
+		return buf;
+	return kvmalloc(*sizep, KSMBD_DEFAULT_GFP);
+}
+
+/**
+ * ksmbd_conn_put_request_buf() - release a PDU buffer, caching it for reuse
+ * @conn:	connection instance
+ * @buf:	buffer to release, may be NULL
+ * @size:	capacity of @buf, 0 if unknown (frees without caching)
+ *
+ * Keep the largest recently released buffer in the connection cache so the
+ * receive path can skip the allocation for the common case of a stream of
+ * similarly sized PDUs.
+ */
+void ksmbd_conn_put_request_buf(struct ksmbd_conn *conn, void *buf,
+				unsigned int size)
+{
+	if (!buf)
+		return;
+
+	if (size) {
+		spin_lock(&conn->request_cache_lock);
+		if (conn->request_cache_sz < size) {
+			swap(conn->request_cache_buf, buf);
+			conn->request_cache_sz = size;
+		}
+		spin_unlock(&conn->request_cache_lock);
+	}
+	kvfree(buf);
 }
 
 int ksmbd_conn_transport_init(void)

@@ -346,7 +346,9 @@ static int queue_ksmbd_work(struct ksmbd_conn *conn)
 
 	work->conn = conn;
 	work->request_buf = conn->request_buf;
+	work->request_buf_sz = conn->request_buf_sz;
 	conn->request_buf = NULL;
+	conn->request_buf_sz = 0;
 
 	ksmbd_conn_enqueue_request(work);
 	ksmbd_conn_r_count_inc(conn);

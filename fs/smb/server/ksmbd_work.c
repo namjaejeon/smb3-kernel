@@ -81,7 +81,11 @@ void ksmbd_free_work_struct(struct ksmbd_work *work)
 
 	kfree(work->tr_buf);
 	kvfree(work->compress_buf);
-	kvfree(work->request_buf);
+	if (work->request_buf_sz && work->conn)
+		ksmbd_conn_put_request_buf(work->conn, work->request_buf,
+					   work->request_buf_sz);
+	else
+		kvfree(work->request_buf);
 	if (work->iov != work->iov_inline)
 		kfree(work->iov);
 

@@ -69,6 +69,16 @@ struct ksmbd_conn {
 	};
 	unsigned int			inet_hash;
 	char				*request_buf;
+	/* Capacity of request_buf, valid only for received PDU buffers */
+	unsigned int			request_buf_sz;
+	/*
+	 * Most recently released PDU buffer, kept for reuse so that the
+	 * receive path does not pay a kvmalloc/kvfree (and the vfree TLB
+	 * flush) for every request. Protected by request_cache_lock.
+	 */
+	void				*request_cache_buf;
+	unsigned int			request_cache_sz;
+	spinlock_t			request_cache_lock;
 	struct ksmbd_transport		*transport;
 	struct nls_table		*local_nls;
 	struct unicode_map		*um;
@@ -224,6 +234,9 @@ void ksmbd_conn_lock(struct ksmbd_conn *conn);
 void ksmbd_conn_unlock(struct ksmbd_conn *conn);
 void ksmbd_conn_r_count_inc(struct ksmbd_conn *conn);
 void ksmbd_conn_r_count_dec(struct ksmbd_conn *conn);
+void *ksmbd_conn_get_request_buf(struct ksmbd_conn *conn, unsigned int *sizep);
+void ksmbd_conn_put_request_buf(struct ksmbd_conn *conn, void *buf,
+				unsigned int size);
 
 /*
  * WARNING

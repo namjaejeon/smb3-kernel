@@ -36,6 +36,8 @@ struct ksmbd_work {
 
 	/* Pointer to received SMB header */
 	void                            *request_buf;
+	/* Capacity of request_buf, nonzero only for received PDU buffers */
+	unsigned int			request_buf_sz;
 	/* Response buffer */
 	void                            *response_buf;
 
