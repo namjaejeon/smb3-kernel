@@ -265,10 +265,23 @@ static void __handle_ksmbd_work(struct ksmbd_work *work,
 send:
 	smb2_complete_request_open(work);
 	/*
-	 * Release any credit charge still outstanding for this request.  On
+	 * The abort and error paths skip the in-loop set_rsp_credits() call,
+	 * so the outgoing error response would grant no credits and the
+	 * client would permanently lose the charge it consumed for this
+	 * request. Grant credits on the error response as well, as long as a
+	 * response is actually going out on a connection that is staying up.
+	 */
+	if (work->credit_charge && !work->send_no_response &&
+	    !ksmbd_conn_exiting(conn) && conn->ops->set_rsp_credits) {
+		spin_lock(&conn->credits_lock);
+		conn->ops->set_rsp_credits(work);
+		spin_unlock(&conn->credits_lock);
+	}
+	/*
+	 * Release any credit charge still outstanding for this request. On
 	 * the normal path smb2_set_rsp_credits() already returned it, but the
-	 * abort, error and send-no-response paths skip that call, so the
-	 * charge would otherwise leak and eventually exhaust the connection's
+	 * send-no-response and grant-failure paths skip it, so the charge
+	 * would otherwise leak and eventually exhaust the connection's
 	 * outstanding credit window.
 	 */
 	if (work->credit_charge) {
