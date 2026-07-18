@@ -114,7 +114,7 @@ int ksmbd_work_pool_init(void)
 
 int ksmbd_workqueue_init(void)
 {
-	ksmbd_wq = alloc_workqueue("ksmbd-io", WQ_PERCPU, 0);
+	ksmbd_wq = alloc_workqueue("ksmbd-io", WQ_UNBOUND, 0);
 	if (!ksmbd_wq)
 		return -ENOMEM;
 	return 0;
