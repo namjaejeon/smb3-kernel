@@ -434,6 +434,26 @@ int smb2_set_rsp_credits(struct ksmbd_work *work)
 	 * that seq_bitmap stays usable as a ring).
 	 */
 	window_room = conn->seq_low + KSMBD_CMD_SEQ_WINDOW - conn->seq_high;
+
+	/*
+	 * If the window cannot be extended while credits remain ungranted,
+	 * the low edge is pinned by sequence numbers that were granted but
+	 * never used (e.g. message ids a client allocated and then abandoned
+	 * without sending). Those will never be consumed, so the window can
+	 * only stay wedged and grants would stop for good, deadlocking the
+	 * connection once the client runs out of credits. Tear the
+	 * connection down instead so the client can reconnect with a fresh
+	 * sequence window. A client legitimately holding every credit
+	 * (total_credits == max_credits) is not wedged and is left alone.
+	 */
+	if (window_room == 0 &&
+	    conn->total_credits < conn->vals->max_credits) {
+		pr_err_ratelimited("Command sequence window wedged at [%llu, %llu), disconnecting\n",
+				   conn->seq_low, conn->seq_high);
+		ksmbd_conn_set_exiting(conn);
+		return -EINVAL;
+	}
+
 	aux_max = min_t(unsigned short, aux_max, window_room);
 	credits_granted = min_t(unsigned short, credits_requested, aux_max);
 
