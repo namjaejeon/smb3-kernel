@@ -5,6 +5,7 @@
  */
 
 #include <linux/fs.h>
+#include <linux/unaligned.h>
 
 #include "glob.h"
 #include "ndr.h"
@@ -38,7 +39,7 @@ static int ndr_write_int16(struct ndr *n, __u16 value)
 			return ret;
 	}
 
-	*(__le16 *)ndr_get_field(n) = cpu_to_le16(value);
+	put_unaligned_le16(value, ndr_get_field(n));
 	n->offset += sizeof(value);
 	return 0;
 }
@@ -53,7 +54,7 @@ static int ndr_write_int32(struct ndr *n, __u32 value)
 			return ret;
 	}
 
-	*(__le32 *)ndr_get_field(n) = cpu_to_le32(value);
+	put_unaligned_le32(value, ndr_get_field(n));
 	n->offset += sizeof(value);
 	return 0;
 }
@@ -68,7 +69,7 @@ static int ndr_write_int64(struct ndr *n, __u64 value)
 			return ret;
 	}
 
-	*(__le64 *)ndr_get_field(n) = cpu_to_le64(value);
+	put_unaligned_le64(value, ndr_get_field(n));
 	n->offset += sizeof(value);
 	return 0;
 }
@@ -140,7 +141,7 @@ static int ndr_read_int16(struct ndr *n, __u16 *value)
 		return -EINVAL;
 
 	if (value)
-		*value = le16_to_cpu(*(__le16 *)ndr_get_field(n));
+		*value = get_unaligned_le16(ndr_get_field(n));
 	n->offset += sizeof(__u16);
 	return 0;
 }
@@ -151,7 +152,7 @@ static int ndr_read_int32(struct ndr *n, __u32 *value)
 		return -EINVAL;
 
 	if (value)
-		*value = le32_to_cpu(*(__le32 *)ndr_get_field(n));
+		*value = get_unaligned_le32(ndr_get_field(n));
 	n->offset += sizeof(__u32);
 	return 0;
 }
@@ -162,7 +163,7 @@ static int ndr_read_int64(struct ndr *n, __u64 *value)
 		return -EINVAL;
 
 	if (value)
-		*value = le64_to_cpu(*(__le64 *)ndr_get_field(n));
+		*value = get_unaligned_le64(ndr_get_field(n));
 	n->offset += sizeof(__u64);
 	return 0;
 }
