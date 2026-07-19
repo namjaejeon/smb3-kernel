@@ -2740,7 +2740,7 @@ int smb2_check_durable_oplock(struct ksmbd_conn *conn,
 			      struct ksmbd_file *fp,
 			      struct lease_ctx_info *lctx,
 			      struct ksmbd_user *user,
-			      char *name)
+			      const char *name)
 {
 	struct oplock_info *opinfo = opinfo_get(fp);
 	int ret = 0;
@@ -2809,8 +2809,14 @@ int smb2_check_durable_oplock(struct ksmbd_conn *conn,
 		goto out;
 	}
 
-	if (!ksmbd_inode_pending_delete(fp))
-		ret = ksmbd_validate_name_reconnect(share, fp, name);
+	if (!ksmbd_inode_pending_delete(fp)) {
+		/* A concurrent reconnect can replace and release fp->share_conf. */
+		spin_lock(&fp->f_lock);
+		if (!path_equal(&share->vfs_path, &fp->share_conf->vfs_path) ||
+		    (name && (!fp->filename || strcmp(fp->filename, name))))
+			ret = -EINVAL;
+		spin_unlock(&fp->f_lock);
+	}
 out:
 	opinfo_put(opinfo);
 	return ret;

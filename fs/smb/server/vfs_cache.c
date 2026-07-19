@@ -941,6 +941,8 @@ static void __ksmbd_close_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp)
 		kfree(fp->stream.name);
 	ksmbd_share_config_put(fp->share_conf);
 	kfree(fp->owner.name);
+	kfree(fp->filename);
+	kfree(fp->wide_link_name);
 
 	kmem_cache_free(filp_cache, fp);
 }
@@ -2153,50 +2155,6 @@ void ksmbd_free_global_file_table(void)
 
 	idr_destroy(global_ft.idr);
 	kfree(global_ft.idr);
-}
-
-int ksmbd_validate_name_reconnect(struct ksmbd_share_config *share,
-				  struct ksmbd_file *fp, char *name)
-{
-	const char *share_path = share->real_path;
-	size_t share_path_sz = share->real_path_sz;
-	char *pathname, *ab_pathname;
-	int ret = 0;
-
-	pathname = kmalloc(PATH_MAX, KSMBD_DEFAULT_GFP);
-	if (!pathname)
-		return -EACCES;
-
-	ab_pathname = d_path(&fp->filp->f_path, pathname, PATH_MAX);
-	if (IS_ERR(ab_pathname)) {
-		kfree(pathname);
-		return -EACCES;
-	}
-
-	if (name) {
-		size_t len = strlen(ab_pathname);
-
-		if (len == share_path_sz && !strncmp(ab_pathname, share_path, len)) {
-			/* the durable fp is the share root itself */
-			if (name[0])
-				ret = -EINVAL;
-		} else if (share_path_sz == 1 && share_path[0] == '/') {
-			if (ab_pathname[0] != '/' ||
-			    strcmp(ab_pathname + 1, name))
-				ret = -EINVAL;
-		} else if (len <= share_path_sz ||
-			   strncmp(ab_pathname, share_path, share_path_sz) ||
-			   ab_pathname[share_path_sz] != '/' ||
-			   strcmp(&ab_pathname[share_path_sz + 1], name)) {
-			ret = -EINVAL;
-		}
-		if (ret)
-			ksmbd_debug(SMB, "invalid name reconnect %s\n", name);
-	}
-
-	kfree(pathname);
-
-	return ret;
 }
 
 int ksmbd_reopen_durable_fd(struct ksmbd_work *work, struct ksmbd_file *fp)
