@@ -119,4 +119,19 @@ struct xattr_ntacl {
 #define XATTR_NAME_SD_LEN	\
 		(sizeof(XATTR_SECURITY_PREFIX SD_PREFIX) - 1)
 
+/* Reparse point metadata is kept separate from the backing file data. */
+#define XATTR_RP_HASH_TYPE_SHA256	0x1
+#define XATTR_RP_HASH_SIZE		64
+#define RP_PREFIX			"RP"
+#define XATTR_NAME_RP			(XATTR_SECURITY_PREFIX RP_PREFIX)
+
+struct xattr_rp {
+	__u16	version;
+	__u32	tag;
+	void	*rp_buf;
+	__u32	rp_size;
+	__u16	hash_type;
+	__u8	hash[XATTR_RP_HASH_SIZE];
+};
+
 #endif /* __XATTR_H__ */
