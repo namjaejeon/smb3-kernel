@@ -36,6 +36,7 @@
 #include "stats.h"
 
 #include "smb_common.h"
+#include "../common/smbfsctl.h"
 #include "mgmt/share_config.h"
 #include "mgmt/tree_connect.h"
 #include "mgmt/user_session.h"
@@ -1835,7 +1836,7 @@ out_free:
 }
 
 /**
- * ksmbd_vfs_set_rp_xattr() - store authenticated reparse point metadata
+ * ksmbd_vfs_set_rp_xattr() - store reparse point metadata with a checksum
  * @idmap: mount idmapping for the target
  * @path: backing inode path
  * @tag: reparse tag in host byte order
@@ -1855,7 +1856,30 @@ int ksmbd_vfs_set_rp_xattr(struct mnt_idmap *idmap, const struct path *path,
 		.rp_size = len,
 		.hash_type = XATTR_RP_HASH_TYPE_SHA256,
 	};
+	void *old_data;
+	u32 old_tag, old_len;
 	int ret;
+
+	/* Serialize the tag comparison and update against other SMB requests. */
+	lockdep_assert_held_write(&ksmbd_reparse_sem);
+	if (!d_is_reg(path->dentry) && !d_is_dir(path->dentry))
+		return -EOPNOTSUPP;
+	if (len > KSMBD_MAX_REPARSE_DATA_SIZE - sizeof(struct reparse_data_buffer))
+		return -EBADMSG;
+	if (tag == IO_REPARSE_TAG_MOUNT_POINT && !d_is_dir(path->dentry))
+		return -ENOTDIR;
+	if (tag == IO_REPARSE_TAG_SYMLINK && d_is_reg(path->dentry) &&
+	    i_size_read(d_inode(path->dentry)))
+		return -EBADMSG;
+	ret = ksmbd_vfs_get_rp_xattr(idmap, path->dentry, &old_tag,
+				     &old_data, &old_len);
+	if (!ret) {
+		kfree(old_data);
+		if (old_tag != tag)
+			return -EEXIST;
+	} else if (ret != -ENODATA && ret != -EOPNOTSUPP) {
+		return ret;
+	}
 
 	if (d_is_dir(path->dentry)) {
 		ret = ksmbd_vfs_path_empty_dir(path);
@@ -1872,7 +1896,7 @@ int ksmbd_vfs_set_rp_xattr(struct mnt_idmap *idmap, const struct path *path,
 }
 
 /**
- * ksmbd_vfs_get_rp_xattr() - load and authenticate reparse point metadata
+ * ksmbd_vfs_get_rp_xattr() - load and verify reparse point metadata
  * @idmap: mount idmapping for the target
  * @dentry: backing inode dentry
  * @tag: returned reparse tag
@@ -1897,7 +1921,8 @@ int ksmbd_vfs_get_rp_xattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	kfree(ndr.data);
 	if (ret)
 		return ret;
-	if (rp.hash_type != XATTR_RP_HASH_TYPE_SHA256) {
+	if (rp.hash_type != XATTR_RP_HASH_TYPE_SHA256 ||
+	    rp.rp_size > KSMBD_MAX_REPARSE_DATA_SIZE - sizeof(struct reparse_data_buffer)) {
 		ret = -EINVAL;
 		goto out;
 	}
