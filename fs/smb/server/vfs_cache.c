@@ -1411,6 +1411,54 @@ struct ksmbd_file *ksmbd_lookup_fd_inode(struct dentry *dentry)
 	return NULL;
 }
 
+/*
+ * SET must not revoke data access while another open can still cache or flush
+ * data. Include hard-link aliases, disconnected opens and FP_NEW handles:
+ * CREATE may grant their oplock after dropping ksmbd_reparse_sem.
+ */
+bool ksmbd_reparse_inode_busy(struct ksmbd_file *fp)
+{
+	struct inode *inode = file_inode(fp->filp);
+	struct ksmbd_file *open;
+	unsigned int id;
+	bool busy = false;
+
+	lockdep_assert_held_write(&ksmbd_reparse_sem);
+	read_lock(&global_ft.lock);
+	idr_for_each_entry(global_ft.idr, open, id) {
+		struct oplock_info *opinfo;
+
+		if (file_inode(open->filp) != inode)
+			continue;
+		if (open != fp && !(open->filp->f_mode & FMODE_PATH) &&
+		    (open->daccess & (FILE_READ_DATA_LE | FILE_WRITE_DATA_LE |
+				     FILE_APPEND_DATA_LE | FILE_EXECUTE_LE))) {
+			busy = true;
+			break;
+		}
+
+		/* Even the requesting open must give up its caching rights first. */
+		opinfo = opinfo_get(open);
+		if (!opinfo)
+			continue;
+		if (opinfo->is_lease) {
+			spin_lock(&opinfo->o_lease->lock);
+			busy = opinfo->o_lease->state != SMB2_LEASE_NONE_LE;
+			spin_unlock(&opinfo->o_lease->lock);
+		} else {
+			spin_lock(&opinfo->state_lock);
+			busy = opinfo->level != SMB2_OPLOCK_LEVEL_NONE;
+			spin_unlock(&opinfo->state_lock);
+		}
+		opinfo_put(opinfo);
+		if (busy)
+			break;
+	}
+	read_unlock(&global_ft.lock);
+
+	return busy;
+}
+
 bool ksmbd_has_other_nonposix_open(struct dentry *dentry)
 {
 	struct ksmbd_file *fp;

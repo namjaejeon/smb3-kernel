@@ -39,6 +39,8 @@ struct ksmbd_conn;
 
 extern struct rw_semaphore ksmbd_reparse_sem;
 
+#define KSMBD_MAX_REPARSE_DATA_SIZE	(16 * 1024)
+
 const char *ksmbd_vfs_get_link(struct dentry *dentry, struct delayed_call *done);
 struct ksmbd_dir_info {
 	const char	*name;
