@@ -132,6 +132,7 @@ struct ksmbd_file {
 	bool				is_nt_open;
 	bool				is_quota;
 	bool				attrib_only;
+	bool				is_reparse;
 	bool				allocation_size_set;
 
 	char				client_guid[16];
