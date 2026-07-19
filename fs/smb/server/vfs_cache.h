@@ -117,6 +117,7 @@ struct ksmbd_file {
 
 	bool				is_nt_open;
 	bool				attrib_only;
+	bool				is_reparse;
 
 	char				client_guid[16];
 	char				create_guid[16];
