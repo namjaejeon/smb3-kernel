@@ -1300,15 +1300,10 @@ static bool __dir_empty(struct dir_context *ctx, const char *name, int namlen,
 	return !buf->dirent_count;
 }
 
-/**
- * ksmbd_vfs_empty_dir() - check for empty directory
- * @fp:	ksmbd file pointer
- *
- * Return:	true if directory empty, otherwise false
- */
-int ksmbd_vfs_empty_dir(struct ksmbd_file *fp)
+static int ksmbd_vfs_path_empty_dir(const struct path *path)
 {
 	int err;
+	struct file *filp;
 	struct ksmbd_readdir_data readdir_data;
 
 	memset(&readdir_data, 0, sizeof(struct ksmbd_readdir_data));
@@ -1316,12 +1311,27 @@ int ksmbd_vfs_empty_dir(struct ksmbd_file *fp)
 	set_ctx_actor(&readdir_data.ctx, __dir_empty);
 	readdir_data.dirent_count = 0;
 
-	err = iterate_dir(fp->filp, &readdir_data.ctx);
+	/* Reparse directory handles use O_PATH and cannot be iterated directly. */
+	filp = dentry_open(path, O_RDONLY | O_DIRECTORY,
+			   current_cred());
+	if (IS_ERR(filp))
+		return PTR_ERR(filp);
+	err = iterate_dir(filp, &readdir_data.ctx);
+	fput(filp);
 	if (readdir_data.dirent_count)
 		err = -ENOTEMPTY;
-	else
-		err = 0;
 	return err;
+}
+
+/**
+ * ksmbd_vfs_empty_dir() - check for an empty directory, including O_PATH handles
+ * @fp: ksmbd directory handle
+ *
+ * Return: 0 if empty, -ENOTEMPTY if populated, otherwise a negative error.
+ */
+int ksmbd_vfs_empty_dir(struct ksmbd_file *fp)
+{
+	return ksmbd_vfs_path_empty_dir(&fp->filp->f_path);
 }
 
 static bool __caseless_lookup(struct dir_context *ctx, const char *name,
@@ -1798,6 +1808,100 @@ out_free:
 	}
 	kfree(n.data);
 	return rc;
+}
+
+/**
+ * ksmbd_vfs_set_rp_xattr() - store authenticated reparse point metadata
+ * @idmap: mount idmapping for the target
+ * @path: backing inode path
+ * @tag: reparse tag in host byte order
+ * @data: tag-specific reparse payload
+ * @len: payload size in bytes
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ksmbd_vfs_set_rp_xattr(struct mnt_idmap *idmap, const struct path *path,
+			   u32 tag, const void *data, u32 len)
+{
+	struct ndr ndr = { };
+	struct xattr_rp rp = {
+		.version = 1,
+		.tag = tag,
+		.rp_buf = (void *)data,
+		.rp_size = len,
+		.hash_type = XATTR_RP_HASH_TYPE_SHA256,
+	};
+	int ret;
+
+	if (d_is_dir(path->dentry)) {
+		ret = ksmbd_vfs_path_empty_dir(path);
+		if (ret)
+			return ret;
+	}
+	sha256(data ?: "", len, rp.hash);
+	ret = ndr_encode_rp(&ndr, &rp);
+	if (!ret)
+		ret = ksmbd_vfs_setxattr(idmap, path, XATTR_NAME_RP, ndr.data,
+					 ndr.offset, 0, true);
+	kfree(ndr.data);
+	return ret;
+}
+
+/**
+ * ksmbd_vfs_get_rp_xattr() - load and authenticate reparse point metadata
+ * @idmap: mount idmapping for the target
+ * @dentry: backing inode dentry
+ * @tag: returned reparse tag
+ * @data: returned allocated reparse payload
+ * @len: returned payload size
+ *
+ * Return: 0 on success, -ENODATA when absent, or another negative error.
+ */
+int ksmbd_vfs_get_rp_xattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			   u32 *tag, void **data, u32 *len)
+{
+	struct ndr ndr;
+	struct xattr_rp rp = { };
+	u8 hash[XATTR_RP_HASH_SIZE] = { };
+	int ret;
+
+	ret = ksmbd_vfs_getxattr(idmap, dentry, XATTR_NAME_RP, &ndr.data);
+	if (ret <= 0)
+		return ret ?: -ENODATA;
+	ndr.length = ret;
+	ret = ndr_decode_rp(&ndr, &rp);
+	kfree(ndr.data);
+	if (ret)
+		return ret;
+	if (rp.hash_type != XATTR_RP_HASH_TYPE_SHA256) {
+		ret = -EINVAL;
+		goto out;
+	}
+	sha256(rp.rp_buf ?: "", rp.rp_size, hash);
+	if (memcmp(hash, rp.hash, sizeof(hash))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	*tag = rp.tag;
+	*data = rp.rp_buf;
+	*len = rp.rp_size;
+	return 0;
+out:
+	kfree(rp.rp_buf);
+	return ret;
+}
+
+/**
+ * ksmbd_vfs_remove_rp_xattr() - remove reparse point metadata
+ * @idmap: mount idmapping for the target
+ * @path: backing inode path
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ksmbd_vfs_remove_rp_xattr(struct mnt_idmap *idmap,
+			      const struct path *path)
+{
+	return ksmbd_vfs_remove_xattr(idmap, path, XATTR_NAME_RP, true);
 }
 
 int ksmbd_vfs_set_dos_attrib_xattr(struct mnt_idmap *idmap,
