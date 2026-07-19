@@ -41,6 +41,9 @@
 #include "mgmt/user_session.h"
 #include "mgmt/user_config.h"
 
+/* Serialize pathname opens and namespace changes against reparse updates. */
+DECLARE_RWSEM(ksmbd_reparse_sem);
+
 static void ksmbd_vfs_inherit_owner(struct ksmbd_work *work,
 				    struct inode *parent_inode,
 				    struct inode *inode)
@@ -114,6 +117,27 @@ static int ksmbd_vfs_path_lookup(struct ksmbd_share_config *share_conf,
 		}
 	}
 	return 0;
+}
+
+/**
+ * ksmbd_vfs_get_link() - read an ordinary native symlink, never a magic link
+ * @dentry: symlink to inspect
+ * @done: cleanup for the returned link body
+ *
+ * Filesystems with a custom readlink operation may implement get_link as a
+ * nameidata jump rather than returning a string. Do not call it outside namei.
+ */
+const char *ksmbd_vfs_get_link(struct dentry *dentry, struct delayed_call *done)
+{
+	struct inode *inode = d_inode(dentry);
+	const char *target;
+
+	if (!d_is_symlink(dentry))
+		return ERR_PTR(-EINVAL);
+	if (inode->i_op->readlink || !inode->i_op->get_link)
+		return ERR_PTR(-EOPNOTSUPP);
+	target = vfs_get_link(dentry, done);
+	return target ?: ERR_PTR(-EOPNOTSUPP);
 }
 
 void ksmbd_vfs_query_maximal_access(struct mnt_idmap *idmap,
