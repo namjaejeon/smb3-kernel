@@ -1877,6 +1877,27 @@ static int smb2_get_dos_mode(struct kstat *stat, int attribute)
 	return attr;
 }
 
+static int smb2_check_reparse_data_access(struct ksmbd_file *fp)
+{
+	void *data;
+	u32 tag, len;
+	int ret;
+
+	/* Keep the inode check and the data operation atomic against SET/DELETE. */
+	lockdep_assert_held_read(&ksmbd_reparse_sem);
+	if (fp->filp->f_mode & FMODE_PATH)
+		return -EACCES;
+	ret = ksmbd_vfs_get_rp_xattr(file_mnt_idmap(fp->filp),
+				     fp->filp->f_path.dentry, &tag, &data, &len);
+	if (!ret) {
+		kfree(data);
+		return -EACCES;
+	}
+	if (ret == -ENODATA || ret == -EOPNOTSUPP)
+		return 0;
+	return ret;
+}
+
 static void smb2_update_reparse_attributes(struct ksmbd_file *fp, u32 tag)
 {
 	struct inode *inode = file_inode(fp->filp);
@@ -5838,7 +5859,11 @@ resolve_path:
 	}
 
 	if (need_truncate) {
-		rc = smb2_create_truncate(&fp->filp->f_path);
+		scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+			rc = smb2_check_reparse_data_access(fp);
+			if (!rc)
+				rc = smb2_create_truncate(&fp->filp->f_path);
+		}
 		if (rc)
 			goto err_out1;
 	}
@@ -5872,10 +5897,14 @@ resolve_path:
 			 * stream and would otherwise pre-allocate storage on
 			 * the base file's data instead.
 			 */
-			if (!ksmbd_stream_fd(fp)) {
+			if (!ksmbd_stream_fd(fp) && !fp->is_reparse) {
 				smb_break_all_levII_oplock(work, fp, 1);
-				err = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0,
-						    alloc_size);
+				scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+					err = smb2_check_reparse_data_access(fp);
+					if (!err)
+						err = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE,
+								    0, alloc_size);
+				}
 				if (err < 0)
 					ksmbd_debug(SMB,
 						    "vfs_fallocate is failed : %d\n",
@@ -9840,6 +9869,12 @@ static int set_file_allocation_info(struct ksmbd_work *work,
 
 	if (!(fp->daccess & FILE_WRITE_DATA_LE))
 		return -EACCES;
+	if (!ksmbd_stream_fd(fp))
+		smb_break_all_levII_oplock(work, fp, 1);
+	guard(rwsem_read)(&ksmbd_reparse_sem);
+	rc = smb2_check_reparse_data_access(fp);
+	if (rc)
+		return rc;
 
 	if (ksmbd_stream_fd(fp) == true)
 		return 0;
@@ -9865,7 +9900,6 @@ static int set_file_allocation_info(struct ksmbd_work *work,
 	inode = file_inode(fp->filp);
 
 	if (alloc_blks > stat.blocks) {
-		smb_break_all_levII_oplock(work, fp, 1);
 		rc = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0,
 				   alloc_blks * 512);
 		if (rc && rc != -EOPNOTSUPP) {
@@ -9906,6 +9940,12 @@ static int set_end_of_file_info(struct ksmbd_work *work, struct ksmbd_file *fp,
 
 	if (!(fp->daccess & FILE_WRITE_DATA_LE))
 		return -EACCES;
+	if (!ksmbd_stream_fd(fp))
+		smb_break_all_levII_oplock(work, fp, 1);
+	guard(rwsem_read)(&ksmbd_reparse_sem);
+	rc = smb2_check_reparse_data_access(fp);
+	if (rc)
+		return rc;
 
 	newsize = le64_to_cpu(file_eof_info->EndOfFile);
 	inode = file_inode(fp->filp);
@@ -10829,7 +10869,6 @@ int smb2_read(struct ksmbd_work *work)
 	err = smb2_set_request_open(work, fp, &req->hdr, true, true);
 	if (err)
 		goto out;
-
 	if (!(fp->daccess & (FILE_READ_DATA_LE | FILE_READ_ATTRIBUTES_LE))) {
 		pr_err("Not permitted to read : 0x%x\n", fp->daccess);
 		err = -EACCES;
@@ -10868,7 +10907,12 @@ int smb2_read(struct ksmbd_work *work)
 		goto out;
 	}
 
-	nbytes = ksmbd_vfs_read(work, fp, length, &offset, aux_payload_buf);
+	scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+		nbytes = smb2_check_reparse_data_access(fp);
+		if (!nbytes)
+			nbytes = ksmbd_vfs_read(work, fp, length, &offset,
+						aux_payload_buf);
+	}
 	if (nbytes < 0) {
 		kvfree(aux_payload_buf);
 		err = nbytes;
@@ -11327,17 +11371,29 @@ int smb2_write(struct ksmbd_work *work)
 
 		ksmbd_debug(SMB, "filename %pD, offset %lld, len %zu\n",
 			    fp->filp, offset, length);
-		err = ksmbd_vfs_write(work, fp, data_buf, length, &offset,
-				      writethrough, &nbytes);
+		if (!ksmbd_stream_fd(fp))
+			smb_break_all_levII_oplock(work, fp, 1);
+		scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+			err = smb2_check_reparse_data_access(fp);
+			if (!err)
+				err = ksmbd_vfs_write(work, fp, data_buf, length,
+						      &offset, writethrough, &nbytes);
+		}
 		if (err < 0)
 			goto out;
 	} else {
 		/* read data from the client using rdma channel, and
 		 * write the data.
 		 */
-		nbytes = smb2_write_rdma(work, rdma_desc, rdma_desc_len,
-					 rdma_info, fp, offset, length,
-					 writethrough);
+		if (!ksmbd_stream_fd(fp))
+			smb_break_all_levII_oplock(work, fp, 1);
+		scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+			nbytes = smb2_check_reparse_data_access(fp);
+			if (!nbytes)
+				nbytes = smb2_write_rdma(work, rdma_desc, rdma_desc_len,
+							  rdma_info, fp, offset, length,
+							  writethrough);
+		}
 		if (nbytes < 0) {
 			err = (int)nbytes;
 			goto out;
@@ -12197,7 +12253,6 @@ static int fsctl_copychunk(struct ksmbd_work *work,
 		rsp->hdr.Status = STATUS_FILE_CLOSED;
 		goto out;
 	}
-
 	/*
 	 * FILE_READ_DATA should only be included in
 	 * the FSCTL_SRV_COPYCHUNK case
@@ -12208,11 +12263,27 @@ static int fsctl_copychunk(struct ksmbd_work *work,
 		goto out;
 	}
 
-	ret = ksmbd_vfs_copy_file_ranges(work, src_fp, dst_fp,
-					 chunks, chunk_count,
-					 &chunk_count_written,
-					 &chunk_size_written,
-					 &total_size_written);
+	if (!(src_fp->daccess & (FILE_READ_DATA_LE | FILE_EXECUTE_LE)) ||
+	    !(dst_fp->daccess & (FILE_WRITE_DATA_LE | FILE_APPEND_DATA_LE))) {
+		ret = -EACCES;
+		rsp->hdr.Status = STATUS_ACCESS_DENIED;
+		goto out;
+	}
+	smb_break_all_levII_oplock(work, dst_fp, 1);
+	scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+		ret = smb2_check_reparse_data_access(src_fp);
+		if (!ret)
+			ret = smb2_check_reparse_data_access(dst_fp);
+		if (ret) {
+			rsp->hdr.Status = STATUS_ACCESS_DENIED;
+			goto out;
+		}
+		ret = ksmbd_vfs_copy_file_ranges(work, src_fp, dst_fp,
+						 chunks, chunk_count,
+						 &chunk_count_written,
+						 &chunk_size_written,
+						 &total_size_written);
+	}
 	if (ret < 0) {
 		if (ret == -EACCES)
 			rsp->hdr.Status = STATUS_ACCESS_DENIED;
@@ -12532,6 +12603,7 @@ static inline int fsctl_set_sparse(struct ksmbd_work *work, u64 id,
 	int ret = 0;
 	__le32 old_fattr;
 
+	guard(rwsem_read)(&ksmbd_reparse_sem);
 	if (!test_tree_conn_flag(work->tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
 		ksmbd_debug(SMB, "User does not have write permission\n");
 		return -EACCES;
@@ -12545,6 +12617,9 @@ static inline int fsctl_set_sparse(struct ksmbd_work *work, u64 id,
 		ret = -EINVAL;
 		goto out;
 	}
+	ret = smb2_check_reparse_data_access(fp);
+	if (ret)
+		goto out;
 
 	if (!(fp->daccess & (FILE_WRITE_DATA_LE | FILE_APPEND_DATA_LE |
 			     FILE_WRITE_ATTRIBUTES_LE))) {
@@ -13113,12 +13188,17 @@ int smb2_ioctl(struct ksmbd_work *work)
 			}
 
 			if (!(fp->daccess & FILE_WRITE_DATA_LE)) {
-				ksmbd_fd_put(work, fp);
 				ret = -EACCES;
+				ksmbd_fd_put(work, fp);
 				goto out;
 			}
 
-			ret = ksmbd_vfs_zero_data(work, fp, off, len);
+			smb_break_all_levII_oplock(work, fp, 1);
+			scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+				ret = smb2_check_reparse_data_access(fp);
+				if (!ret)
+					ret = ksmbd_vfs_zero_data(work, fp, off, len);
+			}
 			ksmbd_fd_put(work, fp);
 			if (ret == -EAGAIN) {
 				rsp->hdr.Status = STATUS_FILE_LOCK_CONFLICT;
@@ -13170,32 +13250,40 @@ int smb2_ioctl(struct ksmbd_work *work)
 		}
 
 		if (!(fp->daccess & FILE_WRITE_DATA_LE)) {
-			ksmbd_fd_put(work, fp);
 			ret = -EACCES;
+			ksmbd_fd_put(work, fp);
 			goto out;
 		}
 
 		trim_rsp = (struct file_level_trim_output *)&rsp->Buffer[0];
 		trim_rsp->NumRangesProcessed = 0;
-		for (i = 0; i < num_ranges; i++) {
-			loff_t off = le64_to_cpu(trim_req->Ranges[i].Offset);
-			loff_t len = le64_to_cpu(trim_req->Ranges[i].Length);
-
-			if (off < 0 || len < 0) {
-				ret = -EINVAL;
-				break;
+		smb_break_all_levII_oplock(work, fp, 1);
+		scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+			ret = smb2_check_reparse_data_access(fp);
+			if (ret) {
+				ksmbd_fd_put(work, fp);
+				goto out;
 			}
+			for (i = 0; i < num_ranges; i++) {
+				loff_t off = le64_to_cpu(trim_req->Ranges[i].Offset);
+				loff_t len = le64_to_cpu(trim_req->Ranges[i].Length);
 
-			if (!len) {
-				trim_rsp->NumRangesProcessed =
-					cpu_to_le32(i + 1);
-				continue;
+				if (off < 0 || len < 0) {
+					ret = -EINVAL;
+					break;
+				}
+
+				if (!len) {
+					trim_rsp->NumRangesProcessed =
+						cpu_to_le32(i + 1);
+					continue;
+				}
+
+				ret = ksmbd_vfs_trim_data(work, fp, off, len);
+				if (ret)
+					break;
+				trim_rsp->NumRangesProcessed = cpu_to_le32(i + 1);
 			}
-
-			ret = ksmbd_vfs_trim_data(work, fp, off, len);
-			if (ret)
-				break;
-			trim_rsp->NumRangesProcessed = cpu_to_le32(i + 1);
 		}
 		ksmbd_fd_put(work, fp);
 		if (ret == -EAGAIN) {
@@ -13329,57 +13417,65 @@ int smb2_ioctl(struct ksmbd_work *work)
 			ret = -EACCES;
 			goto dup_ext_out;
 		}
+		scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+			ret = smb2_check_reparse_data_access(fp_in);
+			if (!ret)
+				ret = smb2_check_reparse_data_access(fp_out);
+			if (ret)
+				goto dup_ext_out;
 
-		if (!(fp_out->daccess & FILE_WRITE_DATA_LE)) {
-			ret = -EACCES;
-			goto dup_ext_out;
-		}
-		if (!(fp_in->daccess & FILE_READ_DATA_LE)) {
-			ret = -EACCES;
-			goto dup_ext_out;
-		}
+			if (!(fp_out->daccess & FILE_WRITE_DATA_LE)) {
+				ret = -EACCES;
+				goto dup_ext_out;
+			}
+			if (!(fp_in->daccess & FILE_READ_DATA_LE)) {
+				ret = -EACCES;
+				goto dup_ext_out;
+			}
 
-		src_off = le64_to_cpu(dup_ext->SourceFileOffset);
-		dst_off = le64_to_cpu(dup_ext->TargetFileOffset);
-		length = le64_to_cpu(dup_ext->ByteCount);
-		if (src_off < 0 || dst_off < 0 || length < 0 ||
-		    src_off + length < src_off || dst_off + length < dst_off) {
-			ret = -EINVAL;
-			goto dup_ext_out;
-		}
-		if (src_off + length > i_size_read(file_inode(fp_in->filp))) {
-			ret = -EOPNOTSUPP;
-			goto dup_ext_out;
-		}
-		if (dst_off + length > i_size_read(file_inode(fp_out->filp)))
-			goto dup_ext_out;
-		if ((fp_in->f_ci->m_fattr & FILE_ATTRIBUTE_SPARSE_FILE_LE) &&
-		    !(fp_out->f_ci->m_fattr & FILE_ATTRIBUTE_SPARSE_FILE_LE)) {
-			ret = -EOPNOTSUPP;
-			goto dup_ext_out;
-		}
-		if (file_inode(fp_in->filp) == file_inode(fp_out->filp) &&
-		    dst_off + length > src_off &&
-		    dst_off < src_off + length) {
-			ret = -EOPNOTSUPP;
-			goto dup_ext_out;
-		}
+			src_off = le64_to_cpu(dup_ext->SourceFileOffset);
+			dst_off = le64_to_cpu(dup_ext->TargetFileOffset);
+			length = le64_to_cpu(dup_ext->ByteCount);
+			if (src_off < 0 || dst_off < 0 || length < 0 ||
+			    src_off + length < src_off || dst_off + length < dst_off) {
+				ret = -EINVAL;
+				goto dup_ext_out;
+			}
+			if (src_off + length > i_size_read(file_inode(fp_in->filp))) {
+				ret = -EOPNOTSUPP;
+				goto dup_ext_out;
+			}
+			if (dst_off + length > i_size_read(file_inode(fp_out->filp)))
+				goto dup_ext_out;
+			if ((fp_in->f_ci->m_fattr & FILE_ATTRIBUTE_SPARSE_FILE_LE) &&
+			    !(fp_out->f_ci->m_fattr & FILE_ATTRIBUTE_SPARSE_FILE_LE)) {
+				ret = -EOPNOTSUPP;
+				goto dup_ext_out;
+			}
+			if (file_inode(fp_in->filp) == file_inode(fp_out->filp) &&
+			    dst_off + length > src_off &&
+			    dst_off < src_off + length) {
+				ret = -EOPNOTSUPP;
+				goto dup_ext_out;
+			}
 
-		cloned = vfs_clone_file_range(fp_in->filp, src_off,
-					      fp_out->filp, dst_off, length, 0);
-		if (cloned != length) {
-			cloned = vfs_copy_file_range(fp_in->filp, src_off,
-						     fp_out->filp, dst_off,
-						     length, 0);
+			cloned = vfs_clone_file_range(fp_in->filp, src_off,
+						      fp_out->filp, dst_off, length, 0);
 			if (cloned != length) {
-				if (cloned < 0)
-					ret = cloned;
-				else
-					ret = -EINVAL;
+				cloned = vfs_copy_file_range(fp_in->filp, src_off,
+							     fp_out->filp, dst_off,
+							     length, 0);
+				if (cloned != length) {
+					if (cloned < 0)
+						ret = cloned;
+					else
+						ret = -EINVAL;
+				}
 			}
 		}
 
 dup_ext_out:
+		/* The last source reference can trigger a parent lease break. */
 		ksmbd_fd_put(work, fp_in);
 		ksmbd_fd_put(work, fp_out);
 		if (ret < 0)

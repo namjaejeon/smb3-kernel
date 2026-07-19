@@ -586,9 +586,6 @@ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
 	/* Reserve lease break for parent dir at closing time */
 	fp->reserve_lease_break = true;
 
-	/* Do we need to break any of a levelII oplock? */
-	smb_break_all_levII_oplock(work, fp, 1);
-
 	err = kernel_write(filp, buf, count, pos);
 	if (err < 0) {
 		ksmbd_debug(VFS, "smb write failed, err = %d\n", err);
@@ -868,9 +865,6 @@ int ksmbd_vfs_truncate(struct ksmbd_work *work,
 
 	filp = fp->filp;
 
-	/* Do we need to break any of a levelII oplock? */
-	smb_break_all_levII_oplock(work, fp, 1);
-
 	if (!work->tcon->posix_extensions) {
 		struct inode *inode = file_inode(filp);
 
@@ -1039,7 +1033,6 @@ int ksmbd_vfs_zero_data(struct ksmbd_work *work, struct ksmbd_file *fp,
 	char *zero_buf = NULL;
 	int err;
 
-	smb_break_all_levII_oplock(work, fp, 1);
 	if (!work->tcon->posix_extensions) {
 		loff_t size = i_size_read(file_inode(fp->filp));
 
@@ -1173,7 +1166,6 @@ int ksmbd_vfs_trim_data(struct ksmbd_work *work, struct ksmbd_file *fp,
 	const struct cred *saved_cred;
 	int err;
 
-	smb_break_all_levII_oplock(work, fp, 1);
 	if (!work->tcon->posix_extensions) {
 		loff_t size = i_size_read(file_inode(fp->filp));
 
@@ -2352,8 +2344,6 @@ int ksmbd_vfs_copy_file_ranges(struct ksmbd_work *work,
 		pr_err("no right to write(%pD)\n", dst_fp->filp);
 		return -EACCES;
 	}
-
-	smb_break_all_levII_oplock(work, dst_fp, 1);
 
 	if (!work->tcon->posix_extensions) {
 		for (i = 0; i < chunk_count; i++) {
