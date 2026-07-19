@@ -41,6 +41,8 @@ struct lease_table {
 
 struct lease {
 	__u8			lease_key[SMB2_LEASE_KEY_SIZE];
+	/* SMB pathname retained across native symlink resolution and reconnect. */
+	char			*filename;
 	__le32			state;
 	__le32			new_state;
 	__le32			flags;
@@ -90,7 +92,8 @@ struct oplock_info {
 
 int smb_grant_oplock(struct ksmbd_work *work, int req_op_level,
 		     u64 pid, struct ksmbd_file *fp, __u16 tid,
-		     struct lease_ctx_info *lctx, int share_ret, bool replay);
+		     struct lease_ctx_info *lctx, const char *name,
+		     int share_ret, bool replay);
 void smb_break_all_levII_oplock(struct ksmbd_work *work,
 					struct ksmbd_file *fp, int is_trunc);
 void smb_break_all_levII_oplock_rename(struct ksmbd_work *work, struct ksmbd_file *fp);
@@ -136,5 +139,5 @@ int smb2_check_durable_oplock(struct ksmbd_conn *conn,
 			      struct ksmbd_file *fp,
 			      struct lease_ctx_info *lctx,
 			      struct ksmbd_user *user,
-			      char *name);
+			      const char *name);
 #endif /* __KSMBD_OPLOCK_H */

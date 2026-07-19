@@ -47,6 +47,99 @@
 /* Serialize pathname opens and namespace changes against reparse updates. */
 DECLARE_RWSEM(ksmbd_reparse_sem);
 
+static int ksmbd_vfs_check_reparse_path(const struct path *path,
+				      const struct path *root, bool include_self);
+static int ksmbd_vfs_check_reparse_components(const char *pathname,
+					    unsigned int flags,
+					    const struct path *root);
+static int ksmbd_vfs_check_reparse_parent(const char *pathname,
+					unsigned int flags, const struct path *root);
+
+static char *ksmbd_vfs_absolute_name(const struct path *root, const char *name)
+{
+	char *buf __free(kfree) = kmalloc(PATH_MAX, KSMBD_DEFAULT_GFP);
+	char *base, *result;
+
+	if (!buf)
+		return ERR_PTR(-ENOMEM);
+	scoped_with_init_fs()
+		base = d_path(root, buf, PATH_MAX);
+	if (IS_ERR(base))
+		return base;
+	result = kasprintf(KSMBD_DEFAULT_GFP, "%s/%s", base, name);
+	return result ?: ERR_PTR(-ENOMEM);
+}
+
+/*
+ * LOOKUP_BENEATH rejects absolute native links even when their targets are in
+ * the share. Retry through the host namespace, then check the pinned root and
+ * mount. Callers also inspect every expanded component before using the path.
+ */
+static int ksmbd_vfs_lookup_path(const char *name, unsigned int flags,
+				 const struct path *root, struct path *path)
+{
+	char *absolute __free(kfree) = NULL;
+	int ret;
+
+	scoped_with_init_fs() {
+		if (root)
+			ret = vfs_path_lookup(root->dentry, root->mnt, name, flags, path);
+		else
+			ret = kern_path(name, flags, path);
+	}
+	if (ret == -EXDEV && root && !(flags & LOOKUP_NO_SYMLINKS)) {
+		absolute = ksmbd_vfs_absolute_name(root, name);
+		if (IS_ERR(absolute))
+			return PTR_ERR(no_free_ptr(absolute));
+		/* Mounts above the share root are not share mount crossings. */
+		scoped_with_init_fs()
+			ret = kern_path(absolute,
+					flags & ~(LOOKUP_BENEATH | LOOKUP_NO_XDEV), path);
+	}
+	if (!ret && root &&
+	    (!path_is_under(path, root) ||
+	     (flags & LOOKUP_NO_XDEV && path->mnt != root->mnt))) {
+		path_put(path);
+		ret = -EXDEV;
+	}
+	return ret;
+}
+
+static int ksmbd_vfs_lookup_parent(struct filename **filename,
+				   unsigned int flags, struct path *path,
+				   struct qstr *last, const struct path *root)
+{
+	char *absolute __free(kfree) = NULL;
+	struct filename *host_name;
+	int ret;
+
+	scoped_with_init_fs()
+		ret = vfs_path_parent_lookup(*filename, flags, path, last, root);
+	if (ret == -EXDEV && !(flags & LOOKUP_NO_SYMLINKS)) {
+		absolute = ksmbd_vfs_absolute_name(root, (*filename)->name);
+		if (IS_ERR(absolute))
+			return PTR_ERR(no_free_ptr(absolute));
+		host_name = getname_kernel(absolute);
+		if (IS_ERR(host_name))
+			return PTR_ERR(host_name);
+		putname(*filename);
+		*filename = host_name;
+		scoped_with_init_fs()
+			ret = vfs_path_parent_lookup(*filename,
+						     flags & ~(LOOKUP_BENEATH | LOOKUP_NO_XDEV),
+						     path, last, NULL);
+		if (ret == -ENOENT)
+			ret = -EXDEV;
+	}
+	if (!ret &&
+	    (!path_is_under(path, root) ||
+	     (flags & LOOKUP_NO_XDEV && path->mnt != root->mnt))) {
+		path_put(path);
+		ret = -EXDEV;
+	}
+	return ret;
+}
+
 static void ksmbd_vfs_inherit_owner(struct ksmbd_work *work,
 				    struct inode *parent_inode,
 				    struct inode *inode)
@@ -59,67 +152,85 @@ static void ksmbd_vfs_inherit_owner(struct ksmbd_work *work,
 }
 
 static int ksmbd_vfs_path_lookup(struct ksmbd_share_config *share_conf,
-				 char *pathname, unsigned int flags,
-				 struct path *path, bool for_remove)
+				 const char *pathname, unsigned int flags,
+				 struct path *path, bool for_remove,
+				 const struct path *root_share_path)
 {
 	struct qstr last;
-	const struct path *root_share_path = &share_conf->vfs_path;
-	int err;
+	char *wide_path __free(kfree) = NULL;
 	struct dentry *d;
+	int err;
 
-	if (pathname[0] == '\0') {
-		pathname = share_conf->path;
-		root_share_path = NULL;
-	} else {
+	if (for_remove && flags & LOOKUP_FOLLOW)
+		return -EINVAL;
+	if (!root_share_path) {
+		wide_path = ksmbd_vfs_absolute_name(&share_conf->vfs_path, pathname);
+		if (IS_ERR(wide_path))
+			return PTR_ERR(no_free_ptr(wide_path));
+		pathname = wide_path;
+	} else if (!*pathname) {
+		pathname = ".";
+	}
+	flags |= LOOKUP_NO_MAGICLINKS;
+	if (root_share_path)
 		flags |= LOOKUP_BENEATH;
+	if (root_share_path &&
+	    !test_share_config_flag(share_conf, KSMBD_SHARE_FLAG_CROSSMNT))
+		flags |= LOOKUP_NO_XDEV;
+
+	if (!for_remove) {
+		/* Keep the final component, symlink policy and confinement in namei. */
+		err = ksmbd_vfs_lookup_path(pathname, flags, root_share_path, path);
+		if (err)
+			return err;
+		if (!test_share_config_flag(share_conf, KSMBD_SHARE_FLAG_CROSSMNT) &&
+		    path->mnt != share_conf->vfs_path.mnt) {
+			path_put(path);
+			return -EXDEV;
+		}
+		err = ksmbd_vfs_check_reparse_components(pathname, flags,
+						root_share_path);
+		if (!err)
+			err = ksmbd_vfs_check_reparse_path(path, root_share_path, false);
+		if (err)
+			path_put(path);
+		return err;
 	}
 
 	CLASS(filename_kernel, filename)(pathname);
-	scoped_with_init_fs()
-		err = vfs_path_parent_lookup(filename, flags, path, &last,
-					     root_share_path);
+	err = ksmbd_vfs_lookup_parent(&filename, flags, path, &last, root_share_path);
 	if (err)
 		return err;
-
-	if (for_remove) {
-		err = mnt_want_write(path->mnt);
-		if (err) {
-			path_put(path);
-			return -ENOENT;
-		}
-
-		d = start_removing_noperm(path->dentry, &last);
-
-		if (!IS_ERR(d)) {
-			dput(path->dentry);
-			path->dentry = d;
-			return 0;
-		}
-		mnt_drop_write(path->mnt);
-		path_put(path);
-		return -ENOENT;
-	}
-
-	d = lookup_noperm_unlocked(&last, path->dentry);
-	if (!IS_ERR(d) && d_is_negative(d)) {
-		dput(d);
-		d = ERR_PTR(-ENOENT);
-	}
+	err = ksmbd_vfs_check_reparse_components(pathname, flags, root_share_path);
+	if (err)
+		goto out;
+	err = mnt_want_write(path->mnt);
+	if (err)
+		goto out;
+	d = start_removing_noperm(path->dentry, &last);
 	if (IS_ERR(d)) {
-		path_put(path);
-		return -ENOENT;
+		err = PTR_ERR(d);
+		goto out_write;
+	}
+	/* A parent may have moved after the scoped parent lookup completed. */
+	if (root_share_path && !path_is_under(path, root_share_path)) {
+		end_removing(d);
+		err = -EXDEV;
+		goto out_write;
+	}
+	err = ksmbd_vfs_check_reparse_path(path, root_share_path, true);
+	if (err) {
+		end_removing(d);
+		goto out_write;
 	}
 	dput(path->dentry);
 	path->dentry = d;
-
-	if (test_share_config_flag(share_conf, KSMBD_SHARE_FLAG_CROSSMNT)) {
-		err = follow_down(path, 0);
-		if (err < 0) {
-			path_put(path);
-			return -ENOENT;
-		}
-	}
 	return 0;
+out_write:
+	mnt_drop_write(path->mnt);
+out:
+	path_put(path);
+	return err;
 }
 
 /**
@@ -141,6 +252,338 @@ const char *ksmbd_vfs_get_link(struct dentry *dentry, struct delayed_call *done)
 		return ERR_PTR(-EOPNOTSUPP);
 	target = vfs_get_link(dentry, done);
 	return target ?: ERR_PTR(-EOPNOTSUPP);
+}
+
+static bool ksmbd_vfs_path_parent(struct path *path)
+{
+	struct dentry *parent;
+
+	if (path->dentry == path->mnt->mnt_root && !follow_up(path))
+		return false;
+	parent = dget_parent(path->dentry);
+	if (parent == path->dentry) {
+		dput(parent);
+		return false;
+	}
+	dput(path->dentry);
+	path->dentry = parent;
+	return true;
+}
+
+/**
+ * ksmbd_vfs_check_reparse_path() - reject traversal beneath reparse stubs
+ * @path: resolved path, including any native symlink expansion
+ * @root: confinement root, or NULL for an explicitly permitted wide link
+ * @include_self: also check @path itself when it is a lookup parent
+ *
+ * The textual-prefix check in CREATE supplies reparse error contexts. This
+ * check enforces the policy on the actual resolved ancestry, including links
+ * whose targets introduce components absent from the client's pathname.
+ * Callers serialize namespace changes against reparse updates using
+ * ksmbd_reparse_sem. Retry if a local rename changes the ancestry we inspect.
+ */
+static int ksmbd_vfs_check_reparse_path(const struct path *path,
+				      const struct path *root, bool include_self)
+{
+	unsigned int seq, retries = 0;
+	int ret;
+
+	do {
+		struct path parent = *path;
+		bool check = include_self;
+
+		seq = read_seqbegin(&rename_lock);
+		path_get(&parent);
+		ret = 0;
+		for (;;) {
+			void *data;
+			u32 tag, len;
+
+			if (check) {
+				ret = ksmbd_vfs_get_rp_xattr(mnt_idmap(parent.mnt),
+							    parent.dentry, &tag, &data, &len);
+				if (!ret) {
+					kfree(data);
+					ret = -EREMOTE;
+					break;
+				}
+				if (ret != -ENODATA && ret != -EOPNOTSUPP)
+					break;
+				ret = 0;
+			}
+			if ((root && path_equal(&parent, root)) ||
+			    !ksmbd_vfs_path_parent(&parent))
+				break;
+			check = true;
+		}
+		if (!ret && root && !path_is_under(path, root))
+			ret = -EXDEV;
+		path_put(&parent);
+		if (!read_seqretry(&rename_lock, seq))
+			return ret;
+	} while (++retries < 3);
+
+	return -EAGAIN;
+}
+
+/* Match an absolute prefix without discarding traversal in the remaining name. */
+static const char *ksmbd_vfs_strip_root(const char *name, const char *root)
+{
+	while (*root) {
+		const char *end;
+		size_t len;
+
+		root += strspn(root, "/");
+		if (!*root)
+			break;
+		for (;;) {
+			name += strspn(name, "/");
+			end = strchrnul(name, '/');
+			if (end - name != 1 || *name != '.')
+				break;
+			name = end;
+		}
+		len = strcspn(root, "/");
+		if (end - name != len || strncmp(name, root, len))
+			return ERR_PTR(-EXDEV);
+		name = end;
+		root += len;
+	}
+	return name + strspn(name, "/");
+}
+
+/* Build an inspection name from the resolved parent, without replaying aliases. */
+static char *ksmbd_vfs_link_target_name(const struct path *link,
+				      const struct path *root, const char *target)
+{
+	char *link_buf __free(kfree) = NULL;
+	char *root_buf __free(kfree) = NULL;
+	unsigned int seq, retries = 0;
+
+	if (*target == '/' && !root) {
+		char *name;
+
+		name = kstrdup(target, KSMBD_DEFAULT_GFP);
+		return name ?: ERR_PTR(-ENOMEM);
+	}
+	link_buf = kmalloc(PATH_MAX, KSMBD_DEFAULT_GFP);
+	if (root)
+		root_buf = kmalloc(PATH_MAX, KSMBD_DEFAULT_GFP);
+	if (!link_buf || (root && !root_buf))
+		return ERR_PTR(-ENOMEM);
+	do {
+		const char *name, *base = NULL, *component;
+		char *result;
+		int ret = 0;
+
+		seq = read_seqbegin(&rename_lock);
+		scoped_with_init_fs() {
+			name = *target == '/' ? target :
+				d_path(link, link_buf, PATH_MAX);
+			if (root)
+				base = d_path(root, root_buf, PATH_MAX);
+		}
+		if (IS_ERR(name))
+			ret = PTR_ERR(name);
+		else if (IS_ERR(base))
+			ret = PTR_ERR(base);
+		else if (root) {
+			name = ksmbd_vfs_strip_root(name, base);
+			if (IS_ERR(name))
+				ret = PTR_ERR(name);
+		}
+		if (ret)
+			result = ERR_PTR(ret);
+		else if (*target == '/')
+			result = kstrdup(*name ? name : ".", KSMBD_DEFAULT_GFP);
+		else {
+			component = strrchr(name, '/');
+			result = kasprintf(KSMBD_DEFAULT_GFP, "%.*s%s",
+					   component ? (int)(component + 1 - name) : 0,
+					   name, target);
+		}
+		if (!read_seqretry(&rename_lock, seq))
+			return result ?: ERR_PTR(-ENOMEM);
+		if (!IS_ERR(result))
+			kfree(result);
+	} while (++retries < 3);
+
+	return ERR_PTR(-EAGAIN);
+}
+
+/**
+ * ksmbd_vfs_rebase_symlink() - express an absolute native target in the share
+ * @link: native symlink path beneath @root
+ * @root: pinned share root
+ * @target: absolute native symlink body
+ *
+ * Keep suffix components verbatim, including dot-dot and nested links, so the
+ * client's retry receives the same confinement and reparse checks as an open.
+ *
+ * Return: allocated target relative to the link's parent, or an error pointer.
+ */
+char *ksmbd_vfs_rebase_symlink(const struct path *link, const struct path *root,
+			       const char *target)
+{
+	unsigned int seq, retries = 0;
+
+	do {
+		char *name __free(kfree) = NULL;
+		char *parent __free(kfree) = NULL;
+		char *result, *next, *p;
+		size_t depth = 0, len;
+
+		/* The target mapping and the parent's depth need the same ancestry. */
+		seq = read_seqbegin(&rename_lock);
+		name = ksmbd_vfs_link_target_name(link, root, target);
+		if (IS_ERR(name))
+			return ERR_CAST(no_free_ptr(name));
+		parent = ksmbd_vfs_link_target_name(link, root, ".");
+		if (IS_ERR(parent))
+			return ERR_CAST(no_free_ptr(parent));
+		for (p = parent; *p; p++)
+			depth += *p == '/';
+		len = strlen(name) + 1;
+		result = kmalloc(depth * 3 + len, KSMBD_DEFAULT_GFP);
+		if (!result)
+			return ERR_PTR(-ENOMEM);
+		next = result;
+		while (depth--) {
+			memcpy(next, "../", 3);
+			next += 3;
+		}
+		memcpy(next, name, len);
+		if (!read_seqretry(&rename_lock, seq))
+			return result;
+		kfree(result);
+	} while (++retries < 3);
+
+	return ERR_PTR(-EAGAIN);
+}
+
+/*
+ * Inspect native link bodies only for reparse stubs, including components
+ * subsequently left through "..". The single full namei lookup above remains
+ * responsible for symlink permissions, magic links and link limits. These
+ * prefix checks and the resolved ancestry check enforce share confinement,
+ * including absolute links that required a host-namespace retry. This
+ * inspection never supplies the path used to open the file.
+ */
+static int ksmbd_vfs_check_reparse_components(const char *pathname,
+					    unsigned int flags,
+					    const struct path *root)
+{
+	struct {
+		char *name;
+		unsigned int flags;
+		bool check_last;
+	} *names __free(kfree) = NULL;
+	unsigned int current_name, nr_names = 1;
+	int ret = 0;
+
+	/* Bound both heap use and work without recursing on the kernel stack. */
+	names = kcalloc(MAXSYMLINKS + 1, sizeof(*names), KSMBD_DEFAULT_GFP);
+	if (!names)
+		return -ENOMEM;
+	names[0].name = kstrdup(pathname, KSMBD_DEFAULT_GFP);
+	names[0].flags = flags;
+	if (!names[0].name) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (current_name = 0; current_name < nr_names; current_name++) {
+		char *prefix = names[current_name].name;
+		char *next = prefix + strspn(prefix, "/");
+
+		flags = names[current_name].flags;
+		for (;;) {
+			struct path path;
+			char *slash = strchr(next, '/');
+
+			if (slash)
+				*slash = '\0';
+			ret = ksmbd_vfs_lookup_path(prefix,
+						    flags & ~(LOOKUP_FOLLOW | LOOKUP_DIRECTORY),
+						    root, &path);
+			if (ret)
+				goto out;
+			if (!d_is_symlink(path.dentry) &&
+			    (slash || names[current_name].check_last)) {
+				void *data;
+				u32 tag, len;
+
+				ret = ksmbd_vfs_get_rp_xattr(mnt_idmap(path.mnt), path.dentry,
+							    &tag, &data, &len);
+				if (!ret) {
+					kfree(data);
+					ret = -EREMOTE;
+				} else if (ret == -ENODATA || ret == -EOPNOTSUPP) {
+					ret = 0;
+				}
+			}
+			if (!ret && d_is_symlink(path.dentry) &&
+			    (slash || flags & LOOKUP_FOLLOW)) {
+				struct delayed_call done = {};
+				const char *target;
+				char *target_name;
+
+				if (nr_names > MAXSYMLINKS) {
+					ret = -ELOOP;
+					goto out_path;
+				}
+				target = ksmbd_vfs_get_link(path.dentry, &done);
+				if (IS_ERR(target)) {
+					ret = PTR_ERR(target);
+					do_delayed_call(&done);
+					goto out_path;
+				}
+				target_name = ksmbd_vfs_link_target_name(&path, root, target);
+				do_delayed_call(&done);
+				if (IS_ERR(target_name)) {
+					ret = PTR_ERR(target_name);
+					goto out_path;
+				}
+				names[nr_names].name = target_name;
+				names[nr_names].flags = flags | LOOKUP_FOLLOW;
+				names[nr_names].check_last =
+					slash || names[current_name].check_last;
+				nr_names++;
+			}
+out_path:
+			path_put(&path);
+			if (ret)
+				goto out;
+			if (!slash)
+				break;
+			*slash = '/';
+			next = slash + 1;
+			next += strspn(next, "/");
+			if (!*next)
+				break;
+		}
+	}
+out:
+	while (nr_names)
+		kfree(names[--nr_names].name);
+	return ret;
+}
+
+static int ksmbd_vfs_check_reparse_parent(const char *pathname,
+					unsigned int flags, const struct path *root)
+{
+	char *parent __free(kfree) = kstrdup(pathname, KSMBD_DEFAULT_GFP);
+	char *slash;
+
+	if (!parent)
+		return -ENOMEM;
+	slash = strrchr(parent, '/');
+	if (!slash)
+		return 0;
+	*slash = '\0';
+	/* The final parent component is traversed by the namespace operation. */
+	if (!(flags & LOOKUP_NO_SYMLINKS))
+		flags |= LOOKUP_FOLLOW;
+	return ksmbd_vfs_check_reparse_components(*parent ? parent : ".", flags, root);
 }
 
 void ksmbd_vfs_query_maximal_access(struct mnt_idmap *idmap,
@@ -170,17 +613,20 @@ void ksmbd_vfs_query_maximal_access(struct mnt_idmap *idmap,
  * @work:	work
  * @name:	file name that is relative to share
  * @mode:	file create mode
+ * @follow_symlinks: follow native symlinks in parent components
  *
  * Return:	0 on success, otherwise error
  */
-int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode)
+int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode,
+		     bool follow_symlinks)
 {
 	struct path path;
 	struct dentry *dentry;
 	int err;
 
 	dentry = ksmbd_vfs_kern_path_create(work, name,
-					    LOOKUP_NO_SYMLINKS, &path);
+					  follow_symlinks ? 0 : LOOKUP_NO_SYMLINKS,
+					  &path);
 	if (IS_ERR(dentry)) {
 		err = PTR_ERR(dentry);
 		if (err != -ENOENT)
@@ -207,10 +653,12 @@ int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode)
  * @work:	work
  * @name:	directory name that is relative to share
  * @mode:	directory create mode
+ * @follow_symlinks: follow native symlinks in parent components
  *
  * Return:	0 on success, otherwise error
  */
-int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode)
+int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode,
+		    bool follow_symlinks)
 {
 	struct mnt_idmap *idmap;
 	struct path path;
@@ -218,7 +666,8 @@ int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode)
 	int err = 0;
 
 	dentry = ksmbd_vfs_kern_path_create(work, name,
-					    LOOKUP_NO_SYMLINKS | LOOKUP_DIRECTORY,
+					    LOOKUP_DIRECTORY |
+					    (follow_symlinks ? 0 : LOOKUP_NO_SYMLINKS),
 					    &path);
 	if (IS_ERR(dentry)) {
 		err = PTR_ERR(dentry);
@@ -689,45 +1138,42 @@ out_err:
 /**
  * ksmbd_vfs_link() - vfs helper for creating smb hardlink
  * @work:	work
- * @oldname:	source file name
+ * @fp:		source handle
  * @newname:	hardlink name that is relative to share
  *
  * Return:	0 on success, otherwise error
  */
-int ksmbd_vfs_link(struct ksmbd_work *work, const char *oldname,
+int ksmbd_vfs_link(struct ksmbd_work *work, struct ksmbd_file *fp,
 		   const char *newname)
 {
-	struct path oldpath, newpath;
+	const struct path *oldpath = &fp->filp->f_path;
+	struct path newpath;
 	struct dentry *dentry;
+	unsigned int lookup_flags = LOOKUP_REVAL;
 	int err;
 
+	if (fp->is_wide_link)
+		return -EACCES;
 	if (ksmbd_override_fsids(work))
 		return -ENOMEM;
 
-	scoped_with_init_fs()
-		err = kern_path(oldname, LOOKUP_NO_SYMLINKS, &oldpath);
-	if (err) {
-		pr_err("cannot get linux path for %s, err = %d\n",
-		       oldname, err);
-		goto out1;
-	}
-
-	dentry = ksmbd_vfs_kern_path_create(work, newname,
-					    LOOKUP_NO_SYMLINKS | LOOKUP_REVAL,
-					    &newpath);
+	if (!test_share_config_flag(work->tcon->share_conf,
+				    KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS))
+		lookup_flags |= LOOKUP_NO_SYMLINKS;
+	dentry = ksmbd_vfs_kern_path_create(work, newname, lookup_flags, &newpath);
 	if (IS_ERR(dentry)) {
 		err = PTR_ERR(dentry);
 		pr_err("path create err for %s, err %d\n", newname, err);
-		goto out2;
+		goto out1;
 	}
 
 	err = -EXDEV;
-	if (oldpath.mnt != newpath.mnt) {
+	if (oldpath->mnt != newpath.mnt) {
 		pr_err("vfs_link failed err %d\n", err);
 		goto out3;
 	}
 
-	err = vfs_link(oldpath.dentry, mnt_idmap(newpath.mnt),
+	err = vfs_link(oldpath->dentry, mnt_idmap(newpath.mnt),
 		       d_inode(newpath.dentry),
 		       dentry, NULL);
 	if (err)
@@ -735,8 +1181,6 @@ int ksmbd_vfs_link(struct ksmbd_work *work, const char *oldname,
 
 out3:
 	end_creating_path(&newpath, dentry);
-out2:
-	path_put(&oldpath);
 out1:
 	ksmbd_revert_fsids(work);
 	return err;
@@ -771,18 +1215,28 @@ int ksmbd_vfs_rename(struct ksmbd_work *work, struct ksmbd_file *old_fp,
 	struct qstr new_last;
 	struct renamedata rd;
 	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
-	int err, lookup_flags = LOOKUP_NO_SYMLINKS;
+	unsigned int lookup_flags = LOOKUP_BENEATH | LOOKUP_NO_MAGICLINKS;
+	int err;
 
 	if (ksmbd_override_fsids(work))
 		return -ENOMEM;
 
+	if (!test_share_config_flag(share_conf, KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS))
+		lookup_flags |= LOOKUP_NO_SYMLINKS;
+	if (!test_share_config_flag(share_conf, KSMBD_SHARE_FLAG_CROSSMNT))
+		lookup_flags |= LOOKUP_NO_XDEV;
+
 	CLASS(filename_kernel, to)(newname);
 
 retry:
-	err = vfs_path_parent_lookup(to, lookup_flags | LOOKUP_BENEATH,
-				     &new_path, &new_last, &share_conf->vfs_path);
+	err = ksmbd_vfs_lookup_parent(&to, lookup_flags,
+				      &new_path, &new_last, &share_conf->vfs_path);
 	if (err)
 		goto out1;
+	err = ksmbd_vfs_check_reparse_parent(newname, lookup_flags,
+					    &share_conf->vfs_path);
+	if (err)
+		goto out2;
 
 	if (old_path->mnt != new_path.mnt) {
 		err = -EXDEV;
@@ -801,6 +1255,13 @@ retry:
 	err = start_renaming_dentry(&rd, lookup_flags, old_child, &new_last);
 	if (err)
 		goto out_drop_write;
+	if (!path_is_under(&new_path, &share_conf->vfs_path)) {
+		err = -EXDEV;
+		goto out3;
+	}
+	err = ksmbd_vfs_check_reparse_path(&new_path, &share_conf->vfs_path, true);
+	if (err)
+		goto out3;
 
 	if (d_is_dir(old_child) && ksmbd_has_nonposix_open_child(old_fp)) {
 		err = -EACCES;
@@ -841,6 +1302,8 @@ out2:
 	path_put(&new_path);
 
 	if (retry_estale(err, lookup_flags)) {
+		putname(to);
+		to = getname_kernel(newname);
 		lookup_flags |= LOOKUP_REVAL;
 		goto retry;
 	}
@@ -1416,18 +1879,20 @@ static int ksmbd_vfs_lookup_in_dir(const struct path *dir, char *name,
 	return ret;
 }
 
-static
-int __ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
-			  unsigned int flags,
-			  struct path *path, bool caseless, bool for_remove)
+static int __ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
+				 unsigned int flags, struct path *path,
+				 bool caseless, bool for_remove, bool wide)
 {
 	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	const struct path *root = wide ? NULL : &share_conf->vfs_path;
 	struct path parent_path;
 	size_t path_len, remain_len;
+	unsigned int prefix_flags;
 	int err;
 
 retry:
-	err = ksmbd_vfs_path_lookup(share_conf, filepath, flags, path, for_remove);
+	err = ksmbd_vfs_path_lookup(share_conf, filepath, flags, path,
+				    for_remove, root);
 	if (!err || err != -ENOENT || !caseless)
 		return err;
 
@@ -1458,11 +1923,12 @@ retry:
 		}
 		next[0] = '\0';
 
-		err = vfs_path_lookup(share_conf->vfs_path.dentry,
-				      share_conf->vfs_path.mnt,
-				      filepath,
-				      flags,
-				      &parent_path);
+		/* Follow prefix symlinks unless this lookup explicitly forbids it. */
+		prefix_flags = flags;
+		if (!(flags & LOOKUP_NO_SYMLINKS))
+			prefix_flags |= LOOKUP_FOLLOW;
+		err = ksmbd_vfs_path_lookup(share_conf, filepath, prefix_flags,
+					    &parent_path, false, root);
 		next[0] = '/';
 		if (err)
 			goto out;
@@ -1494,7 +1960,77 @@ int ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
 			struct path *path, bool caseless)
 {
 	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
-				     caseless, false);
+				     caseless, false, false);
+}
+
+/**
+ * ksmbd_vfs_has_dotdot() - test a client pathname for dot-dot components
+ * @path: slash-separated pathname
+ *
+ * Return: true when an exact ".." component is present.
+ */
+static bool ksmbd_vfs_has_dotdot(const char *path)
+{
+	const char *component = path;
+
+	while (*component) {
+		const char *end;
+
+		while (*component == '/')
+			component++;
+		if (!*component)
+			break;
+		end = strchrnul(component, '/');
+		if (end - component == 2 && component[0] == '.' &&
+		    component[1] == '.')
+			return true;
+		component = end;
+	}
+	return false;
+}
+
+/**
+ * ksmbd_vfs_kern_path_wide() - resolve an explicitly enabled wide link
+ * @work: SMB request work item
+ * @filepath: share-relative client pathname
+ * @path: returned resolved path
+ * @caseless: retry lookup using case-insensitive component matching
+ * @wide_link: set when the unrestricted symlink fallback was used
+ * @follow_final: follow the final symlink component
+ *
+ * The normal lookup remains constrained beneath the share.  The fallback is
+ * used only after encountering a native symlink and rejects dot-dot supplied
+ * by the client before allowing that symlink to leave the share.
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *filepath,
+			     struct path *path, bool caseless,
+			     bool *wide_link, bool follow_final)
+{
+	unsigned int lookup_flags = follow_final ? LOOKUP_FOLLOW : 0;
+	int err;
+
+	*wide_link = false;
+	err = ksmbd_vfs_kern_path(work, filepath, lookup_flags,
+				  path, caseless);
+	if (!err)
+		return 0;
+	if (err != -EXDEV)
+		return err;
+
+	/* LOOKUP_BENEATH protected the first lookup.  The fallback cannot use
+	 * it because following the administrator-created symlink may leave the
+	 * share, so reject traversal supplied directly by the SMB client first.
+	 */
+	if (ksmbd_vfs_has_dotdot(filepath))
+		return -EACCES;
+
+	err = __ksmbd_vfs_kern_path(work, filepath, lookup_flags, path,
+				    caseless, false, true);
+	if (!err)
+		*wide_link = true;
+	return err;
 }
 
 /**
@@ -1515,7 +2051,7 @@ int ksmbd_vfs_kern_path_start_removing(struct ksmbd_work *work, char *filepath,
 				       struct path *path, bool caseless)
 {
 	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
-				     caseless, true);
+				     caseless, true, false);
 }
 
 void ksmbd_vfs_kern_path_end_removing(const struct path *path)
@@ -1538,10 +2074,19 @@ struct dentry *ksmbd_vfs_kern_path_create(struct ksmbd_work *work,
 	/* resolve the name beneath the share root so ".." cannot escape */
 	CLASS(filename_kernel, filename)(name);
 
-	err = vfs_path_parent_lookup(filename, flags | LOOKUP_BENEATH,
-				     path, &last, &share_conf->vfs_path);
+	flags |= LOOKUP_BENEATH | LOOKUP_NO_MAGICLINKS;
+	if (!test_share_config_flag(share_conf, KSMBD_SHARE_FLAG_CROSSMNT))
+		flags |= LOOKUP_NO_XDEV;
+	err = ksmbd_vfs_lookup_parent(&filename, flags,
+				      path, &last, &share_conf->vfs_path);
 	if (err)
 		return ERR_PTR(err);
+
+	err = ksmbd_vfs_check_reparse_parent(name, flags, &share_conf->vfs_path);
+	if (err) {
+		path_put(path);
+		return ERR_PTR(err);
+	}
 
 	err = mnt_want_write(path->mnt);
 	if (err) {
@@ -1550,6 +2095,13 @@ struct dentry *ksmbd_vfs_kern_path_create(struct ksmbd_work *work,
 	}
 
 	dent = start_creating_noperm(path->dentry, &last);
+	if (!IS_ERR(dent)) {
+		err = ksmbd_vfs_check_reparse_path(path, &share_conf->vfs_path, true);
+		if (err) {
+			end_creating(dent);
+			dent = ERR_PTR(err);
+		}
+	}
 	if (IS_ERR(dent)) {
 		mnt_drop_write(path->mnt);
 		path_put(path);

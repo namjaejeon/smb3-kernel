@@ -117,8 +117,10 @@ static void lease_get(struct lease *lease)
 
 static void lease_put(struct lease *lease)
 {
-	if (lease && atomic_dec_and_test(&lease->refcount))
+	if (lease && atomic_dec_and_test(&lease->refcount)) {
+		kfree(lease->filename);
 		kfree(lease);
+	}
 }
 
 /* The caller holds lease->lock. */
@@ -252,7 +254,7 @@ static struct lease_table *alloc_lease_table(struct oplock_info *opinfo)
 }
 
 static struct lease *alloc_lease(struct lease_ctx_info *lctx,
-				 struct ksmbd_inode *ci)
+				 struct ksmbd_inode *ci, const char *name)
 {
 	struct lease *lease;
 
@@ -260,6 +262,11 @@ static struct lease *alloc_lease(struct lease_ctx_info *lctx,
 	if (!lease)
 		return NULL;
 
+	lease->filename = kstrdup(name, KSMBD_DEFAULT_GFP);
+	if (!lease->filename) {
+		kfree(lease);
+		return NULL;
+	}
 	memcpy(lease->lease_key, lctx->lease_key, SMB2_LEASE_KEY_SIZE);
 	lease->state = lctx->req_state;
 	lease->new_state = 0;
@@ -1844,6 +1851,7 @@ void smb_lazy_parent_lease_break_close(struct ksmbd_file *fp)
  * @fp:			ksmbd file pointer
  * @tid:		Tree id of connection
  * @lctx:		lease context information on file open
+ * @name:		share-relative pathname supplied by the client
  * @share_ret:		share mode
  * @replay:		whether this is a replayed CREATE request
  *
@@ -1851,7 +1859,8 @@ void smb_lazy_parent_lease_break_close(struct ksmbd_file *fp)
  */
 int smb_grant_oplock(struct ksmbd_work *work, int req_op_level, u64 pid,
 		     struct ksmbd_file *fp, __u16 tid,
-		     struct lease_ctx_info *lctx, int share_ret, bool replay)
+		     struct lease_ctx_info *lctx, const char *name,
+		     int share_ret, bool replay)
 {
 	int err = 0;
 	int break_level = SMB2_OPLOCK_LEVEL_II;
@@ -1878,7 +1887,7 @@ int smb_grant_oplock(struct ksmbd_work *work, int req_op_level, u64 pid,
 		return -ENOMEM;
 
 	if (lctx) {
-		opinfo->o_lease = alloc_lease(lctx, ci);
+		opinfo->o_lease = alloc_lease(lctx, ci, name);
 		if (!opinfo->o_lease) {
 			err = -ENOMEM;
 			goto err_out;
@@ -2748,7 +2757,7 @@ int smb2_check_durable_oplock(struct ksmbd_conn *conn,
 			      struct ksmbd_file *fp,
 			      struct lease_ctx_info *lctx,
 			      struct ksmbd_user *user,
-			      char *name)
+			      const char *name)
 {
 	struct oplock_info *opinfo = opinfo_get(fp);
 	int ret = 0;
@@ -2817,8 +2826,21 @@ int smb2_check_durable_oplock(struct ksmbd_conn *conn,
 		goto out;
 	}
 
-	if (!ksmbd_inode_pending_delete(fp))
-		ret = ksmbd_validate_name_reconnect(share, fp, name);
+	if (!ksmbd_inode_pending_delete(fp)) {
+		struct lease *lease = opinfo->o_lease;
+
+		/* A saved alias is meaningful only beneath its original share root. */
+		if (!path_equal(&share->vfs_path, &fp->share_conf->vfs_path)) {
+			ret = -EINVAL;
+			goto out;
+		}
+		if (name) {
+			spin_lock(&lease->lock);
+			if (strcmp(lease->filename, name))
+				ret = -EINVAL;
+			spin_unlock(&lease->lock);
+		}
+	}
 out:
 	opinfo_put(opinfo);
 	return ret;

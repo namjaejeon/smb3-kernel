@@ -37,11 +37,14 @@ struct ksmbd_work;
 struct ksmbd_file;
 struct ksmbd_conn;
 
+/* Never hold this across an SMB oplock or lease break wait. */
 extern struct rw_semaphore ksmbd_reparse_sem;
 
 #define KSMBD_MAX_REPARSE_DATA_SIZE	(16 * 1024)
 
 const char *ksmbd_vfs_get_link(struct dentry *dentry, struct delayed_call *done);
+char *ksmbd_vfs_rebase_symlink(const struct path *link, const struct path *root,
+			       const char *target);
 struct ksmbd_dir_info {
 	const char	*name;
 	char		*wptr;
@@ -83,8 +86,10 @@ struct ksmbd_kstat {
 int ksmbd_vfs_lock_parent(struct dentry *parent, struct dentry *child);
 void ksmbd_vfs_query_maximal_access(struct mnt_idmap *idmap,
 				   struct dentry *dentry, __le32 *daccess);
-int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode);
-int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode);
+int ksmbd_vfs_create(struct ksmbd_work *work, const char *name, umode_t mode,
+		     bool follow_symlinks);
+int ksmbd_vfs_mkdir(struct ksmbd_work *work, const char *name, umode_t mode,
+		    bool follow_symlinks);
 int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
 		   loff_t *pos, char *rbuf);
 int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
@@ -94,7 +99,7 @@ int ksmbd_vfs_stream_truncate(struct ksmbd_file *fp, loff_t newsize);
 int ksmbd_vfs_fsync(struct ksmbd_work *work, u64 fid, u64 p_id);
 int ksmbd_vfs_remove_file(struct ksmbd_work *work, const struct path *path);
 int ksmbd_vfs_link(struct ksmbd_work *work,
-		   const char *oldname, const char *newname);
+		   struct ksmbd_file *fp, const char *newname);
 int ksmbd_vfs_getattr(const struct path *path, struct kstat *stat);
 int ksmbd_vfs_rename(struct ksmbd_work *work, struct ksmbd_file *old_fp,
 			 char *newname, int flags);
@@ -136,6 +141,9 @@ int ksmbd_vfs_remove_xattr(struct mnt_idmap *idmap,
 int ksmbd_vfs_kern_path(struct ksmbd_work *work, char *name,
 			unsigned int flags,
 			struct path *path, bool caseless);
+int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *name,
+			     struct path *path, bool caseless,
+			     bool *wide_link, bool follow_final);
 int ksmbd_vfs_kern_path_start_removing(struct ksmbd_work *work, char *name,
 				       unsigned int flags,
 				       struct path *path, bool caseless);
