@@ -23,6 +23,8 @@
 #include <linux/sched/xacct.h>
 #include <linux/crc32c.h>
 #include <linux/fileattr.h>
+#include <linux/mount.h>
+#include <linux/unaligned.h>
 
 #include "glob.h"
 #include "oplock.h"
@@ -1940,6 +1942,86 @@ out:
 	return ret;
 }
 
+/* Report a stored stub's type without changing the backing inode's mode. */
+static umode_t ksmbd_vfs_reparse_mode(u32 tag, const void *data, u32 len,
+				    umode_t mode)
+{
+	umode_t type;
+
+	switch (tag) {
+	case IO_REPARSE_TAG_SYMLINK:
+	case IO_REPARSE_TAG_LX_SYMLINK:
+		type = S_IFLNK;
+		break;
+	case IO_REPARSE_TAG_AF_UNIX:
+		type = S_IFSOCK;
+		break;
+	case IO_REPARSE_TAG_LX_FIFO:
+		type = S_IFIFO;
+		break;
+	case IO_REPARSE_TAG_LX_CHR:
+		type = S_IFCHR;
+		break;
+	case IO_REPARSE_TAG_LX_BLK:
+		type = S_IFBLK;
+		break;
+	case IO_REPARSE_TAG_NFS:
+		if (len < sizeof(__le64))
+			return mode;
+		switch (get_unaligned_le64(data)) {
+		case NFS_SPECFILE_LNK:
+			type = S_IFLNK;
+			break;
+		case NFS_SPECFILE_CHR:
+			type = S_IFCHR;
+			break;
+		case NFS_SPECFILE_BLK:
+			type = S_IFBLK;
+			break;
+		case NFS_SPECFILE_FIFO:
+			type = S_IFIFO;
+			break;
+		case NFS_SPECFILE_SOCK:
+			type = S_IFSOCK;
+			break;
+		default:
+			return mode;
+		}
+		break;
+	default:
+		return mode;
+	}
+	return (mode & ~S_IFMT) | type;
+}
+
+/**
+ * ksmbd_vfs_get_reparse_info() - get the stored or native reparse type
+ * @idmap: mount idmapping for the target
+ * @dentry: inode whose reparse metadata is inspected
+ * @tag: returned reparse tag, or zero for an ordinary inode
+ * @mode: returned mode with the file type described by the reparse data
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ksmbd_vfs_get_reparse_info(struct mnt_idmap *idmap, struct dentry *dentry,
+			       u32 *tag, umode_t *mode)
+{
+	void *data;
+	u32 len;
+	int ret;
+
+	*mode = d_inode(dentry)->i_mode;
+	ret = ksmbd_vfs_get_rp_xattr(idmap, dentry, tag, &data, &len);
+	if (!ret) {
+		*mode = ksmbd_vfs_reparse_mode(*tag, data, len, *mode);
+		kfree(data);
+	} else if (ret == -ENODATA || ret == -EOPNOTSUPP) {
+		*tag = le32_to_cpu(smb2_get_reparse_tag_special_file(*mode));
+		ret = 0;
+	}
+	return ret;
+}
+
 /**
  * ksmbd_vfs_remove_rp_xattr() - remove reparse point metadata
  * @idmap: mount idmapping for the target
@@ -2073,6 +2155,18 @@ int ksmbd_vfs_fill_dentry_attrs(struct ksmbd_work *work,
 			ksmbd_debug(VFS, "fail to load dos attribute.\n");
 		}
 	}
+
+	/* Reparse state is authoritative over potentially stale DOS attributes. */
+	ksmbd_kstat->file_attributes &= ~FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	rc = ksmbd_vfs_get_reparse_info(idmap, dentry,
+					&ksmbd_kstat->reparse_tag,
+					&ksmbd_kstat->posix_mode);
+	if (rc)
+		return rc;
+	if (ksmbd_kstat->reparse_tag)
+		ksmbd_kstat->file_attributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	if (S_ISDIR(ksmbd_kstat->kstat->mode))
+		ksmbd_kstat->file_attributes |= FILE_ATTRIBUTE_DIRECTORY_LE;
 
 	/*
 	 * Only pay for this when it'll actually be used: AAPL

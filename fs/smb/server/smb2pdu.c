@@ -1779,6 +1779,33 @@ __le32 smb2_get_reparse_tag_special_file(umode_t mode)
 	return 0;
 }
 
+__le32 smb2_get_posix_mode(umode_t mode)
+{
+	u32 type = POSIX_TYPE_FILE;
+
+	switch (mode & S_IFMT) {
+	case S_IFDIR:
+		type = POSIX_TYPE_DIR;
+		break;
+	case S_IFLNK:
+		type = POSIX_TYPE_SYMLINK;
+		break;
+	case S_IFCHR:
+		type = POSIX_TYPE_CHARDEV;
+		break;
+	case S_IFBLK:
+		type = POSIX_TYPE_BLKDEV;
+		break;
+	case S_IFIFO:
+		type = POSIX_TYPE_FIFO;
+		break;
+	case S_IFSOCK:
+		type = POSIX_TYPE_SOCKET;
+		break;
+	}
+	return cpu_to_le32((mode & 07777) | (type << POSIX_FILETYPE_SHIFT));
+}
+
 static int smb2_get_native_reparse_point(struct dentry *dentry, u32 *tag,
 					 void **data, u32 *len)
 {
@@ -1813,6 +1840,19 @@ out:
 }
 
 /**
+ * smb2_get_reparse_tag() - obtain the reparse tag for directory information
+ * @ksmbd_kstat: attributes collected for the directory entry
+ *
+ * Return: little-endian reparse tag, or zero for a regular entry.
+ */
+static __le32 smb2_get_reparse_tag(struct ksmbd_kstat *ksmbd_kstat)
+{
+	if (ksmbd_kstat->reparse_tag)
+		return cpu_to_le32(ksmbd_kstat->reparse_tag);
+	return smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+}
+
+/**
  * smb2_get_dos_mode() - get file mode in dos format from unix mode
  * @stat:	kstat containing file mode
  * @attribute:	attribute flags
@@ -1835,6 +1875,39 @@ static int smb2_get_dos_mode(struct kstat *stat, int attribute)
 	}
 
 	return attr;
+}
+
+static int smb2_get_file_attributes(struct ksmbd_file *fp, __le32 *attributes)
+{
+	umode_t mode;
+	u32 tag;
+	int ret;
+
+	guard(rwsem_read)(&ksmbd_reparse_sem);
+	ret = ksmbd_vfs_get_reparse_info(file_mnt_idmap(fp->filp),
+					fp->filp->f_path.dentry, &tag, &mode);
+	if (ret)
+		return ret;
+
+	/* Hard-link aliases cache DOS attributes separately from inode metadata. */
+	*attributes = fp->f_ci->m_fattr & ~FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	if (tag)
+		*attributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	return 0;
+}
+
+static void smb2_update_reparse_attributes(struct ksmbd_file *fp, u32 tag)
+{
+	struct inode *inode = file_inode(fp->filp);
+	__le32 attributes = fp->f_ci->m_fattr;
+
+	attributes &= ~(FILE_ATTRIBUTE_REPARSE_POINT_LE |
+			FILE_ATTRIBUTE_DIRECTORY_LE);
+	if (tag)
+		attributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	if (S_ISDIR(inode->i_mode))
+		attributes |= FILE_ATTRIBUTE_DIRECTORY_LE;
+	fp->f_ci->m_fattr = attributes;
 }
 
 static void build_preauth_ctxt(struct smb2_preauth_neg_context *pneg_ctxt,
@@ -5884,19 +5957,27 @@ resolve_path:
 	fp->change_time = ksmbd_UnixTimeToNT(stat.ctime);
 	fp->allocation_size = S_ISDIR(stat.mode) ? 0 :
 		(alloc_size ?: stat.blocks << 9);
-	if (created || fp->f_ci->m_fattr == 0)
-		fp->f_ci->m_fattr =
-			cpu_to_le32(smb2_get_dos_mode(&stat, le32_to_cpu(req->FileAttributes)));
-	if (reparse_point)
-		fp->f_ci->m_fattr |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
+		umode_t mode;
+		u32 reparse_tag;
 
-	if (!created)
-		smb2_update_xattrs(tcon, &path, fp);
-	if (need_truncate && req->FileAttributes) {
-		dos_attr = le32_to_cpu(req->FileAttributes);
-		fp->f_ci->m_fattr =
-			cpu_to_le32(smb2_get_dos_mode(&stat, dos_attr));
-		smb2_new_xattrs(tcon, &path, fp);
+		if (created || fp->f_ci->m_fattr == 0) {
+			dos_attr = le32_to_cpu(req->FileAttributes);
+			fp->f_ci->m_fattr =
+				cpu_to_le32(smb2_get_dos_mode(&stat, dos_attr));
+		}
+		if (!created)
+			smb2_update_xattrs(tcon, &path, fp);
+		if (need_truncate && req->FileAttributes) {
+			dos_attr = le32_to_cpu(req->FileAttributes);
+			fp->f_ci->m_fattr =
+				cpu_to_le32(smb2_get_dos_mode(&stat, dos_attr));
+			smb2_new_xattrs(tcon, &path, fp);
+		}
+		rc = ksmbd_vfs_get_reparse_info(idmap, path.dentry, &reparse_tag, &mode);
+		if (rc)
+			goto err_out1;
+		smb2_update_reparse_attributes(fp, reparse_tag);
 	}
 
 	ksmbd_vfs_update_compressed_fattr(path.dentry, &fp->f_ci->m_fattr);
@@ -5956,6 +6037,9 @@ resolve_path:
 	 * this function's normal (non-reconnect) parsing already handles.
 	 */
 	reconnected_fp:
+	rc = smb2_get_file_attributes(fp, &rsp->FileAttributes);
+	if (rc)
+		goto err_out1;
 	if (dh_info.replay)
 		file_info = le32_to_cpu(fp->create_action);
 	rsp->StructureSize = cpu_to_le16(89);
@@ -6001,8 +6085,6 @@ resolve_path:
 		rsp->AllocationSize = cpu_to_le64(fp->allocation_size);
 		rsp->EndofFile = S_ISDIR(stat.mode) ? 0 : cpu_to_le64(stat.size);
 	}
-	rsp->FileAttributes = fp->f_ci->m_fattr;
-
 	rsp->Reserved2 = 0;
 
 	rsp->PersistentFileId = fp->persistent_id;
@@ -6107,9 +6189,11 @@ resolve_path:
 		posix_ccontext = (struct create_context *)(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength));
 		contxt_cnt++;
-		create_posix_rsp_buf(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength),
-				fp);
+		rc = create_posix_rsp_buf(rsp->Buffer +
+					 le32_to_cpu(rsp->CreateContextsLength),
+					 fp);
+		if (rc)
+			goto err_out1;
 		le32_add_cpu(&rsp->CreateContextsLength,
 			     conn->vals->create_posix_size);
 		iov_len += conn->vals->create_posix_size;
@@ -6464,9 +6548,9 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		ffdinfo = (FILE_FULL_DIRECTORY_INFO *)kstat;
 		ffdinfo->FileNameLength = cpu_to_le32(conv_len);
 		ffdinfo->EaSize =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+			smb2_get_reparse_tag(ksmbd_kstat);
 		if (ffdinfo->EaSize)
-			ffdinfo->ExtFileAttributes = FILE_ATTRIBUTE_REPARSE_POINT_LE;
+			ffdinfo->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		if (d_info->hide_dot_file && d_info->name[0] == '.')
 			ffdinfo->ExtFileAttributes |= FILE_ATTRIBUTE_HIDDEN_LE;
 		memcpy(ffdinfo->FileName, conv_name, conv_len);
@@ -6480,9 +6564,9 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		fbdinfo = (FILE_BOTH_DIRECTORY_INFO *)kstat;
 		fbdinfo->FileNameLength = cpu_to_le32(conv_len);
 		fbdinfo->EaSize =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+			smb2_get_reparse_tag(ksmbd_kstat);
 		if (fbdinfo->EaSize)
-			fbdinfo->ExtFileAttributes = FILE_ATTRIBUTE_REPARSE_POINT_LE;
+			fbdinfo->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		fbdinfo->ShortNameLength = 0;
 		fbdinfo->Reserved = 0;
 		if (d_info->hide_dot_file && d_info->name[0] == '.')
@@ -6520,9 +6604,9 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		dinfo = (FILE_ID_FULL_DIR_INFO *)kstat;
 		dinfo->FileNameLength = cpu_to_le32(conv_len);
 		dinfo->EaSize =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+			smb2_get_reparse_tag(ksmbd_kstat);
 		if (dinfo->EaSize)
-			dinfo->ExtFileAttributes = FILE_ATTRIBUTE_REPARSE_POINT_LE;
+			dinfo->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		dinfo->Reserved = 0;
 		if (conn->is_aapl)
 			dinfo->UniqueId = 0;
@@ -6567,10 +6651,10 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 			 * AAPL_READDIR_ATTR_V2_NO_XATTR's meaning.
 			 */
 			__le32 reparse_tag =
-				smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+				smb2_get_reparse_tag(ksmbd_kstat);
 
 			if (reparse_tag)
-				fibdinfo->ExtFileAttributes = FILE_ATTRIBUTE_REPARSE_POINT_LE;
+				fibdinfo->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 			/*
 			 * FILE_GENERIC_ALL_LE (0x10000000) is the raw
 			 * "generic all" meta-bit -- valid only in a
@@ -6612,9 +6696,9 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 			fibdinfo->Reserved2 = cpu_to_le16(ksmbd_kstat->kstat->mode & 0xffff);
 		} else {
 			fibdinfo->EaSize =
-				smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+				smb2_get_reparse_tag(ksmbd_kstat);
 			if (fibdinfo->EaSize)
-				fibdinfo->ExtFileAttributes = FILE_ATTRIBUTE_REPARSE_POINT_LE;
+				fibdinfo->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 			fibdinfo->Reserved2 = cpu_to_le16(0);
 		}
 		if (d_info->hide_dot_file && d_info->name[0] == '.')
@@ -6630,8 +6714,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		info = (struct file_id_extd_directory_info *)kstat;
 		info->FileNameLength = cpu_to_le32(conv_len);
 		info->EaSize = 0;
-		info->ReparsePointTag =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+		info->ReparsePointTag = smb2_get_reparse_tag(ksmbd_kstat);
 		if (info->ReparsePointTag)
 			info->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		/* The VFS does not provide a 128-bit file ID. */
@@ -6650,8 +6733,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		info = (struct file_id_64_extd_directory_info *)kstat;
 		info->FileNameLength = cpu_to_le32(conv_len);
 		info->EaSize = 0;
-		info->ReparsePointTag =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+		info->ReparsePointTag = smb2_get_reparse_tag(ksmbd_kstat);
 		if (info->ReparsePointTag)
 			info->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		if (conn->is_aapl)
@@ -6672,8 +6754,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		info = (struct file_id_64_extd_both_directory_info *)kstat;
 		info->FileNameLength = cpu_to_le32(conv_len);
 		info->EaSize = 0;
-		info->ReparsePointTag =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+		info->ReparsePointTag = smb2_get_reparse_tag(ksmbd_kstat);
 		if (info->ReparsePointTag)
 			info->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		if (conn->is_aapl)
@@ -6697,8 +6778,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		info = (struct file_id_all_extd_directory_info *)kstat;
 		info->FileNameLength = cpu_to_le32(conv_len);
 		info->EaSize = 0;
-		info->ReparsePointTag =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+		info->ReparsePointTag = smb2_get_reparse_tag(ksmbd_kstat);
 		if (info->ReparsePointTag)
 			info->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		if (conn->is_aapl)
@@ -6721,8 +6801,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		info = (struct file_id_all_extd_both_directory_info *)kstat;
 		info->FileNameLength = cpu_to_le32(conv_len);
 		info->EaSize = 0;
-		info->ReparsePointTag =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+		info->ReparsePointTag = smb2_get_reparse_tag(ksmbd_kstat);
 		if (info->ReparsePointTag)
 			info->ExtFileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		if (conn->is_aapl)
@@ -6760,33 +6839,11 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		posix_info->AllocationSize = cpu_to_le64(ksmbd_kstat->kstat->blocks << 9);
 		posix_info->DeviceId = cpu_to_le32(ksmbd_kstat->kstat->dev);
 		posix_info->HardLinks = cpu_to_le32(ksmbd_kstat->kstat->nlink);
-		posix_info->ReparseTag =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
-		posix_info->Mode = cpu_to_le32(ksmbd_kstat->kstat->mode & 07777);
-		switch (ksmbd_kstat->kstat->mode & S_IFMT) {
-		case S_IFDIR:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_DIR << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFLNK:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_SYMLINK << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFCHR:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_CHARDEV << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFBLK:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_BLKDEV << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFIFO:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_FIFO << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFSOCK:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_SOCKET << POSIX_FILETYPE_SHIFT);
-		}
+		posix_info->ReparseTag = smb2_get_reparse_tag(ksmbd_kstat);
+		posix_info->Mode = smb2_get_posix_mode(ksmbd_kstat->posix_mode);
 
 		posix_info->Inode = cpu_to_le64(ksmbd_kstat->kstat->ino);
-		posix_info->DosAttributes =
-			S_ISDIR(ksmbd_kstat->kstat->mode) ?
-				FILE_ATTRIBUTE_DIRECTORY_LE : FILE_ATTRIBUTE_ARCHIVE_LE;
+		posix_info->DosAttributes = ksmbd_kstat->file_attributes;
 		if (posix_info->ReparseTag)
 			posix_info->DosAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		if (d_info->hide_dot_file && d_info->name[0] == '.')
@@ -7672,13 +7729,15 @@ static int get_file_basic_info(struct smb2_query_info_rsp *rsp,
 		return ret;
 
 	basic_info = (struct file_basic_info *)rsp->Buffer;
+	ret = smb2_get_file_attributes(fp, &basic_info->Attributes);
+	if (ret)
+		return ret;
 	basic_info->CreationTime = cpu_to_le64(fp->create_time);
 	time = ksmbd_UnixTimeToNT(stat.atime);
 	basic_info->LastAccessTime = cpu_to_le64(time);
 	time = ksmbd_UnixTimeToNT(stat.mtime);
 	basic_info->LastWriteTime = cpu_to_le64(time);
 	basic_info->ChangeTime = cpu_to_le64(fp->change_time);
-	basic_info->Attributes = fp->f_ci->m_fattr;
 	basic_info->Pad = 0;
 	rsp->OutputBufferLength =
 		cpu_to_le32(sizeof(struct file_basic_info));
@@ -7795,6 +7854,11 @@ static int get_file_all_info(struct ksmbd_work *work,
 	ksmbd_debug(SMB, "filename = %s\n", filename);
 	delete_pending = ksmbd_inode_pending_delete(fp);
 	file_info = (struct smb2_file_all_info *)rsp->Buffer;
+	ret = smb2_get_file_attributes(fp, &file_info->Attributes);
+	if (ret) {
+		kfree(filename);
+		return ret;
+	}
 
 	file_info->CreationTime = cpu_to_le64(fp->create_time);
 	time = ksmbd_UnixTimeToNT(stat.atime);
@@ -7802,7 +7866,6 @@ static int get_file_all_info(struct ksmbd_work *work,
 	time = ksmbd_UnixTimeToNT(stat.mtime);
 	file_info->LastWriteTime = cpu_to_le64(time);
 	file_info->ChangeTime = cpu_to_le64(fp->change_time);
-	file_info->Attributes = fp->f_ci->m_fattr;
 	file_info->Pad1 = 0;
 	if (ksmbd_stream_fd(fp) == false) {
 		file_info->AllocationSize = cpu_to_le64(fp->allocation_size);
@@ -8088,6 +8151,9 @@ static int get_file_network_open_info(struct smb2_query_info_rsp *rsp,
 		return ret;
 
 	file_info = (struct smb2_file_network_open_info *)rsp->Buffer;
+	ret = smb2_get_file_attributes(fp, &file_info->Attributes);
+	if (ret)
+		return ret;
 
 	file_info->CreationTime = cpu_to_le64(fp->create_time);
 	time = ksmbd_UnixTimeToNT(stat.atime);
@@ -8095,7 +8161,6 @@ static int get_file_network_open_info(struct smb2_query_info_rsp *rsp,
 	time = ksmbd_UnixTimeToNT(stat.mtime);
 	file_info->LastWriteTime = cpu_to_le64(time);
 	file_info->ChangeTime = cpu_to_le64(fp->change_time);
-	file_info->Attributes = fp->f_ci->m_fattr;
 	if (ksmbd_stream_fd(fp) == false) {
 		file_info->AllocationSize = cpu_to_le64(fp->allocation_size);
 		file_info->EndOfFile = S_ISDIR(stat.mode) ? 0 : cpu_to_le64(stat.size);
@@ -8182,6 +8247,9 @@ static int get_file_attribute_tag_info(struct smb2_query_info_rsp *rsp,
 				       struct ksmbd_file *fp, void *rsp_org)
 {
 	struct smb2_file_attr_tag_info *file_info;
+	void *data;
+	u32 tag, len;
+	int ret;
 
 	if (!(fp->daccess & FILE_READ_ATTRIBUTES_LE)) {
 		pr_err("no right to read the attributes : 0x%x\n",
@@ -8189,9 +8257,22 @@ static int get_file_attribute_tag_info(struct smb2_query_info_rsp *rsp,
 		return -EACCES;
 	}
 
+	ret = ksmbd_vfs_get_rp_xattr(file_mnt_idmap(fp->filp),
+				     fp->filp->f_path.dentry, &tag, &data, &len);
+	if (!ret)
+		kfree(data);
+	else if (ret == -ENODATA || ret == -EOPNOTSUPP)
+		tag = le32_to_cpu(smb2_get_reparse_tag_special_file(file_inode(fp->filp)->i_mode));
+	else
+		return ret;
+
 	file_info = (struct smb2_file_attr_tag_info *)rsp->Buffer;
 	file_info->FileAttributes = fp->f_ci->m_fattr;
-	file_info->ReparseTag = 0;
+	if (tag)
+		file_info->FileAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	else
+		file_info->FileAttributes &= ~FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	file_info->ReparseTag = cpu_to_le32(tag);
 	rsp->OutputBufferLength =
 		cpu_to_le32(sizeof(struct smb2_file_attr_tag_info));
 	return 0;
@@ -8211,6 +8292,8 @@ static int find_file_posix_info(struct ksmbd_work *work,
 	char *filename;
 	__le16 *utf16_name;
 	__le32 *filename_len;
+	umode_t posix_mode;
+	u32 reparse_tag;
 	size_t name_bytes;
 	u64 time;
 	int fixed_len = sizeof(struct smb311_posix_qinfo) + 32 + sizeof(__le32);
@@ -8223,6 +8306,10 @@ static int find_file_posix_info(struct ksmbd_work *work,
 	}
 
 	ret = get_file_allocation_stat(fp, &stat);
+	if (ret)
+		return ret;
+	ret = ksmbd_vfs_get_reparse_info(idmap, fp->filp->f_path.dentry,
+					&reparse_tag, &posix_mode);
 	if (ret)
 		return ret;
 	max_len = smb2_calc_max_out_buf_len(work,
@@ -8277,30 +8364,12 @@ static int find_file_posix_info(struct ksmbd_work *work,
 		file_info->AllocationSize = cpu_to_le64((u64)seof);
 	}
 	file_info->HardLinks = cpu_to_le32(stat.nlink);
-	file_info->Mode = cpu_to_le32(stat.mode & 07777);
-	switch (stat.mode & S_IFMT) {
-	case S_IFDIR:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_DIR << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFLNK:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_SYMLINK << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFCHR:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_CHARDEV << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFBLK:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_BLKDEV << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFIFO:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_FIFO << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFSOCK:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_SOCKET << POSIX_FILETYPE_SHIFT);
-	}
+	file_info->Mode = smb2_get_posix_mode(posix_mode);
 
 	file_info->DeviceId = cpu_to_le32(stat.dev);
 	file_info->Zero = 0;
-	file_info->ReparseTag = smb2_get_reparse_tag_special_file(stat.mode);
+	file_info->ReparseTag = cpu_to_le32(reparse_tag);
+	file_info->DosAttributes &= ~FILE_ATTRIBUTE_REPARSE_POINT_LE;
 	if (file_info->ReparseTag)
 		file_info->DosAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 
@@ -8561,7 +8630,8 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
 			FILE_UNICODE_ON_DISK |
 			FILE_FILE_COMPRESSION |
 			FILE_SUPPORTS_SPARSE_FILES |
-			FILE_SUPPORTS_BLOCK_REFCOUNTING;
+			FILE_SUPPORTS_BLOCK_REFCOUNTING |
+			FILE_SUPPORTS_REPARSE_POINTS;
 
 		err = vfs_fileattr_get(path.dentry, &fa);
 		/*
@@ -9420,15 +9490,17 @@ int smb2_close(struct ksmbd_work *work)
 
 		ret = vfs_getattr(&fp->filp->f_path, &stat, STATX_BASIC_STATS,
 				  AT_STATX_SYNC_AS_STAT);
+		if (!ret)
+			ret = smb2_get_file_attributes(fp, &rsp->Attributes);
 		if (ret) {
 			ksmbd_fd_put(work, fp);
+			err = ret;
 			goto out;
 		}
 
 		rsp->Flags = SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB;
 		rsp->AllocationSize = cpu_to_le64(fp->allocation_size);
 		rsp->EndOfFile = cpu_to_le64(stat.size);
-		rsp->Attributes = fp->f_ci->m_fattr;
 		rsp->CreationTime = cpu_to_le64(fp->create_time);
 		time = ksmbd_UnixTimeToNT(stat.atime);
 		rsp->LastAccessTime = cpu_to_le64(time);
@@ -9663,7 +9735,7 @@ static int set_file_basic_info(struct ksmbd_file *fp,
 	struct inode *inode;
 	struct mnt_idmap *idmap;
 	__le32 attrs_mask = FILE_ATTRIBUTE_DIRECTORY_LE |
-		FILE_ATTRIBUTE_COMPRESSED_LE;
+		FILE_ATTRIBUTE_COMPRESSED_LE | FILE_ATTRIBUTE_REPARSE_POINT_LE;
 	int rc = 0;
 
 	guard(rwsem_read)(&ksmbd_reparse_sem);
@@ -9674,6 +9746,17 @@ static int set_file_basic_info(struct ksmbd_file *fp,
 	filp = fp->filp;
 	inode = file_inode(filp);
 	idmap = file_mnt_idmap(filp);
+
+	if (file_info->Attributes) {
+		umode_t mode;
+		u32 reparse_tag;
+
+		rc = ksmbd_vfs_get_reparse_info(idmap, filp->f_path.dentry,
+						&reparse_tag, &mode);
+		if (rc)
+			return rc;
+		smb2_update_reparse_attributes(fp, reparse_tag);
+	}
 
 	if (file_info->CreationTime)
 		fp->create_time = le64_to_cpu(file_info->CreationTime);
@@ -9703,7 +9786,7 @@ static int set_file_basic_info(struct ksmbd_file *fp,
 
 		if (!(S_ISDIR(inode->i_mode) && file_info->Attributes == FILE_ATTRIBUTE_NORMAL_LE))
 			fp->f_ci->m_fattr =
-				(file_info->Attributes & ~FILE_ATTRIBUTE_COMPRESSED_LE) |
+				(file_info->Attributes & ~attrs_mask) |
 				(fp->f_ci->m_fattr & attrs_mask);
 	}
 
@@ -12592,8 +12675,10 @@ static int smb2_set_reparse_point(struct ksmbd_work *work, u64 id,
 				     le32_to_cpu(reparse_ptr->ReparseTag),
 				     reparse_ptr->DataBuffer,
 				     le16_to_cpu(reparse_ptr->ReparseDataLength));
-	if (!ret)
+	if (!ret) {
 		fp->is_reparse = true;
+		smb2_update_reparse_attributes(fp, le32_to_cpu(reparse_ptr->ReparseTag));
+	}
 out:
 	ksmbd_fd_put(work, fp);
 	return ret;
@@ -12643,8 +12728,10 @@ static int smb2_delete_reparse_point(struct ksmbd_work *work, u64 id,
 	if (!ret)
 		ret = ksmbd_vfs_remove_rp_xattr(file_mnt_idmap(fp->filp),
 						&fp->filp->f_path);
-	if (!ret)
+	if (!ret) {
 		fp->is_reparse = false;
+		smb2_update_reparse_attributes(fp, 0);
+	}
 out:
 	ksmbd_fd_put(work, fp);
 	return ret;
