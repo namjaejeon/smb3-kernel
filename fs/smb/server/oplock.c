@@ -2532,8 +2532,11 @@ void create_disk_id_rsp_buf(char *cc, __u64 file_id, __u64 vol_id)
  * create_posix_rsp_buf() - create posix extension context
  * @cc:	buffer to create posix on posix response
  * @fp: ksmbd file pointer
+ * @reparse_tag: tag used for the CREATE response
+ * @posix_mode: mode derived from the same reparse metadata
  */
-void create_posix_rsp_buf(char *cc, struct ksmbd_file *fp)
+void create_posix_rsp_buf(char *cc, struct ksmbd_file *fp, u32 reparse_tag,
+			  umode_t posix_mode)
 {
 	struct create_posix_rsp *buf;
 	struct inode *inode = file_inode(fp->filp);
@@ -2572,27 +2575,8 @@ void create_posix_rsp_buf(char *cc, struct ksmbd_file *fp)
 	buf->Name[15] = 0x7C;
 
 	buf->nlink = cpu_to_le32(inode->i_nlink);
-	buf->reparse_tag = smb2_get_reparse_tag_special_file(inode->i_mode);
-	buf->mode = cpu_to_le32(inode->i_mode & 07777);
-	switch (inode->i_mode & S_IFMT) {
-	case S_IFDIR:
-		buf->mode |= cpu_to_le32(POSIX_TYPE_DIR << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFLNK:
-		buf->mode |= cpu_to_le32(POSIX_TYPE_SYMLINK << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFCHR:
-		buf->mode |= cpu_to_le32(POSIX_TYPE_CHARDEV << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFBLK:
-		buf->mode |= cpu_to_le32(POSIX_TYPE_BLKDEV << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFIFO:
-		buf->mode |= cpu_to_le32(POSIX_TYPE_FIFO << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFSOCK:
-		buf->mode |= cpu_to_le32(POSIX_TYPE_SOCKET << POSIX_FILETYPE_SHIFT);
-	}
+	buf->reparse_tag = cpu_to_le32(reparse_tag);
+	buf->mode = smb2_get_posix_mode(posix_mode);
 	/*
 	 * SidBuffer(44) contain two sids(Domain sid(28), UNIX group sid(16)).
 	 * Domain sid(28) = revision(1) + num_subauth(1) + authority(6) +
