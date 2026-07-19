@@ -512,3 +512,67 @@ int ndr_decode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 	ret = ndr_read_bytes(n, acl->sd_buf, acl->sd_size);
 	return ret;
 }
+
+/**
+ * ndr_encode_rp() - encode reparse point metadata into an NDR blob
+ * @n: NDR context receiving the allocated encoded blob
+ * @rp: reparse point metadata to encode
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ndr_encode_rp(struct ndr *n, struct xattr_rp *rp)
+{
+	int ret;
+
+	n->offset = 0;
+	n->length = 1024;
+	n->data = kzalloc(n->length, KSMBD_DEFAULT_GFP);
+	if (!n->data)
+		return -ENOMEM;
+
+	ret = ndr_write_int16(n, rp->version);
+	if (ret)
+		return ret;
+	ret = ndr_write_int32(n, rp->tag);
+	if (ret)
+		return ret;
+	ret = ndr_write_int16(n, rp->hash_type);
+	if (ret)
+		return ret;
+	ret = ndr_write_bytes(n, rp->hash, XATTR_RP_HASH_SIZE);
+	if (ret || !rp->rp_size)
+		return ret;
+	return ndr_write_bytes(n, rp->rp_buf, rp->rp_size);
+}
+
+/**
+ * ndr_decode_rp() - decode reparse point metadata from an NDR blob
+ * @n: NDR context containing the encoded blob
+ * @rp: destination for decoded reparse point metadata
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ndr_decode_rp(struct ndr *n, struct xattr_rp *rp)
+{
+	int ret;
+
+	n->offset = 0;
+	ret = ndr_read_int16(n, &rp->version);
+	if (ret || rp->version != 1)
+		return ret ?: -EINVAL;
+	ret = ndr_read_int32(n, &rp->tag);
+	if (ret)
+		return ret;
+	ret = ndr_read_int16(n, &rp->hash_type);
+	if (ret)
+		return ret;
+	ret = ndr_read_bytes(n, rp->hash, XATTR_RP_HASH_SIZE);
+	if (ret)
+		return ret;
+	rp->rp_size = n->length - n->offset;
+	if (!rp->rp_size)
+		return 0;
+	rp->rp_buf = kmemdup(n->data + n->offset, rp->rp_size,
+				 KSMBD_DEFAULT_GFP);
+	return rp->rp_buf ? 0 : -ENOMEM;
+}

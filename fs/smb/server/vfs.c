@@ -1635,6 +1635,95 @@ out_free:
 	return rc;
 }
 
+/**
+ * ksmbd_vfs_set_rp_xattr() - store authenticated reparse point metadata
+ * @idmap: mount idmapping for the target
+ * @path: backing inode path
+ * @tag: reparse tag in host byte order
+ * @data: tag-specific reparse payload
+ * @len: payload size in bytes
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ksmbd_vfs_set_rp_xattr(struct mnt_idmap *idmap, const struct path *path,
+			   u32 tag, const void *data, u32 len)
+{
+	struct ndr ndr = { };
+	struct xattr_rp rp = {
+		.version = 1,
+		.tag = tag,
+		.rp_buf = (void *)data,
+		.rp_size = len,
+		.hash_type = XATTR_RP_HASH_TYPE_SHA256,
+	};
+	int ret;
+
+	sha256(data ?: "", len, rp.hash);
+	ret = ndr_encode_rp(&ndr, &rp);
+	if (!ret)
+		ret = ksmbd_vfs_setxattr(idmap, path, XATTR_NAME_RP, ndr.data,
+					 ndr.offset, 0, true);
+	kfree(ndr.data);
+	return ret;
+}
+
+/**
+ * ksmbd_vfs_get_rp_xattr() - load and authenticate reparse point metadata
+ * @idmap: mount idmapping for the target
+ * @dentry: backing inode dentry
+ * @tag: returned reparse tag
+ * @data: returned allocated reparse payload
+ * @len: returned payload size
+ *
+ * Return: 0 on success, -ENODATA when absent, or another negative error.
+ */
+int ksmbd_vfs_get_rp_xattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			   u32 *tag, void **data, u32 *len)
+{
+	struct ndr ndr;
+	struct xattr_rp rp = { };
+	u8 hash[XATTR_RP_HASH_SIZE] = { };
+	int ret;
+
+	ret = ksmbd_vfs_getxattr(idmap, dentry, XATTR_NAME_RP, &ndr.data);
+	if (ret <= 0)
+		return ret ?: -ENODATA;
+	ndr.length = ret;
+	ret = ndr_decode_rp(&ndr, &rp);
+	kfree(ndr.data);
+	if (ret)
+		return ret;
+	if (rp.hash_type != XATTR_RP_HASH_TYPE_SHA256) {
+		ret = -EINVAL;
+		goto out;
+	}
+	sha256(rp.rp_buf ?: "", rp.rp_size, hash);
+	if (memcmp(hash, rp.hash, sizeof(hash))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	*tag = rp.tag;
+	*data = rp.rp_buf;
+	*len = rp.rp_size;
+	return 0;
+out:
+	kfree(rp.rp_buf);
+	return ret;
+}
+
+/**
+ * ksmbd_vfs_remove_rp_xattr() - remove reparse point metadata
+ * @idmap: mount idmapping for the target
+ * @path: backing inode path
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ksmbd_vfs_remove_rp_xattr(struct mnt_idmap *idmap,
+			      const struct path *path)
+{
+	return ksmbd_vfs_remove_xattr(idmap, path, XATTR_NAME_RP, true);
+}
+
 int ksmbd_vfs_set_dos_attrib_xattr(struct mnt_idmap *idmap,
 				   const struct path *path,
 				   struct xattr_dos_attrib *da,

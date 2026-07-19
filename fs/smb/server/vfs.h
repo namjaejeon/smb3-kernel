@@ -161,6 +161,12 @@ int ksmbd_vfs_get_sd_xattr(struct ksmbd_conn *conn,
 			   struct mnt_idmap *idmap,
 			   struct dentry *dentry,
 			   struct smb_ntsd **pntsd);
+int ksmbd_vfs_set_rp_xattr(struct mnt_idmap *idmap, const struct path *path,
+			   u32 tag, const void *data, u32 len);
+int ksmbd_vfs_get_rp_xattr(struct mnt_idmap *idmap, struct dentry *dentry,
+			   u32 *tag, void **data, u32 *len);
+int ksmbd_vfs_remove_rp_xattr(struct mnt_idmap *idmap,
+			      const struct path *path);
 int ksmbd_vfs_set_dos_attrib_xattr(struct mnt_idmap *idmap,
 				   const struct path *path,
 				   struct xattr_dos_attrib *da,
