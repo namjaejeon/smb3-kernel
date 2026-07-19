@@ -1318,6 +1318,80 @@ int ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
 }
 
 /**
+ * ksmbd_vfs_has_dotdot() - test a client pathname for dot-dot components
+ * @path: slash-separated pathname
+ *
+ * Return: true when an exact ".." component is present.
+ */
+static bool ksmbd_vfs_has_dotdot(const char *path)
+{
+	const char *component = path;
+
+	while (*component) {
+		const char *end;
+
+		while (*component == '/')
+			component++;
+		if (!*component)
+			break;
+		end = strchrnul(component, '/');
+		if (end - component == 2 && component[0] == '.' &&
+		    component[1] == '.')
+			return true;
+		component = end;
+	}
+	return false;
+}
+
+/**
+ * ksmbd_vfs_kern_path_wide() - resolve an explicitly enabled wide link
+ * @work: SMB request work item
+ * @filepath: share-relative client pathname
+ * @path: returned resolved path
+ * @caseless: retry lookup using case-insensitive component matching
+ * @wide_link: set when the unrestricted symlink fallback was used
+ *
+ * The normal lookup remains constrained beneath the share.  The fallback is
+ * used only after encountering a native symlink and rejects dot-dot supplied
+ * by the client before allowing that symlink to leave the share.
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *filepath,
+			     struct path *path, bool caseless,
+			     bool *wide_link)
+{
+	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	char *fullpath;
+	int err;
+
+	*wide_link = false;
+	err = ksmbd_vfs_kern_path(work, filepath, LOOKUP_FOLLOW,
+				  path, caseless);
+	if (!err)
+		return 0;
+	if (err != -EXDEV)
+		return err;
+
+	/* LOOKUP_BENEATH protected the first lookup.  The fallback cannot use
+	 * it because following the administrator-created symlink may leave the
+	 * share, so reject traversal supplied directly by the SMB client first.
+	 */
+	if (ksmbd_vfs_has_dotdot(filepath))
+		return -EACCES;
+
+	fullpath = kasprintf(KSMBD_DEFAULT_GFP, "%s/%s",
+			     share_conf->path, filepath);
+	if (!fullpath)
+		return -ENOMEM;
+	err = kern_path(fullpath, LOOKUP_FOLLOW, path);
+	kfree(fullpath);
+	if (!err)
+		*wide_link = true;
+	return err;
+}
+
+/**
  * ksmbd_vfs_kern_path_start_removing() - lookup a file and get path info prior to removal
  * @work:		work
  * @filepath:		file path that is relative to share

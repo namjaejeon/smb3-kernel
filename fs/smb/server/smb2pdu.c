@@ -4147,6 +4147,7 @@ int smb2_open(struct ksmbd_work *work)
 	char *name = NULL;
 	char *stream_name = NULL;
 	bool file_present = false, created = false, already_permitted = false;
+	bool wide_link = false;
 	bool reparse_point = false;
 	int share_ret, need_truncate = 0;
 	u64 time, alloc_size = 0;
@@ -4430,11 +4431,17 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out2;
 	}
 	if (!(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE) &&
-	    test_share_config_flag(share, KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS))
-		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_FOLLOW, &path, 1);
-	else
+	    test_share_config_flag(share, KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS)) {
+		if (test_share_config_flag(share, KSMBD_SHARE_FLAG_WIDE_LINKS))
+			rc = ksmbd_vfs_kern_path_wide(work, name, &path, 1,
+						      &wide_link);
+		else
+			rc = ksmbd_vfs_kern_path(work, name, LOOKUP_FOLLOW,
+						 &path, 1);
+	} else {
 		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
 					 &path, 1);
+	}
 	if (!rc)
 		file_present = true;
 	if (rc == -ENOTDIR) {
@@ -4489,6 +4496,18 @@ int smb2_open(struct ksmbd_work *work)
 		rsp->hdr.Status = STATUS_STOPPED_ON_SYMLINK;
 		rc = -ELOOP;
 		goto err_out;
+	}
+	if (!rc && wide_link) {
+		__le32 wide_daccess =
+			smb_map_generic_desired_access(req->DesiredAccess);
+
+		if (req->CreateDisposition != FILE_OPEN_LE ||
+		    req->CreateOptions & FILE_DELETE_ON_CLOSE_LE ||
+		    wide_daccess & (FILE_WRITE_DESIRE_ACCESS_LE | FILE_DELETE_LE |
+				    FILE_WRITE_DAC_LE | FILE_WRITE_OWNER_LE)) {
+			rc = -EACCES;
+			goto err_out;
+		}
 	}
 	/*
 	 * A durable handle opened with delete-on-close is preserved across a
