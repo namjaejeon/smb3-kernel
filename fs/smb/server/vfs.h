@@ -91,7 +91,7 @@ int ksmbd_vfs_stream_truncate(struct ksmbd_file *fp, loff_t newsize);
 int ksmbd_vfs_fsync(struct ksmbd_work *work, u64 fid, u64 p_id);
 int ksmbd_vfs_remove_file(struct ksmbd_work *work, const struct path *path);
 int ksmbd_vfs_link(struct ksmbd_work *work,
-		   const char *oldname, const char *newname);
+		   struct ksmbd_file *fp, const char *newname);
 int ksmbd_vfs_getattr(const struct path *path, struct kstat *stat);
 int ksmbd_vfs_rename(struct ksmbd_work *work, struct ksmbd_file *old_fp,
 			 char *newname, int flags);
@@ -133,6 +133,9 @@ int ksmbd_vfs_remove_xattr(struct mnt_idmap *idmap,
 int ksmbd_vfs_kern_path(struct ksmbd_work *work, char *name,
 			unsigned int flags,
 			struct path *path, bool caseless);
+int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *name,
+			     struct path *path, bool caseless,
+			     bool *wide_link);
 int ksmbd_vfs_kern_path_start_removing(struct ksmbd_work *work, char *name,
 				       unsigned int flags,
 				       struct path *path, bool caseless);

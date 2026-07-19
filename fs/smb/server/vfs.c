@@ -981,28 +981,23 @@ out_err:
 /**
  * ksmbd_vfs_link() - vfs helper for creating smb hardlink
  * @work:	work
- * @oldname:	source file name
+ * @fp:		source handle
  * @newname:	hardlink name that is relative to share
  *
  * Return:	0 on success, otherwise error
  */
-int ksmbd_vfs_link(struct ksmbd_work *work, const char *oldname,
+int ksmbd_vfs_link(struct ksmbd_work *work, struct ksmbd_file *fp,
 		   const char *newname)
 {
-	struct path oldpath, newpath;
+	const struct path *oldpath = &fp->filp->f_path;
+	struct path newpath;
 	struct dentry *dentry;
 	int err;
 
+	if (fp->is_wide_link)
+		return -EACCES;
 	if (ksmbd_override_fsids(work))
 		return -ENOMEM;
-
-	scoped_with_init_fs()
-		err = kern_path(oldname, LOOKUP_NO_SYMLINKS, &oldpath);
-	if (err) {
-		pr_err("cannot get linux path for %s, err = %d\n",
-		       oldname, err);
-		goto out1;
-	}
 
 	dentry = ksmbd_vfs_kern_path_create(work, newname,
 					    LOOKUP_NO_SYMLINKS | LOOKUP_REVAL,
@@ -1010,16 +1005,16 @@ int ksmbd_vfs_link(struct ksmbd_work *work, const char *oldname,
 	if (IS_ERR(dentry)) {
 		err = PTR_ERR(dentry);
 		pr_err("path create err for %s, err %d\n", newname, err);
-		goto out2;
+		goto out1;
 	}
 
 	err = -EXDEV;
-	if (oldpath.mnt != newpath.mnt) {
+	if (oldpath->mnt != newpath.mnt) {
 		pr_err("vfs_link failed err %d\n", err);
 		goto out3;
 	}
 
-	err = vfs_link(oldpath.dentry, mnt_idmap(newpath.mnt),
+	err = vfs_link(oldpath->dentry, mnt_idmap(newpath.mnt),
 		       d_inode(newpath.dentry),
 		       dentry, NULL);
 	if (err)
@@ -1027,8 +1022,6 @@ int ksmbd_vfs_link(struct ksmbd_work *work, const char *oldname,
 
 out3:
 	end_creating_path(&newpath, dentry);
-out2:
-	path_put(&oldpath);
 out1:
 	ksmbd_revert_fsids(work);
 	return err;
@@ -1809,6 +1802,82 @@ int ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
 {
 	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
 				     caseless, false);
+}
+
+/**
+ * ksmbd_vfs_has_dotdot() - test a client pathname for dot-dot components
+ * @path: slash-separated pathname
+ *
+ * Return: true when an exact ".." component is present.
+ */
+static bool ksmbd_vfs_has_dotdot(const char *path)
+{
+	const char *component = path;
+
+	while (*component) {
+		const char *end;
+
+		while (*component == '/')
+			component++;
+		if (!*component)
+			break;
+		end = strchrnul(component, '/');
+		if (end - component == 2 && component[0] == '.' &&
+		    component[1] == '.')
+			return true;
+		component = end;
+	}
+	return false;
+}
+
+/**
+ * ksmbd_vfs_kern_path_wide() - resolve an explicitly enabled wide link
+ * @work: SMB request work item
+ * @filepath: share-relative client pathname
+ * @path: returned resolved path
+ * @caseless: retry lookup using case-insensitive component matching
+ * @wide_link: set when the unrestricted symlink fallback was used
+ *
+ * The normal lookup remains constrained beneath the share.  The fallback is
+ * used only after encountering a native symlink and rejects dot-dot supplied
+ * by the client before allowing that symlink to leave the share.
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *filepath,
+			     struct path *path, bool caseless,
+			     bool *wide_link)
+{
+	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	unsigned int lookup_flags = LOOKUP_FOLLOW;
+	char *fullpath;
+	int err;
+
+	*wide_link = false;
+	err = ksmbd_vfs_kern_path(work, filepath, lookup_flags,
+				  path, caseless);
+	if (!err)
+		return 0;
+	if (err != -EXDEV)
+		return err;
+
+	/* LOOKUP_BENEATH protected the first lookup.  The fallback cannot use
+	 * it because following the administrator-created symlink may leave the
+	 * share, so reject traversal supplied directly by the SMB client first.
+	 */
+	if (ksmbd_vfs_has_dotdot(filepath))
+		return -EACCES;
+
+	fullpath = kasprintf(KSMBD_DEFAULT_GFP, "%s/%s",
+			     share_conf->path, filepath);
+	if (!fullpath)
+		return -ENOMEM;
+	err = ksmbd_vfs_path_lookup(share_conf, fullpath, lookup_flags,
+				    path, false, NULL);
+	kfree(fullpath);
+	if (!err)
+		*wide_link = true;
+	return err;
 }
 
 /**
