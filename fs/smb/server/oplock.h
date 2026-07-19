@@ -136,5 +136,5 @@ int smb2_check_durable_oplock(struct ksmbd_conn *conn,
 			      struct ksmbd_file *fp,
 			      struct lease_ctx_info *lctx,
 			      struct ksmbd_user *user,
-			      char *name);
+			      const char *name);
 #endif /* __KSMBD_OPLOCK_H */

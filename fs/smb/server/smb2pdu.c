@@ -207,23 +207,6 @@ struct ksmbd_symlink_reparse_data {
 	u8 PathBuffer[];
 } __packed;
 
-static u16 smb2_create_trailing_separator_len(const struct smb2_create_req *req)
-{
-	const char *name = (const char *)req + le16_to_cpu(req->NameOffset);
-	unsigned int len = le16_to_cpu(req->NameLength);
-	unsigned int off = len;
-
-	/* Name conversion strips these bytes before reparse prefix inspection. */
-	while (off >= sizeof(__le16)) {
-		u16 c = get_unaligned_le16(name + off - sizeof(__le16));
-
-		if (c != '\\' && c != '/')
-			break;
-		off -= sizeof(__le16);
-	}
-	return len - off;
-}
-
 /**
  * smb2_validate_reparse_data() - validate tag-specific reparse payload
  * @tag: reparse tag in host byte order
@@ -314,6 +297,23 @@ static int smb2_validate_reparse_buffer(const struct reparse_data_buffer *rp,
 	return 0;
 }
 
+static u16 smb2_create_trailing_separator_len(const struct smb2_create_req *req)
+{
+	const char *name = (const char *)req + le16_to_cpu(req->NameOffset);
+	unsigned int len = le16_to_cpu(req->NameLength);
+	unsigned int off = len;
+
+	/* Name conversion strips these bytes before reparse prefix inspection. */
+	while (off >= sizeof(__le16)) {
+		u16 c = get_unaligned_le16(name + off - sizeof(__le16));
+
+		if (c != '\\' && c != '/')
+			break;
+		off -= sizeof(__le16);
+	}
+	return len - off;
+}
+
 /**
  * smb2_set_symlink_err_rsp() - build an SMB symbolic-link error response
  * @work: SMB request work item
@@ -321,22 +321,25 @@ static int smb2_validate_reparse_buffer(const struct reparse_data_buffer *rp,
  * @data: symbolic-link reparse payload
  * @len: size of @data in bytes
  * @unparsed_path_len: UTF-16 byte length following the link component
+ * @stream_suffix_len: UTF-16 byte length of the original stream suffix
  *
  * Return: 0 on success, otherwise a negative error code.
  */
 static int smb2_set_symlink_err_rsp(struct ksmbd_work *work, u32 tag,
 				    const void *data, u32 len,
-				    u16 unparsed_path_len)
+				    u16 unparsed_path_len, u16 stream_suffix_len)
 {
 	struct smb2_err_rsp *err_rsp;
 	struct ksmbd_error_context_rsp *err_ctx = NULL;
 	struct ksmbd_symlink_err_rsp *sym_rsp;
 	size_t error_len, context_len = 0, total_len;
-	u32 unparsed_len = unparsed_path_len;
+	u32 unparsed_len = unparsed_path_len + stream_suffix_len;
 
 	if (tag != IO_REPARSE_TAG_SYMLINK || len < 12 || len > U16_MAX)
 		return -EINVAL;
-	unparsed_len += smb2_create_trailing_separator_len(ksmbd_req_buf_next(work));
+	/* Stream suffixes already include any trailing separators on the wire. */
+	if (!stream_suffix_len)
+		unparsed_len += smb2_create_trailing_separator_len(ksmbd_req_buf_next(work));
 	if (unparsed_len > U16_MAX)
 		return -EINVAL;
 	if (work->next_smb2_rcv_hdr_off)
@@ -366,6 +369,20 @@ static int smb2_set_symlink_err_rsp(struct ksmbd_work *work, u32 tag,
 	sym_rsp->ReparseDataLength = cpu_to_le16(len);
 	sym_rsp->UnparsedPathLength = cpu_to_le16(unparsed_len);
 	memcpy(sym_rsp->ReparseData, data, len);
+	return 0;
+}
+
+static u16 smb2_create_stream_suffix_len(const struct smb2_create_req *req)
+{
+	const char *name = (const char *)req + le16_to_cpu(req->NameOffset);
+	unsigned int len = le16_to_cpu(req->NameLength);
+	unsigned int off;
+
+	/* Preserve colons, stream type and UTF-16 code units before name parsing. */
+	for (off = 0; off + sizeof(__le16) <= len; off += sizeof(__le16)) {
+		if (get_unaligned_le16(name + off) == ':')
+			return len - off;
+	}
 	return 0;
 }
 
@@ -401,17 +418,22 @@ static int smb2_reparse_unparsed_len(struct ksmbd_work *work,
  * smb2_find_reparse_point() - find an intermediate xattr reparse point
  * @work: SMB request work item
  * @name: share-relative pathname
+ * @follow_symlinks: follow native symlinks while inspecting parent components
  * @tag: returned reparse tag
  * @data: returned allocated reparse payload
  * @len: returned payload length
  * @unparsed_len: returned UTF-16 length following the reparse component
+ * @reparse_name_len: returned byte length of the local pathname through the stub
  *
  * Return: 0 when found, -ENODATA when absent, or another negative error.
  */
 static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
-				   u32 *tag, void **data, u32 *len,
-				   u16 *unparsed_len)
+				   bool follow_symlinks, u32 *tag,
+				   void **data, u32 *len,
+				   u16 *unparsed_len, size_t *reparse_name_len)
 {
+	struct ksmbd_share_config *share = work->tcon->share_conf;
+	unsigned int flags = follow_symlinks ? LOOKUP_FOLLOW : LOOKUP_NO_SYMLINKS;
 	char *prefix, *slash, *next;
 	int ret = -ENODATA;
 
@@ -429,8 +451,15 @@ static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
 		}
 		*slash = '\0';
 		if (*prefix) {
-			ret = ksmbd_vfs_kern_path(work, prefix, LOOKUP_NO_SYMLINKS,
-						  &path, 1);
+			if (follow_symlinks &&
+			    test_share_config_flag(share, KSMBD_SHARE_FLAG_WIDE_LINKS)) {
+				bool wide_link;
+
+				ret = ksmbd_vfs_kern_path_wide(work, prefix, &path,
+							       1, &wide_link, true);
+			} else {
+				ret = ksmbd_vfs_kern_path(work, prefix, flags, &path, 1);
+			}
 			if (ret) {
 				/* Leave ordinary lookup failures to the complete path lookup. */
 				if (ret == -ENOENT || ret == -ENOTDIR ||
@@ -449,6 +478,7 @@ static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
 			if (!ret) {
 				const char *suffix = name + (slash - prefix);
 
+				*reparse_name_len = slash - prefix;
 				ret = smb2_reparse_unparsed_len(work, suffix,
 								unparsed_len);
 				if (ret) {
@@ -525,14 +555,15 @@ static int smb2_find_posix_symlink(struct ksmbd_work *work, const char *name,
 /**
  * smb2_set_posix_symlink_err_rsp() - describe a native symlink to an SMB client
  * @work: SMB request work item
- * @dentry: native symlink dentry
+ * @path: native symlink path
  * @unparsed_len: UTF-16 byte length following the symlink component
+ * @stream_suffix_len: UTF-16 byte length of the original stream suffix
  *
  * Return: 0 on success, otherwise a negative error code.
  */
 static int smb2_set_posix_symlink_err_rsp(struct ksmbd_work *work,
-					  struct dentry *dentry,
-					  u16 unparsed_len)
+					  const struct path *path,
+					  u16 unparsed_len, u16 stream_suffix_len)
 {
 	struct ksmbd_symlink_reparse_data *sym;
 	struct delayed_call done = {};
@@ -541,11 +572,17 @@ static int smb2_set_posix_symlink_err_rsp(struct ksmbd_work *work,
 	size_t target_len, data_len;
 	int utf16_len, ret;
 
-	link = ksmbd_vfs_get_link(dentry, &done);
+	link = ksmbd_vfs_get_link(path->dentry, &done);
 	if (IS_ERR(link))
 		return PTR_ERR(link);
-	target = kstrdup(link, KSMBD_DEFAULT_GFP);
+	if (*link == '/')
+		target = ksmbd_vfs_rebase_symlink(path,
+						  &work->tcon->share_conf->vfs_path, link);
+	else
+		target = kstrdup(link, KSMBD_DEFAULT_GFP);
 	do_delayed_call(&done);
+	if (IS_ERR(target))
+		return PTR_ERR(target);
 	if (!target)
 		return -ENOMEM;
 	target_len = strlen(target);
@@ -559,7 +596,7 @@ static int smb2_set_posix_symlink_err_rsp(struct ksmbd_work *work,
 		kfree(target);
 		return -ENOMEM;
 	}
-	sym->Flags = target[0] == '/' ? 0 : cpu_to_le32(SYMLINK_FLAG_RELATIVE);
+	sym->Flags = cpu_to_le32(SYMLINK_FLAG_RELATIVE);
 	ksmbd_conv_path_to_windows(target);
 	utf16_len = smbConvertToUTF16((__le16 *)sym->PathBuffer, target,
 				      target_len, work->conn->local_nls, 0);
@@ -572,9 +609,84 @@ static int smb2_set_posix_symlink_err_rsp(struct ksmbd_work *work,
 	sym->SubstituteNameLength = cpu_to_le16(target_len);
 	sym->PrintNameLength = cpu_to_le16(target_len);
 	ret = smb2_set_symlink_err_rsp(work, IO_REPARSE_TAG_SYMLINK, sym,
-				       sizeof(*sym) + target_len, unparsed_len);
+				       sizeof(*sym) + target_len, unparsed_len,
+				       stream_suffix_len);
 	kfree(sym);
 	return ret;
+}
+
+static int smb2_set_path_symlink_err_rsp(struct ksmbd_work *work, char *name,
+					 u16 stream_suffix_len)
+{
+	struct path path;
+	u16 unparsed_len;
+	int ret;
+
+	ret = smb2_find_posix_symlink(work, name, &path, &unparsed_len);
+	if (ret)
+		return ret;
+	ret = smb2_set_posix_symlink_err_rsp(work, &path, unparsed_len,
+					     stream_suffix_len);
+	path_put(&path);
+	return ret;
+}
+
+static int smb2_create_symlink_error(struct ksmbd_work *work,
+				    struct smb2_hdr *rsp, char *name,
+				    u16 stream_suffix_len, int error)
+{
+	int ret;
+
+	ret = smb2_set_path_symlink_err_rsp(work, name, stream_suffix_len);
+	if (!ret) {
+		rsp->Status = STATUS_STOPPED_ON_SYMLINK;
+		return -ELOOP;
+	}
+	if (ret != -ENOENT && ret != -ELOOP)
+		return ret;
+	return error;
+}
+
+/*
+ * A native alias can change the parent of a relative reparse target. Return
+ * that alias first so the client retries from the correct parent. Inspect
+ * only the parsed prefix: the stub may not permit looking up the suffix.
+ */
+static int smb2_set_stored_symlink_err_rsp(struct ksmbd_work *work, char *name,
+					   size_t reparse_name_len,
+					   const void *data, u32 len,
+					   u16 unparsed_len, u16 stream_suffix_len)
+{
+	char *prefix __free(kfree) = NULL;
+	const struct ksmbd_symlink_reparse_data *sym = data;
+	struct path path;
+	u16 alias_unparsed_len;
+	int ret;
+
+	if (len < sizeof(*sym))
+		return -EINVAL;
+	if (sym->Flags & cpu_to_le32(SYMLINK_FLAG_RELATIVE)) {
+		prefix = kstrndup(name, reparse_name_len, KSMBD_DEFAULT_GFP);
+		if (!prefix)
+			return -ENOMEM;
+		ret = smb2_find_posix_symlink(work, prefix, &path, &alias_unparsed_len);
+		if (!ret) {
+			if (alias_unparsed_len > U16_MAX - unparsed_len) {
+				ret = -EINVAL;
+			} else {
+				alias_unparsed_len += unparsed_len;
+				ret = smb2_set_posix_symlink_err_rsp(work, &path,
+								     alias_unparsed_len,
+								     stream_suffix_len);
+			}
+			path_put(&path);
+			return ret;
+		}
+		if (ret != -ENOENT)
+			return ret;
+	}
+	return smb2_set_symlink_err_rsp(work, IO_REPARSE_TAG_SYMLINK, data, len,
+				      unparsed_len, stream_suffix_len);
 }
 
 /**
@@ -1877,6 +1989,69 @@ static int smb2_get_dos_mode(struct kstat *stat, int attribute)
 	return attr;
 }
 
+/**
+ * smb2_symlink_target_is_dir() - detect a directory-style native symlink
+ * @dentry: native symlink dentry
+ *
+ * Native SMB symlinks do not carry a directory/file type in their reparse
+ * payload.  The Linux SMB client uses FILE_ATTRIBUTE_DIRECTORY from the
+ * OPEN_REPARSE_POINT response to validate a target with a trailing slash.
+ * Inspect only the link text here; do not resolve the target or cross the
+ * share boundary while following symlinks is disabled.
+ *
+ * Return: true when the link text ends in a slash, otherwise false.
+ */
+static bool smb2_symlink_target_is_dir(struct dentry *dentry)
+{
+	struct delayed_call done = {};
+	const char *target;
+	bool is_dir = false;
+	size_t len;
+
+	target = ksmbd_vfs_get_link(dentry, &done);
+	if (!IS_ERR(target)) {
+		len = strlen(target);
+		is_dir = len && target[len - 1] == '/';
+	}
+	do_delayed_call(&done);
+
+	return is_dir;
+}
+
+static bool smb2_is_dir(struct dentry *dentry)
+{
+	return d_is_dir(dentry) ||
+		(d_is_symlink(dentry) && smb2_symlink_target_is_dir(dentry));
+}
+
+/**
+ * smb2_should_follow_final_symlink() - classify a data open
+ * @req: SMB2 CREATE request
+ *
+ * Attribute and other metadata operations must be able to inspect the
+ * terminal symlink itself.  Data opens, on the other hand, should resolve
+ * the terminal symlink when following symlinks is enabled for the share.
+ *
+ * Return: true when the final symlink should be followed.
+ */
+static bool smb2_should_follow_final_symlink(const struct smb2_create_req *req)
+{
+	__le32 data_access = FILE_READ_DATA_LE | FILE_WRITE_DATA_LE |
+		FILE_APPEND_DATA_LE | FILE_EXECUTE_LE | FILE_MAXIMAL_ACCESS_LE;
+
+	if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)
+		return false;
+
+	return smb_map_generic_desired_access(req->DesiredAccess) & data_access;
+}
+
+static bool smb2_wide_link_access_allowed(__le32 daccess)
+{
+	return !(daccess & (FILE_WRITE_DESIRE_ACCESS_LE | FILE_DELETE_LE |
+			    FILE_DELETE_CHILD_LE | FILE_WRITE_DAC_LE |
+			    FILE_WRITE_OWNER_LE | FILE_ACCESS_SYSTEM_SECURITY_LE));
+}
+
 static int smb2_check_reparse_data_access(struct ksmbd_file *fp)
 {
 	void *data;
@@ -1919,14 +2094,13 @@ static int smb2_get_file_attributes(struct ksmbd_file *fp, __le32 *attributes)
 
 static void smb2_update_reparse_attributes(struct ksmbd_file *fp, u32 tag)
 {
-	struct inode *inode = file_inode(fp->filp);
 	__le32 attributes = fp->f_ci->m_fattr;
 
 	attributes &= ~(FILE_ATTRIBUTE_REPARSE_POINT_LE |
 			FILE_ATTRIBUTE_DIRECTORY_LE);
 	if (tag)
 		attributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
-	if (S_ISDIR(inode->i_mode))
+	if (smb2_is_dir(fp->filp->f_path.dentry))
 		attributes |= FILE_ATTRIBUTE_DIRECTORY_LE;
 	fp->f_ci->m_fattr = attributes;
 }
@@ -4018,7 +4192,10 @@ static noinline int smb2_set_stream_name_xattr(const struct path *path,
 		return rc;
 
 	if (fp->cdoption == FILE_OPEN_LE) {
-		if (!strcmp(stream_name, "AFP_AfpInfo") &&
+		if (!fp->is_wide_link &&
+		    test_tree_conn_flag(fp->tcon, KSMBD_TREE_CONN_FLAG_WRITABLE) &&
+		    (fp->daccess & (FILE_WRITE_DATA_LE | FILE_WRITE_EA_LE)) &&
+		    !strcmp(stream_name, "AFP_AfpInfo") &&
 		    test_share_config_flag(fp->tcon->share_conf,
 					   KSMBD_SHARE_FLAG_TIME_MACHINE)) {
 			/*
@@ -4199,7 +4376,7 @@ static void smb2_update_xattrs(struct ksmbd_tree_connect *tcon,
 
 static int smb2_creat(struct ksmbd_work *work,
 		      struct path *path, char *name, int open_flags,
-		      umode_t posix_mode, bool is_dir)
+		      umode_t posix_mode, bool is_dir, bool follow_symlinks)
 {
 	struct ksmbd_tree_connect *tcon = work->tcon;
 	struct ksmbd_share_config *share = tcon->share_conf;
@@ -4214,14 +4391,14 @@ static int smb2_creat(struct ksmbd_work *work,
 		ksmbd_debug(SMB, "creating directory\n");
 
 		mode = share_config_directory_mode(share, posix_mode);
-		rc = ksmbd_vfs_mkdir(work, name, mode);
+		rc = ksmbd_vfs_mkdir(work, name, mode, follow_symlinks);
 		if (rc)
 			return rc;
 	} else {
 		ksmbd_debug(SMB, "creating regular file\n");
 
 		mode = share_config_create_mode(share, posix_mode);
-		rc = ksmbd_vfs_create(work, name, mode);
+		rc = ksmbd_vfs_create(work, name, mode, follow_symlinks);
 		if (rc)
 			return rc;
 	}
@@ -4938,7 +5115,12 @@ int smb2_open(struct ksmbd_work *work)
 	int next_off = 0;
 	char *name = NULL;
 	char *stream_name = NULL;
+	char *reconnect_name __free(kfree) = NULL;
+	u16 stream_suffix_len = 0;
 	bool file_present = false, created = false, already_permitted = false;
+	bool wide_link = false;
+	bool follow_final = false;
+	bool follow_symlinks;
 	bool reparse_point = false;
 	bool reparse_locked = false;
 	bool app_instance_id_checked = false, app_instance_closed;
@@ -5026,6 +5208,7 @@ int smb2_open(struct ksmbd_work *work)
 					rc = -EBADF;
 					goto err_out2;
 				}
+				stream_suffix_len = smb2_create_stream_suffix_len(req);
 				rc = parse_stream_name(name, &stream_name, &s_type);
 				if (rc < 0)
 					goto err_out2;
@@ -5248,25 +5431,39 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out2;
 	}
 
+	/* Case-insensitive lookup may rewrite the client's reconnect name. */
+	if (lc) {
+		reconnect_name = kstrdup(name, KSMBD_DEFAULT_GFP);
+		if (!reconnect_name) {
+			rc = -ENOMEM;
+			goto err_out;
+		}
+	}
 	down_read(&ksmbd_reparse_sem);
 	reparse_locked = true;
 resolve_path:
 	file_present = false;
 	maximal_access = 0;
+	wide_link = false;
 	reparse_point = false;
+	follow_final = smb2_should_follow_final_symlink(req);
+	follow_symlinks = !(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE) &&
+		test_share_config_flag(share, KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS);
 	{
 		void *rp_data = NULL;
 		u32 rp_tag, rp_len;
 		u16 unparsed_len;
+		size_t reparse_name_len;
 
 		/* Directory reparse stubs are traversable by the backing VFS. */
-		rc = smb2_find_reparse_point(work, name,
+		rc = smb2_find_reparse_point(work, name, follow_symlinks,
 					     &rp_tag, &rp_data, &rp_len,
-					     &unparsed_len);
+					     &unparsed_len, &reparse_name_len);
 		if (!rc) {
 			if (rp_tag == IO_REPARSE_TAG_SYMLINK) {
-				rc = smb2_set_symlink_err_rsp(work, rp_tag, rp_data,
-							      rp_len, unparsed_len);
+				rc = smb2_set_stored_symlink_err_rsp(work, name, reparse_name_len,
+								     rp_data, rp_len, unparsed_len,
+								     stream_suffix_len);
 				if (!rc) {
 					rsp->hdr.Status = STATUS_STOPPED_ON_SYMLINK;
 					rc = -ELOOP;
@@ -5278,40 +5475,58 @@ resolve_path:
 			kfree(rp_data);
 			goto err_out;
 		}
-		if (rc != -ENODATA)
-			goto err_out;
-	}
-	rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
-				 &path, 1);
-	if (!rc)
-		file_present = true;
-	if (rc == -ELOOP) {
-		struct path symlink_path;
-		u16 unparsed_len;
-
-		rc = smb2_find_posix_symlink(work, name, &symlink_path,
-					     &unparsed_len);
-		if (!rc) {
-			rc = smb2_set_posix_symlink_err_rsp(work,
-							    symlink_path.dentry,
-							    unparsed_len);
-			path_put(&symlink_path);
-			if (rc)
-				goto err_out;
-			rsp->hdr.Status = STATUS_STOPPED_ON_SYMLINK;
-			rc = -ELOOP;
+		if (rc != -ENODATA) {
+			if (rc == -EREMOTE)
+				rc = smb2_create_symlink_error(work, &rsp->hdr,
+							name, stream_suffix_len, rc);
 			goto err_out;
 		}
-		rc = -ELOOP;
+	}
+	if (follow_symlinks) {
+		/* Without LOOKUP_FOLLOW, only the final component remains unresolved. */
+		if (test_share_config_flag(share, KSMBD_SHARE_FLAG_WIDE_LINKS))
+			rc = ksmbd_vfs_kern_path_wide(work, name, &path, 1,
+						      &wide_link, follow_final);
+		else
+			rc = ksmbd_vfs_kern_path(work, name,
+						 follow_final ? LOOKUP_FOLLOW : 0,
+						 &path, 1);
+	} else {
+		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
+					 &path, 1);
+	}
+	if (!rc)
+		file_present = true;
+	if (rc == -ELOOP || (follow_symlinks &&
+	    (rc == -ENOTDIR || rc == -EREMOTE ||
+	     (rc == -ENOENT && (req->CreateDisposition == FILE_OPEN_LE ||
+			       req->CreateDisposition == FILE_OVERWRITE_LE))))) {
+		/* A native link body may traverse a stored stub absent from name. */
+		rc = smb2_create_symlink_error(work, &rsp->hdr, name,
+						stream_suffix_len, rc);
+		if (rc != -ENOENT)
+			goto err_out;
 	}
 	if (!rc && d_is_symlink(path.dentry) &&
 	    !(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE)) {
-		rc = smb2_set_posix_symlink_err_rsp(work, path.dentry, 0);
+		rc = smb2_set_path_symlink_err_rsp(work, name, stream_suffix_len);
 		if (rc)
 			goto err_out;
 		rsp->hdr.Status = STATUS_STOPPED_ON_SYMLINK;
 		rc = -ELOOP;
 		goto err_out;
+	}
+
+	if (!rc && wide_link) {
+		__le32 wide_daccess =
+			smb_map_generic_desired_access(req->DesiredAccess);
+
+		if (req->CreateDisposition != FILE_OPEN_LE ||
+		    req->CreateOptions & FILE_DELETE_ON_CLOSE_LE ||
+		    !smb2_wide_link_access_allowed(wide_daccess)) {
+			rc = -EACCES;
+			goto err_out;
+		}
 	}
 
 	/* Validate takeover before disconnected delete-on-close cleanup. */
@@ -5375,8 +5590,10 @@ resolve_path:
 						rc = -EOPNOTSUPP;
 						goto err_out;
 					}
-					rc = smb2_set_symlink_err_rsp(work, rp_tag,
-								      rp_data, rp_len, 0);
+					rc = smb2_set_stored_symlink_err_rsp(work,
+									     name, strlen(name),
+									     rp_data, rp_len, 0,
+									     stream_suffix_len);
 					kfree(rp_data);
 					if (rc)
 						goto err_out;
@@ -5454,7 +5671,7 @@ resolve_path:
 				rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
 			}
 		} else {
-			if (file_present && S_ISDIR(d_inode(path.dentry)->i_mode) &&
+			if (file_present && smb2_is_dir(path.dentry) &&
 			    !stream_name && s_type == DATA_STREAM) {
 				rc = -EIO;
 				rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
@@ -5472,7 +5689,7 @@ resolve_path:
 	}
 
 	if (file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
-	    S_ISDIR(d_inode(path.dentry)->i_mode) &&
+	    smb2_is_dir(path.dentry) &&
 	    !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
 		ksmbd_debug(SMB, "open() argument is a directory: %s, %x\n",
 			    name, req->CreateOptions);
@@ -5483,7 +5700,7 @@ resolve_path:
 
 	if (file_present && (req->CreateOptions & FILE_DIRECTORY_FILE_LE) &&
 	    !(req->CreateDisposition == FILE_CREATE_LE) &&
-	    !S_ISDIR(d_inode(path.dentry)->i_mode)) {
+	    !smb2_is_dir(path.dentry)) {
 		rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
 		rc = -EIO;
 		goto err_out;
@@ -5535,6 +5752,10 @@ resolve_path:
 		}
 		maximal_access = daccess;
 	}
+	if (wide_link && !smb2_wide_link_access_allowed(daccess)) {
+		rc = -EACCES;
+		goto err_out;
+	}
 
 	open_flags = smb2_create_open_flags(file_present, daccess,
 					    req->CreateDisposition,
@@ -5567,8 +5788,14 @@ resolve_path:
 	if (!file_present) {
 		rc = smb2_creat(work, &path, name, open_flags,
 				posix_ctxt ? posix_mode : (umode_t)-1,
-				req->CreateOptions & FILE_DIRECTORY_FILE_LE);
+				req->CreateOptions & FILE_DIRECTORY_FILE_LE,
+				follow_symlinks);
 		if (rc) {
+			if (rc == -ELOOP || rc == -EEXIST ||
+			    (follow_symlinks && (rc == -ENOENT || rc == -ENOTDIR ||
+					 rc == -EREMOTE)))
+				rc = smb2_create_symlink_error(work, &rsp->hdr,
+								name, stream_suffix_len, rc);
 			if (rc == -ENOENT) {
 				rc = -EIO;
 				rsp->hdr.Status = STATUS_OBJECT_PATH_NOT_FOUND;
@@ -5692,7 +5919,16 @@ resolve_path:
 	fp->daccess = daccess;
 	fp->saccess = req->ShareAccess;
 	fp->coption = req->CreateOptions;
+	fp->filename = no_free_ptr(reconnect_name);
 	fp->is_reparse = reparse_point;
+	fp->is_wide_link = wide_link;
+	if (wide_link) {
+		fp->wide_link_name = kstrdup(name, KSMBD_DEFAULT_GFP);
+		if (!fp->wide_link_name) {
+			rc = -ENOMEM;
+			goto err_out;
+		}
+	}
 
 	/* Set default windows and posix acls if creating new file */
 	if (created) {
@@ -5916,7 +6152,8 @@ resolve_path:
 			 * stream and would otherwise pre-allocate storage on
 			 * the base file's data instead.
 			 */
-			if (!ksmbd_stream_fd(fp) && !fp->is_reparse) {
+			if (!ksmbd_stream_fd(fp) && !fp->is_reparse &&
+			    !fp->is_wide_link) {
 				smb_break_all_levII_oplock(work, fp, 1);
 				scoped_guard(rwsem_read, &ksmbd_reparse_sem) {
 					err = smb2_check_reparse_data_access(fp);
@@ -6293,6 +6530,8 @@ err_out2:
 			rsp->hdr.Status = STATUS_INVALID_PARAMETER;
 		else if (rc == -EOPNOTSUPP && !rsp->hdr.Status)
 			rsp->hdr.Status = STATUS_NOT_SUPPORTED;
+		else if (rc == -EREMOTE)
+			rsp->hdr.Status = STATUS_IO_REPARSE_TAG_NOT_HANDLED;
 		else if ((rc == -EACCES || rc == -ESTALE || rc == -EXDEV) &&
 			 !rsp->hdr.Status) {
 			if (req->DesiredAccess & FILE_ACCESS_SYSTEM_SECURITY_LE)
@@ -6321,7 +6560,7 @@ err_out2:
 		else if (rc == -EAGAIN)
 			rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
 		else if (rc == -ELOOP && !rsp->hdr.Status)
-			rsp->hdr.Status = STATUS_STOPPED_ON_SYMLINK;
+			rsp->hdr.Status = STATUS_ACCESS_DENIED;
 		if (!rsp->hdr.Status)
 			rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
 
@@ -7823,7 +8062,7 @@ static int get_file_standard_info(struct smb2_query_info_rsp *rsp,
 	}
 	sinfo->NumberOfLinks = cpu_to_le32(get_nlink(&stat) - delete_pending);
 	sinfo->DeletePending = delete_pending;
-	sinfo->Directory = S_ISDIR(stat.mode) ? 1 : 0;
+	sinfo->Directory = smb2_is_dir(fp->filp->f_path.dentry);
 	rsp->OutputBufferLength =
 		cpu_to_le32(sizeof(struct smb2_file_standard_info));
 
@@ -7839,6 +8078,21 @@ static void get_file_alignment_info(struct smb2_query_info_rsp *rsp,
 	file_info->AlignmentRequirement = 0;
 	rsp->OutputBufferLength =
 		cpu_to_le32(sizeof(struct smb2_file_alignment_info));
+}
+
+static char *smb2_get_file_name(struct ksmbd_work *work, struct ksmbd_file *fp)
+{
+	char *name;
+
+	if (!fp->wide_link_name)
+		return convert_to_nt_pathname(work->tcon->share_conf, &fp->filp->f_path);
+
+	/* The resolved wide-link target has no name beneath the share root. */
+	name = kasprintf(KSMBD_DEFAULT_GFP, "\\%s", fp->wide_link_name);
+	if (!name)
+		return ERR_PTR(-ENOMEM);
+	ksmbd_conv_path_to_windows(name);
+	return name;
 }
 
 static int get_file_all_info(struct ksmbd_work *work,
@@ -7861,7 +8115,7 @@ static int get_file_all_info(struct ksmbd_work *work,
 		return -EACCES;
 	}
 
-	filename = convert_to_nt_pathname(work->tcon->share_conf, &fp->filp->f_path);
+	filename = smb2_get_file_name(work, fp);
 	if (IS_ERR(filename))
 		return PTR_ERR(filename);
 
@@ -7908,7 +8162,7 @@ static int get_file_all_info(struct ksmbd_work *work,
 	file_info->NumberOfLinks =
 			cpu_to_le32(get_nlink(&stat) - delete_pending);
 	file_info->DeletePending = delete_pending;
-	file_info->Directory = S_ISDIR(stat.mode) ? 1 : 0;
+	file_info->Directory = smb2_is_dir(fp->filp->f_path.dentry);
 	file_info->Pad2 = 0;
 	file_info->IndexNumber = cpu_to_le64(stat.ino);
 	file_info->EASize = 0;
@@ -7997,8 +8251,7 @@ static int get_file_normalized_name_info(struct ksmbd_work *work,
 		return -EOPNOTSUPP;
 	}
 
-	filename = convert_to_nt_pathname(work->tcon->share_conf,
-					  &fp->filp->f_path);
+	filename = smb2_get_file_name(work, fp);
 	if (IS_ERR(filename))
 		return PTR_ERR(filename);
 	if (filename[0] == '\\')
@@ -8348,8 +8601,7 @@ static int find_file_posix_info(struct ksmbd_work *work,
 		rsp->hdr.Status = STATUS_INFO_LENGTH_MISMATCH;
 		return -EINVAL;
 	}
-	filename = convert_to_nt_pathname(work->tcon->share_conf,
-					   &fp->filp->f_path);
+	filename = smb2_get_file_name(work, fp);
 	if (IS_ERR(filename))
 		return PTR_ERR(filename);
 	if (filename[0] == '\\')
@@ -9682,6 +9934,12 @@ static int smb2_rename(struct ksmbd_work *work,
 		if (!rc)
 			rc = ksmbd_vfs_rename(work, fp, new_name, flags);
 	}
+	if (!rc) {
+		spin_lock(&fp->f_lock);
+		if (fp->filename)
+			swap(fp->filename, new_name);
+		spin_unlock(&fp->f_lock);
+	}
 out:
 	kfree(new_name);
 	return rc;
@@ -9690,11 +9948,12 @@ out:
 static int smb2_create_link(struct ksmbd_work *work,
 			    struct ksmbd_share_config *share,
 			    struct smb2_file_link_info *file_info,
-			    unsigned int buf_len, struct file *filp,
+			    unsigned int buf_len, struct ksmbd_file *fp,
 			    struct nls_table *local_nls)
 {
-	char *link_name = NULL, *target_name = NULL, *pathname = NULL;
+	char *link_name = NULL;
 	struct path path;
+	unsigned int lookup_flags = 0;
 	int rc;
 
 	guard(rwsem_read)(&ksmbd_reparse_sem);
@@ -9703,27 +9962,21 @@ static int smb2_create_link(struct ksmbd_work *work,
 		return -EINVAL;
 
 	ksmbd_debug(SMB, "setting FILE_LINK_INFORMATION\n");
-	pathname = kmalloc(PATH_MAX, KSMBD_DEFAULT_GFP);
-	if (!pathname)
-		return -ENOMEM;
+	if (fp->is_wide_link)
+		return -EACCES;
 
 	link_name = smb2_get_name(file_info->FileName,
 				  le32_to_cpu(file_info->FileNameLength),
 				  local_nls);
-	if (IS_ERR(link_name) || S_ISDIR(file_inode(filp)->i_mode)) {
+	if (IS_ERR(link_name) || S_ISDIR(file_inode(fp->filp)->i_mode)) {
 		rc = -EINVAL;
 		goto out;
 	}
 
 	ksmbd_debug(SMB, "link name is %s\n", link_name);
-	target_name = file_path(filp, pathname, PATH_MAX);
-	if (IS_ERR(target_name)) {
-		rc = -EINVAL;
-		goto out;
-	}
-
-	ksmbd_debug(SMB, "target name is %s\n", target_name);
-	rc = ksmbd_vfs_kern_path_start_removing(work, link_name, LOOKUP_NO_SYMLINKS,
+	if (!test_share_config_flag(share, KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS))
+		lookup_flags |= LOOKUP_NO_SYMLINKS;
+	rc = ksmbd_vfs_kern_path_start_removing(work, link_name, lookup_flags,
 						&path, 0);
 	if (rc) {
 		if (rc != -ENOENT)
@@ -9744,14 +9997,11 @@ static int smb2_create_link(struct ksmbd_work *work,
 		if (rc)
 			goto out;
 	}
-	rc = ksmbd_vfs_link(work, target_name, link_name);
-	if (rc)
-		rc = -EINVAL;
+	rc = ksmbd_vfs_link(work, fp, link_name);
 out:
 
 	if (!IS_ERR(link_name))
 		kfree(link_name);
-	kfree(pathname);
 	return rc;
 }
 
@@ -9807,13 +10057,15 @@ static int set_file_basic_info(struct ksmbd_file *fp,
 	}
 
 	if (file_info->Attributes) {
-		if (!S_ISDIR(inode->i_mode) &&
+		bool is_dir = fp->f_ci->m_fattr & FILE_ATTRIBUTE_DIRECTORY_LE;
+
+		if (!is_dir &&
 		    file_info->Attributes & FILE_ATTRIBUTE_DIRECTORY_LE) {
 			pr_err("can't change a file to a directory\n");
 			return -EINVAL;
 		}
 
-		if (!(S_ISDIR(inode->i_mode) && file_info->Attributes == FILE_ATTRIBUTE_NORMAL_LE))
+		if (!(is_dir && file_info->Attributes == FILE_ATTRIBUTE_NORMAL_LE))
 			fp->f_ci->m_fattr =
 				(file_info->Attributes & ~attrs_mask) |
 				(fp->f_ci->m_fattr & attrs_mask);
@@ -10060,6 +10312,8 @@ static int set_file_mode_info(struct ksmbd_file *fp,
 
 	mode = file_info->Mode;
 
+	if (fp->is_wide_link && mode & FILE_DELETE_ON_CLOSE_LE)
+		return -EACCES;
 	if ((mode & ~FILE_MODE_INFO_MASK)) {
 		pr_err("Mode is not valid : 0x%x\n", le32_to_cpu(mode));
 		return -EINVAL;
@@ -10137,7 +10391,7 @@ static int smb2_set_info_file(struct ksmbd_work *work, struct ksmbd_file *fp,
 		}
 
 		return smb2_create_link(work, work->tcon->share_conf, file_info,
-					buf_len, fp->filp,
+					buf_len, fp,
 					work->conn->local_nls);
 	}
 	case FILE_DISPOSITION_INFORMATION:
@@ -10335,6 +10589,14 @@ int smb2_set_info(struct ksmbd_work *work)
 		goto err_out;
 	}
 
+	if (fp->is_wide_link &&
+	    (req->InfoType != SMB2_O_INFO_FILE ||
+	     (req->FileInfoClass != FILE_POSITION_INFORMATION &&
+	      req->FileInfoClass != FILE_MODE_INFORMATION))) {
+		rc = -EACCES;
+		goto err_out;
+	}
+
 	saved_cred = override_creds(fp->filp->f_cred);
 	switch (req->InfoType) {
 	case SMB2_O_INFO_FILE:
@@ -10378,6 +10640,8 @@ err_out:
 	}
 	else if (rc == -EINVAL)
 		rsp->hdr.Status = STATUS_INVALID_PARAMETER;
+	else if (rc == -EREMOTE)
+		rsp->hdr.Status = STATUS_IO_REPARSE_TAG_NOT_HANDLED;
 	else if (rc == -EMSGSIZE)
 		rsp->hdr.Status = STATUS_INFO_LENGTH_MISMATCH;
 	else if (rc == -ENOSPC || rc == -EFBIG)
@@ -11321,6 +11585,10 @@ int smb2_write(struct ksmbd_work *work)
 	if (err) {
 		rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
 		chseq_err = true;
+		goto out;
+	}
+	if (fp->is_wide_link) {
+		err = -EACCES;
 		goto out;
 	}
 
@@ -12696,7 +12964,8 @@ static int smb2_check_reparse_write_access(struct ksmbd_file *fp)
 	const struct cred *saved_cred;
 	int ret;
 
-	if (!(fp->daccess & (FILE_WRITE_DATA_LE | FILE_WRITE_ATTRIBUTES_LE)))
+	if (fp->is_wide_link ||
+	    !(fp->daccess & (FILE_WRITE_DATA_LE | FILE_WRITE_ATTRIBUTES_LE)))
 		return -EACCES;
 
 	saved_cred = override_creds(fp->filp->f_cred);

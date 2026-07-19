@@ -108,6 +108,8 @@ struct ksmbd_file {
 	u64				durable_volatile_id;
 
 	spinlock_t			f_lock;
+	/* Client pathname for durable reconnect, protected by f_lock. */
+	char				*filename;
 
 	struct ksmbd_inode		*f_ci;
 	struct ksmbd_inode		*f_parent_ci;
@@ -133,7 +135,10 @@ struct ksmbd_file {
 	bool				is_quota;
 	bool				attrib_only;
 	bool				is_reparse;
+	bool				is_wide_link;
 	bool				allocation_size_set;
+	/* Share-relative alias retained for wide-link file name queries. */
+	char				*wide_link_name;
 
 	char				client_guid[16];
 	char				create_guid[16];
@@ -279,8 +284,6 @@ void ksmbd_fd_set_delete_pending(struct ksmbd_file *fp);
 void ksmbd_fd_clear_delete_pending(struct ksmbd_file *fp);
 int ksmbd_reopen_durable_fd(struct ksmbd_work *work, struct ksmbd_file *fp);
 int ksmbd_rebind_replay_fd(struct ksmbd_work *work, struct ksmbd_file *fp);
-int ksmbd_validate_name_reconnect(struct ksmbd_share_config *share,
-				  struct ksmbd_file *fp, char *name);
 int ksmbd_init_file_cache(void);
 void ksmbd_exit_file_cache(void);
 #endif /* __VFS_CACHE_H__ */
