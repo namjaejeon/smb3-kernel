@@ -2011,7 +2011,9 @@ int ksmbd_vfs_fill_dentry_attrs(struct ksmbd_work *work,
 				struct ksmbd_kstat *ksmbd_kstat)
 {
 	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	void *rp_data;
 	u64 time;
+	u32 rp_len;
 	int rc;
 	struct path path = {
 		.mnt = share_conf->vfs_path.mnt,
@@ -2048,6 +2050,24 @@ int ksmbd_vfs_fill_dentry_attrs(struct ksmbd_work *work,
 			ksmbd_debug(VFS, "fail to load dos attribute.\n");
 		}
 	}
+
+	/* Reparse state is authoritative over potentially stale DOS attributes. */
+	ksmbd_kstat->file_attributes &= ~FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	ksmbd_kstat->reparse_tag = 0;
+	rc = ksmbd_vfs_get_rp_xattr(idmap, dentry,
+				    &ksmbd_kstat->reparse_tag,
+				    &rp_data, &rp_len);
+	if (!rc) {
+		ksmbd_kstat->file_attributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
+		kfree(rp_data);
+	} else if (rc != -ENODATA && rc != -EOPNOTSUPP) {
+		return rc;
+	}
+	if (!S_ISREG(ksmbd_kstat->kstat->mode) &&
+	    !S_ISDIR(ksmbd_kstat->kstat->mode))
+		ksmbd_kstat->file_attributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	if (S_ISDIR(ksmbd_kstat->kstat->mode))
+		ksmbd_kstat->file_attributes |= FILE_ATTRIBUTE_DIRECTORY_LE;
 
 	/*
 	 * Only pay for this when it'll actually be used: AAPL
