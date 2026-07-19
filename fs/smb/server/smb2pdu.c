@@ -347,6 +347,7 @@ static int smb2_reparse_unparsed_len(struct ksmbd_work *work,
  * smb2_find_reparse_point() - find an intermediate xattr reparse point
  * @work: SMB request work item
  * @name: share-relative pathname
+ * @follow_symlinks: follow native symlinks while inspecting parent components
  * @tag: returned reparse tag
  * @data: returned allocated reparse payload
  * @len: returned payload length
@@ -355,9 +356,11 @@ static int smb2_reparse_unparsed_len(struct ksmbd_work *work,
  * Return: 0 when found, -ENODATA when absent, or another negative error.
  */
 static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
-				   u32 *tag, void **data, u32 *len,
+				   bool follow_symlinks, u32 *tag,
+				   void **data, u32 *len,
 				   u16 *unparsed_len)
 {
+	unsigned int flags = follow_symlinks ? LOOKUP_FOLLOW : LOOKUP_NO_SYMLINKS;
 	char *prefix, *slash, *next;
 	int ret = -ENODATA;
 
@@ -375,8 +378,7 @@ static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
 		}
 		*slash = '\0';
 		if (*prefix) {
-			ret = ksmbd_vfs_kern_path(work, prefix, LOOKUP_NO_SYMLINKS,
-						  &path, 1);
+			ret = ksmbd_vfs_kern_path(work, prefix, flags, &path, 1);
 			if (ret) {
 				/* Leave ordinary lookup failures to the complete path lookup. */
 				if (ret == -ENOENT || ret == -ENOTDIR ||
@@ -4800,6 +4802,7 @@ int smb2_open(struct ksmbd_work *work)
 	char *name = NULL;
 	char *stream_name = NULL;
 	bool file_present = false, created = false, already_permitted = false;
+	bool follow_symlinks;
 	bool reparse_point = false;
 	bool reparse_locked = false;
 	bool app_instance_id_checked = false, app_instance_closed;
@@ -5114,13 +5117,15 @@ resolve_path:
 	file_present = false;
 	maximal_access = 0;
 	reparse_point = false;
+	follow_symlinks = !(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE) &&
+		test_share_config_flag(share, KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS);
 	{
 		void *rp_data = NULL;
 		u32 rp_tag, rp_len;
 		u16 unparsed_len;
 
 		/* Directory reparse stubs are traversable by the backing VFS. */
-		rc = smb2_find_reparse_point(work, name,
+		rc = smb2_find_reparse_point(work, name, follow_symlinks,
 					     &rp_tag, &rp_data, &rp_len,
 					     &unparsed_len);
 		if (!rc) {
@@ -5141,8 +5146,11 @@ resolve_path:
 		if (rc != -ENODATA)
 			goto err_out;
 	}
-	rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
-				 &path, 1);
+	if (follow_symlinks)
+		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_FOLLOW, &path, 1);
+	else
+		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
+					 &path, 1);
 	if (!rc)
 		file_present = true;
 	if (rc == -ELOOP) {
@@ -6124,6 +6132,8 @@ err_out2:
 			rsp->hdr.Status = STATUS_INVALID_PARAMETER;
 		else if (rc == -EOPNOTSUPP && !rsp->hdr.Status)
 			rsp->hdr.Status = STATUS_NOT_SUPPORTED;
+		else if (rc == -EREMOTE)
+			rsp->hdr.Status = STATUS_IO_REPARSE_TAG_NOT_HANDLED;
 		else if ((rc == -EACCES || rc == -ESTALE || rc == -EXDEV) &&
 			 !rsp->hdr.Status) {
 			if (req->DesiredAccess & FILE_ACCESS_SYSTEM_SECURITY_LE)
@@ -10205,6 +10215,8 @@ err_out:
 	}
 	else if (rc == -EINVAL)
 		rsp->hdr.Status = STATUS_INVALID_PARAMETER;
+	else if (rc == -EREMOTE)
+		rsp->hdr.Status = STATUS_IO_REPARSE_TAG_NOT_HANDLED;
 	else if (rc == -EMSGSIZE)
 		rsp->hdr.Status = STATUS_INFO_LENGTH_MISMATCH;
 	else if (rc == -ENOSPC || rc == -EFBIG)
