@@ -208,6 +208,65 @@ struct ksmbd_symlink_reparse_data {
 } __packed;
 
 /**
+ * smb2_validate_reparse_data() - validate tag-specific reparse payload
+ * @tag: reparse tag in host byte order
+ * @data: tag-specific reparse data
+ * @len: size of @data in bytes
+ *
+ * Return: 0 when the payload is valid, otherwise -EINVAL.
+ */
+static int smb2_validate_reparse_data(u32 tag, const void *data, u32 len)
+{
+	const struct ksmbd_symlink_reparse_data *sym = data;
+	u32 path_len, off, name_len;
+	u64 type;
+
+	switch (tag) {
+	case IO_REPARSE_TAG_NFS:
+		if (len < sizeof(__le64))
+			return -EINVAL;
+		type = get_unaligned_le64(data);
+		switch (type) {
+		case NFS_SPECFILE_LNK:
+			return (len - sizeof(__le64)) & 1 ? -EINVAL : 0;
+		case NFS_SPECFILE_CHR:
+		case NFS_SPECFILE_BLK:
+			return len == sizeof(__le64) + 2 * sizeof(__le32) ? 0 : -EINVAL;
+		case NFS_SPECFILE_FIFO:
+		case NFS_SPECFILE_SOCK:
+			return len == sizeof(__le64) ? 0 : -EINVAL;
+		default:
+			return -EINVAL;
+		}
+	case IO_REPARSE_TAG_LX_SYMLINK:
+		return len >= sizeof(__le32) &&
+			get_unaligned_le32(data) == 2 ? 0 : -EINVAL;
+	case IO_REPARSE_TAG_AF_UNIX:
+	case IO_REPARSE_TAG_LX_FIFO:
+	case IO_REPARSE_TAG_LX_CHR:
+	case IO_REPARSE_TAG_LX_BLK:
+		return len ? -EINVAL : 0;
+	case IO_REPARSE_TAG_SYMLINK:
+		break;
+	default:
+		return 0;
+	}
+	if (len < sizeof(*sym) || le32_to_cpu(sym->Flags) &
+					~SYMLINK_FLAG_RELATIVE)
+		return -EINVAL;
+	path_len = len - sizeof(*sym);
+	off = le16_to_cpu(sym->SubstituteNameOffset);
+	name_len = le16_to_cpu(sym->SubstituteNameLength);
+	if ((off | name_len) & 1 || off > path_len || name_len > path_len - off)
+		return -EINVAL;
+	off = le16_to_cpu(sym->PrintNameOffset);
+	name_len = le16_to_cpu(sym->PrintNameLength);
+	if ((off | name_len) & 1 || off > path_len || name_len > path_len - off)
+		return -EINVAL;
+	return 0;
+}
+
+/**
  * smb2_set_symlink_err_rsp() - build an SMB symbolic-link error response
  * @work: SMB request work item
  * @tag: reparse tag in host byte order
@@ -515,6 +574,35 @@ void smb2_set_err_rsp(struct ksmbd_work *work)
 		if (err)
 			work->send_no_response = 1;
 	}
+}
+
+/**
+ * smb2_set_buffer_too_small_rsp() - return the required response size
+ * @work: SMB request work item
+ * @required: minimum output buffer size in bytes
+ *
+ * Return: -ENOSPC after pinning the SMB error response.
+ */
+static int smb2_set_buffer_too_small_rsp(struct ksmbd_work *work, u32 required)
+{
+	struct smb2_err_rsp *err_rsp;
+	int err;
+
+	if (work->next_smb2_rcv_hdr_off)
+		err_rsp = ksmbd_resp_buf_next(work);
+	else
+		err_rsp = smb_get_msg(work->response_buf);
+	err_rsp->hdr.Status = STATUS_BUFFER_TOO_SMALL;
+	err_rsp->StructureSize = SMB2_ERROR_STRUCTURE_SIZE2_LE;
+	err_rsp->ErrorContextCount = 0;
+	err_rsp->Reserved = 0;
+	err_rsp->ByteCount = cpu_to_le32(sizeof(__le32));
+	put_unaligned_le32(required, err_rsp->ErrorData);
+	err = ksmbd_iov_pin_rsp(work, err_rsp,
+				sizeof(*err_rsp) + sizeof(__le32));
+	if (err)
+		work->send_no_response = 1;
+	return -ENOSPC;
 }
 
 /**
@@ -1617,6 +1705,39 @@ __le32 smb2_get_reparse_tag_special_file(umode_t mode)
 		return IO_REPARSE_TAG_LX_BLK_LE;
 
 	return 0;
+}
+
+static int smb2_get_native_reparse_point(struct dentry *dentry, u32 *tag,
+					 void **data, u32 *len)
+{
+	struct delayed_call done = {};
+	const char *target;
+	int ret = 0;
+
+	*tag = le32_to_cpu(smb2_get_reparse_tag_special_file(d_inode(dentry)->i_mode));
+	*data = NULL;
+	*len = 0;
+	if (!*tag)
+		return -ENODATA;
+	if (!d_is_symlink(dentry))
+		return 0;
+
+	target = ksmbd_vfs_get_link(dentry, &done);
+	if (IS_ERR(target)) {
+		ret = PTR_ERR(target);
+		goto out;
+	}
+	*len = sizeof(__le32) + strlen(target);
+	*data = kmalloc(*len, KSMBD_DEFAULT_GFP);
+	if (!*data) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	put_unaligned_le32(2, *data);
+	memcpy(*data + sizeof(__le32), target, *len - sizeof(__le32));
+out:
+	do_delayed_call(&done);
+	return ret;
 }
 
 /**
@@ -12325,6 +12446,123 @@ static int fsctl_request_resume_key(struct ksmbd_work *work,
 	return 0;
 }
 
+static int smb2_check_reparse_write_access(struct ksmbd_file *fp)
+{
+	const struct cred *saved_cred;
+	int ret;
+
+	if (!(fp->daccess & FILE_WRITE_ATTRIBUTES_LE))
+		return -EACCES;
+
+	saved_cred = override_creds(fp->filp->f_cred);
+	ret = inode_permission(file_mnt_idmap(fp->filp),
+			       file_inode(fp->filp), MAY_WRITE);
+	revert_creds(saved_cred);
+	return ret;
+}
+
+/**
+ * smb2_set_reparse_point() - store reparse metadata for an open file
+ * @work: smb work containing the ioctl request
+ * @id: volatile file identifier
+ * @buffer: ioctl input buffer
+ * @in_buf_len: ioctl input buffer size
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+static int smb2_set_reparse_point(struct ksmbd_work *work, u64 id,
+				  const char *buffer,
+				  unsigned int in_buf_len)
+{
+	const struct reparse_data_buffer *reparse_ptr;
+	struct ksmbd_file *fp;
+	u32 len;
+	int ret;
+
+	reparse_ptr = (const struct reparse_data_buffer *)buffer;
+	if (!test_tree_conn_flag(work->tcon, KSMBD_TREE_CONN_FLAG_WRITABLE) ||
+	    in_buf_len < sizeof(*reparse_ptr))
+		return -EINVAL;
+
+	len = le16_to_cpu(reparse_ptr->ReparseDataLength);
+	if (len != in_buf_len - sizeof(*reparse_ptr))
+		return -EINVAL;
+
+	ret = smb2_validate_reparse_data(le32_to_cpu(reparse_ptr->ReparseTag),
+					 reparse_ptr->DataBuffer, len);
+	if (ret)
+		return ret;
+
+	guard(rwsem_write)(&ksmbd_reparse_sem);
+	fp = ksmbd_lookup_fd_fast(work, id);
+	if (!fp)
+		return -ENOENT;
+	ret = smb2_check_reparse_write_access(fp);
+	if (ret)
+		goto out;
+
+	ret = ksmbd_vfs_set_rp_xattr(file_mnt_idmap(fp->filp),
+				     &fp->filp->f_path,
+				     le32_to_cpu(reparse_ptr->ReparseTag),
+				     reparse_ptr->DataBuffer, len);
+	if (!ret)
+		fp->is_reparse = true;
+out:
+	ksmbd_fd_put(work, fp);
+	return ret;
+}
+
+/**
+ * smb2_delete_reparse_point() - remove reparse metadata from an open file
+ * @work: smb work containing the ioctl request
+ * @id: volatile file identifier
+ * @buffer: ioctl input buffer
+ * @in_buf_len: ioctl input buffer size
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+static int smb2_delete_reparse_point(struct ksmbd_work *work, u64 id,
+				     const char *buffer,
+				     unsigned int in_buf_len)
+{
+	const struct reparse_data_buffer *reparse_ptr;
+	struct ksmbd_file *fp;
+	void *data;
+	u32 tag, len;
+	int ret;
+
+	reparse_ptr = (const struct reparse_data_buffer *)buffer;
+	if (!test_tree_conn_flag(work->tcon, KSMBD_TREE_CONN_FLAG_WRITABLE))
+		return -EACCES;
+	if (in_buf_len != sizeof(*reparse_ptr) ||
+	    reparse_ptr->ReparseDataLength)
+		return -EINVAL;
+
+	guard(rwsem_write)(&ksmbd_reparse_sem);
+	fp = ksmbd_lookup_fd_fast(work, id);
+	if (!fp)
+		return -ENOENT;
+	ret = smb2_check_reparse_write_access(fp);
+	if (ret)
+		goto out;
+
+	ret = ksmbd_vfs_get_rp_xattr(file_mnt_idmap(fp->filp),
+				     fp->filp->f_path.dentry,
+				     &tag, &data, &len);
+	if (!ret)
+		kfree(data);
+	if (!ret && tag != le32_to_cpu(reparse_ptr->ReparseTag))
+		ret = -EIO;
+	if (!ret)
+		ret = ksmbd_vfs_remove_rp_xattr(file_mnt_idmap(fp->filp),
+						&fp->filp->f_path);
+	if (!ret)
+		fp->is_reparse = false;
+out:
+	ksmbd_fd_put(work, fp);
+	return ret;
+}
+
 /**
  * smb2_ioctl() - handler for smb2 ioctl command
  * @work:	smb work containing ioctl command buffer
@@ -12822,10 +13060,12 @@ int smb2_ioctl(struct ksmbd_work *work)
 	{
 		struct reparse_data_buffer *reparse_ptr;
 		struct ksmbd_file *fp;
+		void *data;
+		u32 tag, len;
 
 		if (out_buf_len < sizeof(struct reparse_data_buffer)) {
-			ret = -EINVAL;
-			goto out;
+			return smb2_set_buffer_too_small_rsp(work,
+					sizeof(struct reparse_data_buffer));
 		}
 
 		reparse_ptr = (struct reparse_data_buffer *)&rsp->Buffer[0];
@@ -12836,13 +13076,42 @@ int smb2_ioctl(struct ksmbd_work *work)
 			goto out;
 		}
 
-		reparse_ptr->ReparseTag =
-			smb2_get_reparse_tag_special_file(file_inode(fp->filp)->i_mode);
-		reparse_ptr->ReparseDataLength = 0;
+		ret = ksmbd_vfs_get_rp_xattr(file_mnt_idmap(fp->filp),
+					     fp->filp->f_path.dentry,
+					     &tag, &data, &len);
+		if (ret == -ENODATA || ret == -EOPNOTSUPP)
+			ret = smb2_get_native_reparse_point(fp->filp->f_path.dentry,
+							    &tag, &data, &len);
 		ksmbd_fd_put(work, fp);
-		nbytes = sizeof(struct reparse_data_buffer);
+		if (ret)
+			goto out;
+		if (len > U16_MAX || out_buf_len < sizeof(*reparse_ptr) + len) {
+			u32 required = sizeof(*reparse_ptr) + len;
+
+			kfree(data);
+			if (len > U16_MAX)
+				return -EINVAL;
+			return smb2_set_buffer_too_small_rsp(work, required);
+		}
+		reparse_ptr->ReparseTag = cpu_to_le32(tag);
+		reparse_ptr->ReparseDataLength = cpu_to_le16(len);
+		reparse_ptr->Reserved = 0;
+		if (len)
+			memcpy(reparse_ptr->DataBuffer, data, len);
+		kfree(data);
+		nbytes = sizeof(*reparse_ptr) + len;
 		break;
 	}
+	case FSCTL_SET_REPARSE_POINT:
+		ret = smb2_set_reparse_point(work, id, buffer, in_buf_len);
+		if (ret)
+			goto out;
+		break;
+	case FSCTL_DELETE_REPARSE_POINT:
+		ret = smb2_delete_reparse_point(work, id, buffer, in_buf_len);
+		if (ret)
+			goto out;
+		break;
 	case FSCTL_DUPLICATE_EXTENTS_TO_FILE:
 	{
 		struct ksmbd_file *fp_in, *fp_out = NULL;
@@ -12963,6 +13232,12 @@ out:
 		rsp->hdr.Status = STATUS_OBJECT_NAME_NOT_FOUND;
 	else if (ret == -EOPNOTSUPP)
 		rsp->hdr.Status = STATUS_NOT_SUPPORTED;
+	else if (ret == -ENODATA)
+		rsp->hdr.Status = STATUS_NOT_A_REPARSE_POINT;
+	else if (ret == -EIO)
+		rsp->hdr.Status = STATUS_IO_REPARSE_TAG_MISMATCH;
+	else if (ret == -ENOTEMPTY)
+		rsp->hdr.Status = STATUS_DIRECTORY_NOT_EMPTY;
 	else if (ret == -ENOSPC)
 		rsp->hdr.Status = STATUS_BUFFER_TOO_SMALL;
 	else if (!chseq_err && (ret < 0 || rsp->hdr.Status == 0))
