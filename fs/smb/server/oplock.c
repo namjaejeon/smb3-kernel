@@ -1482,6 +1482,9 @@ static int oplock_break(struct oplock_info *brk_opinfo, struct ksmbd_inode *ci,
 	bool sent_interim = false;
 	bool expect_ack = false;
 
+	/* The owner may need a data operation or CLOSE before sending its ACK. */
+	lockdep_assert_not_held(&ksmbd_reparse_sem);
+
 	/* Need to break exclusive/batch oplock, write lease or overwrite_if */
 	ksmbd_debug(OPLOCK,
 		    "request to send oplock(level : 0x%x) break notification\n",
