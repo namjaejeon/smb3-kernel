@@ -63,6 +63,19 @@ static int ksmbd_vfs_path_lookup(struct ksmbd_share_config *share_conf,
 		pathname = share_conf->path;
 		root_share_path = NULL;
 	} else {
+		/*
+		 * Resolve the complete pathname when symlink following is
+		 * requested. LOOKUP_BENEATH keeps the result confined to the
+		 * share while allowing both intermediate and trailing symlinks
+		 * whose targets remain below it.
+		 */
+		if (flags & LOOKUP_FOLLOW) {
+			if (for_remove)
+				return -EINVAL;
+			return vfs_path_lookup(root_share_path->dentry,
+					       root_share_path->mnt, pathname,
+					       flags | LOOKUP_BENEATH, path);
+		}
 		flags |= LOOKUP_BENEATH;
 	}
 
@@ -1268,7 +1281,7 @@ retry:
 		err = vfs_path_lookup(share_conf->vfs_path.dentry,
 				      share_conf->vfs_path.mnt,
 				      filepath,
-				      flags,
+				      flags | LOOKUP_BENEATH,
 				      &parent_path);
 		next[0] = '/';
 		if (err)

@@ -4429,8 +4429,12 @@ int smb2_open(struct ksmbd_work *work)
 		rc = -ENOMEM;
 		goto err_out2;
 	}
-	rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
-				 &path, 1);
+	if (!(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE) &&
+	    test_share_config_flag(share, KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS))
+		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_FOLLOW, &path, 1);
+	else
+		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
+					 &path, 1);
 	if (!rc)
 		file_present = true;
 	if (rc == -ENOTDIR) {
