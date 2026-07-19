@@ -5764,7 +5764,7 @@ resolve_path:
 			 * stream and would otherwise pre-allocate storage on
 			 * the base file's data instead.
 			 */
-			if (!ksmbd_stream_fd(fp)) {
+			if (!ksmbd_stream_fd(fp) && !fp->is_reparse) {
 				smb_break_all_levII_oplock(work, fp, 1);
 				err = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0,
 						    alloc_size);
@@ -9708,7 +9708,7 @@ static int set_file_allocation_info(struct ksmbd_work *work,
 	struct kstat stat;
 	int rc;
 
-	if (!(fp->daccess & FILE_WRITE_DATA_LE))
+	if (fp->is_reparse || !(fp->daccess & FILE_WRITE_DATA_LE))
 		return -EACCES;
 
 	if (ksmbd_stream_fd(fp) == true)
@@ -9774,7 +9774,7 @@ static int set_end_of_file_info(struct ksmbd_work *work, struct ksmbd_file *fp,
 	struct inode *inode;
 	int rc;
 
-	if (!(fp->daccess & FILE_WRITE_DATA_LE))
+	if (fp->is_reparse || !(fp->daccess & FILE_WRITE_DATA_LE))
 		return -EACCES;
 
 	newsize = le64_to_cpu(file_eof_info->EndOfFile);
@@ -10697,6 +10697,10 @@ int smb2_read(struct ksmbd_work *work)
 	err = smb2_set_request_open(work, fp, &req->hdr, true, true);
 	if (err)
 		goto out;
+	if (fp->is_reparse) {
+		err = -EACCES;
+		goto out;
+	}
 
 	if (!(fp->daccess & (FILE_READ_DATA_LE | FILE_READ_ATTRIBUTES_LE))) {
 		pr_err("Not permitted to read : 0x%x\n", fp->daccess);
@@ -11144,6 +11148,10 @@ int smb2_write(struct ksmbd_work *work)
 	if (err) {
 		rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
 		chseq_err = true;
+		goto out;
+	}
+	if (fp->is_reparse) {
+		err = -EACCES;
 		goto out;
 	}
 
@@ -12065,6 +12073,11 @@ static int fsctl_copychunk(struct ksmbd_work *work,
 		rsp->hdr.Status = STATUS_FILE_CLOSED;
 		goto out;
 	}
+	if (src_fp->is_reparse || dst_fp->is_reparse) {
+		rsp->hdr.Status = STATUS_ACCESS_DENIED;
+		ret = -EACCES;
+		goto out;
+	}
 
 	/*
 	 * FILE_READ_DATA should only be included in
@@ -12411,6 +12424,10 @@ static inline int fsctl_set_sparse(struct ksmbd_work *work, u64 id,
 
 	if (S_ISDIR(file_inode(fp->filp)->i_mode)) {
 		ret = -EINVAL;
+		goto out;
+	}
+	if (fp->is_reparse) {
+		ret = -EACCES;
 		goto out;
 	}
 
@@ -12980,7 +12997,7 @@ int smb2_ioctl(struct ksmbd_work *work)
 				goto out;
 			}
 
-			if (!(fp->daccess & FILE_WRITE_DATA_LE)) {
+			if (fp->is_reparse || !(fp->daccess & FILE_WRITE_DATA_LE)) {
 				ksmbd_fd_put(work, fp);
 				ret = -EACCES;
 				goto out;
@@ -13037,7 +13054,7 @@ int smb2_ioctl(struct ksmbd_work *work)
 			goto out;
 		}
 
-		if (!(fp->daccess & FILE_WRITE_DATA_LE)) {
+		if (fp->is_reparse || !(fp->daccess & FILE_WRITE_DATA_LE)) {
 			ksmbd_fd_put(work, fp);
 			ret = -EACCES;
 			goto out;
@@ -13186,6 +13203,10 @@ int smb2_ioctl(struct ksmbd_work *work)
 
 		if (!test_tree_conn_flag(work->tcon,
 					 KSMBD_TREE_CONN_FLAG_WRITABLE)) {
+			ret = -EACCES;
+			goto dup_ext_out;
+		}
+		if (fp_in->is_reparse || fp_out->is_reparse) {
 			ret = -EACCES;
 			goto dup_ext_out;
 		}
