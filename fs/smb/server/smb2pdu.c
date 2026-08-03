@@ -1599,6 +1599,27 @@ static bool smb2_symlink_target_is_dir(struct dentry *dentry)
 	return is_dir;
 }
 
+/**
+ * smb2_should_follow_final_symlink() - classify a data open
+ * @req: SMB2 CREATE request
+ *
+ * Attribute and other metadata operations must be able to inspect the
+ * terminal symlink itself.  Data opens, on the other hand, should resolve
+ * the terminal symlink when following symlinks is enabled for the share.
+ *
+ * Return: true when the final symlink should be followed.
+ */
+static bool smb2_should_follow_final_symlink(const struct smb2_create_req *req)
+{
+	__le32 data_access = FILE_READ_DATA_LE | FILE_WRITE_DATA_LE |
+		FILE_APPEND_DATA_LE | FILE_EXECUTE_LE;
+
+	if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)
+		return false;
+
+	return req->DesiredAccess & data_access;
+}
+
 static void build_preauth_ctxt(struct smb2_preauth_neg_context *pneg_ctxt,
 			       __le16 hash_id)
 {
@@ -4280,6 +4301,7 @@ int smb2_open(struct ksmbd_work *work)
 	char *stream_name = NULL;
 	bool file_present = false, created = false, already_permitted = false;
 	bool wide_link = false;
+	bool follow_final = false;
 	bool reparse_point = false;
 	int share_ret, need_truncate = 0;
 	u64 time, alloc_size = 0;
@@ -4562,14 +4584,17 @@ int smb2_open(struct ksmbd_work *work)
 		rc = -ENOMEM;
 		goto err_out2;
 	}
+	follow_final = smb2_should_follow_final_symlink(req);
 	if (!(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE) &&
 	    test_share_config_flag(share, KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS)) {
+		/* Without LOOKUP_FOLLOW, only the final component is preserved. */
 		if (test_share_config_flag(share, KSMBD_SHARE_FLAG_WIDE_LINKS))
 			rc = ksmbd_vfs_kern_path_wide(work, name, &path, 1,
-						      &wide_link);
+						      &wide_link, follow_final);
 		else
-			rc = ksmbd_vfs_kern_path(work, name, LOOKUP_FOLLOW,
-						 &path, 1);
+			rc = ksmbd_vfs_kern_path(work, name,
+					   follow_final ? LOOKUP_FOLLOW : 0,
+					   &path, 1);
 	} else {
 		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
 					 &path, 1);

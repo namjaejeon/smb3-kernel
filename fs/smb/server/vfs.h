@@ -126,7 +126,7 @@ int ksmbd_vfs_kern_path(struct ksmbd_work *work, char *name,
 			struct path *path, bool caseless);
 int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *name,
 			     struct path *path, bool caseless,
-			     bool *wide_link);
+			     bool *wide_link, bool follow_final);
 int ksmbd_vfs_kern_path_start_removing(struct ksmbd_work *work, char *name,
 				       unsigned int flags,
 				       struct path *path, bool caseless);

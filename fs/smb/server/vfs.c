@@ -1244,6 +1244,7 @@ int __ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
 	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
 	struct path parent_path;
 	size_t path_len, remain_len;
+	unsigned int prefix_flags;
 	int err;
 
 retry:
@@ -1278,10 +1279,14 @@ retry:
 		}
 		next[0] = '\0';
 
+		/* Follow prefix symlinks unless this lookup explicitly forbids it. */
+		prefix_flags = flags | LOOKUP_BENEATH;
+		if (!(flags & LOOKUP_NO_SYMLINKS))
+			prefix_flags |= LOOKUP_FOLLOW;
 		err = vfs_path_lookup(share_conf->vfs_path.dentry,
 				      share_conf->vfs_path.mnt,
 				      filepath,
-				      flags | LOOKUP_BENEATH,
+				      prefix_flags,
 				      &parent_path);
 		next[0] = '/';
 		if (err)
@@ -1350,6 +1355,7 @@ static bool ksmbd_vfs_has_dotdot(const char *path)
  * @path: returned resolved path
  * @caseless: retry lookup using case-insensitive component matching
  * @wide_link: set when the unrestricted symlink fallback was used
+ * @follow_final: follow the final symlink component
  *
  * The normal lookup remains constrained beneath the share.  The fallback is
  * used only after encountering a native symlink and rejects dot-dot supplied
@@ -1359,14 +1365,15 @@ static bool ksmbd_vfs_has_dotdot(const char *path)
  */
 int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *filepath,
 			     struct path *path, bool caseless,
-			     bool *wide_link)
+			     bool *wide_link, bool follow_final)
 {
 	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	unsigned int lookup_flags = follow_final ? LOOKUP_FOLLOW : 0;
 	char *fullpath;
 	int err;
 
 	*wide_link = false;
-	err = ksmbd_vfs_kern_path(work, filepath, LOOKUP_FOLLOW,
+	err = ksmbd_vfs_kern_path(work, filepath, lookup_flags,
 				  path, caseless);
 	if (!err)
 		return 0;
@@ -1384,7 +1391,7 @@ int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *filepath,
 			     share_conf->path, filepath);
 	if (!fullpath)
 		return -ENOMEM;
-	err = kern_path(fullpath, LOOKUP_FOLLOW, path);
+	err = kern_path(fullpath, lookup_flags, path);
 	kfree(fullpath);
 	if (!err)
 		*wide_link = true;
