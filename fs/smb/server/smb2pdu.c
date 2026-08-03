@@ -1570,6 +1570,35 @@ static int smb2_get_dos_mode(struct kstat *stat, int attribute)
 	return attr;
 }
 
+/**
+ * smb2_symlink_target_is_dir() - detect a directory-style native symlink
+ * @dentry: native symlink dentry
+ *
+ * Native SMB symlinks do not carry a directory/file type in their reparse
+ * payload.  The Linux SMB client uses FILE_ATTRIBUTE_DIRECTORY from the
+ * OPEN_REPARSE_POINT response to validate a target with a trailing slash.
+ * Inspect only the link text here; do not resolve the target or cross the
+ * share boundary while following symlinks is disabled.
+ *
+ * Return: true when the link text ends in a slash, otherwise false.
+ */
+static bool smb2_symlink_target_is_dir(struct dentry *dentry)
+{
+	struct delayed_call done = {};
+	const char *target;
+	bool is_dir = false;
+	size_t len;
+
+	target = vfs_get_link(dentry, &done);
+	if (!IS_ERR(target)) {
+		len = strlen(target);
+		is_dir = len && target[len - 1] == '/';
+	}
+	do_delayed_call(&done);
+
+	return is_dir;
+}
+
 static void build_preauth_ctxt(struct smb2_preauth_neg_context *pneg_ctxt,
 			       __le16 hash_id)
 {
@@ -5222,6 +5251,9 @@ int smb2_open(struct ksmbd_work *work)
 			cpu_to_le32(smb2_get_dos_mode(&stat, le32_to_cpu(req->FileAttributes)));
 	if (reparse_point)
 		fp->f_ci->m_fattr |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
+	if (reparse_point && d_is_symlink(path.dentry) &&
+	    smb2_symlink_target_is_dir(path.dentry))
+		fp->f_ci->m_fattr |= FILE_ATTRIBUTE_DIRECTORY_LE;
 
 	if (!created)
 		smb2_update_xattrs(tcon, &path, fp);
