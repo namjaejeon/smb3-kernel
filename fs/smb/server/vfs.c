@@ -1837,6 +1837,7 @@ static bool ksmbd_vfs_has_dotdot(const char *path)
  * @path: returned resolved path
  * @caseless: retry lookup using case-insensitive component matching
  * @wide_link: set when the unrestricted symlink fallback was used
+ * @follow_final: follow the final symlink component
  *
  * The normal lookup remains constrained beneath the share.  The fallback is
  * used only after encountering a native symlink and rejects dot-dot supplied
@@ -1846,10 +1847,10 @@ static bool ksmbd_vfs_has_dotdot(const char *path)
  */
 int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *filepath,
 			     struct path *path, bool caseless,
-			     bool *wide_link)
+			     bool *wide_link, bool follow_final)
 {
 	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
-	unsigned int lookup_flags = LOOKUP_FOLLOW;
+	unsigned int lookup_flags = follow_final ? LOOKUP_FOLLOW : 0;
 	char *fullpath;
 	int err;
 

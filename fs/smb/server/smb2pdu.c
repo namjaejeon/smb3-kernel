@@ -384,7 +384,7 @@ static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
 				bool wide_link;
 
 				ret = ksmbd_vfs_kern_path_wide(work, prefix, &path,
-							       1, &wide_link);
+							       1, &wide_link, true);
 			} else {
 				ret = ksmbd_vfs_kern_path(work, prefix, flags, &path, 1);
 			}
@@ -1789,6 +1789,56 @@ static int smb2_get_dos_mode(struct kstat *stat, int attribute)
 	return attr;
 }
 
+/**
+ * smb2_symlink_target_is_dir() - detect a directory-style native symlink
+ * @dentry: native symlink dentry
+ *
+ * Native SMB symlinks do not carry a directory/file type in their reparse
+ * payload.  The Linux SMB client uses FILE_ATTRIBUTE_DIRECTORY from the
+ * OPEN_REPARSE_POINT response to validate a target with a trailing slash.
+ * Inspect only the link text here; do not resolve the target or cross the
+ * share boundary while following symlinks is disabled.
+ *
+ * Return: true when the link text ends in a slash, otherwise false.
+ */
+static bool smb2_symlink_target_is_dir(struct dentry *dentry)
+{
+	struct delayed_call done = {};
+	const char *target;
+	bool is_dir = false;
+	size_t len;
+
+	target = ksmbd_vfs_get_link(dentry, &done);
+	if (!IS_ERR(target)) {
+		len = strlen(target);
+		is_dir = len && target[len - 1] == '/';
+	}
+	do_delayed_call(&done);
+
+	return is_dir;
+}
+
+/**
+ * smb2_should_follow_final_symlink() - classify a data open
+ * @req: SMB2 CREATE request
+ *
+ * Attribute and other metadata operations must be able to inspect the
+ * terminal symlink itself.  Data opens, on the other hand, should resolve
+ * the terminal symlink when following symlinks is enabled for the share.
+ *
+ * Return: true when the final symlink should be followed.
+ */
+static bool smb2_should_follow_final_symlink(const struct smb2_create_req *req)
+{
+	__le32 data_access = FILE_READ_DATA_LE | FILE_WRITE_DATA_LE |
+		FILE_APPEND_DATA_LE | FILE_EXECUTE_LE | FILE_MAXIMAL_ACCESS_LE;
+
+	if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)
+		return false;
+
+	return smb_map_generic_desired_access(req->DesiredAccess) & data_access;
+}
+
 static bool smb2_wide_link_access_allowed(__le32 daccess)
 {
 	return !(daccess & (FILE_WRITE_DESIRE_ACCESS_LE | FILE_DELETE_LE |
@@ -1805,7 +1855,9 @@ static void smb2_update_reparse_attributes(struct ksmbd_file *fp)
 			FILE_ATTRIBUTE_DIRECTORY_LE);
 	if (fp->is_reparse || smb2_get_reparse_tag_special_file(inode->i_mode))
 		attributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
-	if (S_ISDIR(inode->i_mode))
+	if (S_ISDIR(inode->i_mode) ||
+	    (S_ISLNK(inode->i_mode) &&
+	     smb2_symlink_target_is_dir(fp->filp->f_path.dentry)))
 		attributes |= FILE_ATTRIBUTE_DIRECTORY_LE;
 	fp->f_ci->m_fattr = attributes;
 }
@@ -4822,6 +4874,7 @@ int smb2_open(struct ksmbd_work *work)
 	char *stream_name = NULL;
 	bool file_present = false, created = false, already_permitted = false;
 	bool wide_link = false;
+	bool follow_final = false;
 	bool follow_symlinks;
 	bool reparse_point = false;
 	bool reparse_locked = false;
@@ -5138,6 +5191,7 @@ resolve_path:
 	maximal_access = 0;
 	wide_link = false;
 	reparse_point = false;
+	follow_final = smb2_should_follow_final_symlink(req);
 	follow_symlinks = !(req->CreateOptions & FILE_OPEN_REPARSE_POINT_LE) &&
 		test_share_config_flag(share, KSMBD_SHARE_FLAG_FOLLOW_SYMLINKS);
 	{
@@ -5168,11 +5222,13 @@ resolve_path:
 			goto err_out;
 	}
 	if (follow_symlinks) {
+		/* Without LOOKUP_FOLLOW, only the final component remains unresolved. */
 		if (test_share_config_flag(share, KSMBD_SHARE_FLAG_WIDE_LINKS))
 			rc = ksmbd_vfs_kern_path_wide(work, name, &path, 1,
-						      &wide_link);
+						      &wide_link, follow_final);
 		else
-			rc = ksmbd_vfs_kern_path(work, name, LOOKUP_FOLLOW,
+			rc = ksmbd_vfs_kern_path(work, name,
+						 follow_final ? LOOKUP_FOLLOW : 0,
 						 &path, 1);
 	} else {
 		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
