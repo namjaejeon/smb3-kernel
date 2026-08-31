@@ -15,7 +15,9 @@
 #include <linux/posix_acl_xattr.h>
 #include <linux/compat.h>
 #include <linux/falloc.h>
+#include <linux/file.h>
 #include <linux/overflow.h>
+#include <linux/security.h>
 #include <uapi/linux/ntfs.h>
 
 #include "lcnalloc.h"
@@ -81,6 +83,7 @@ static int ntfs_file_open(struct inode *vi, struct file *filp)
 static int ntfs_trim_prealloc(struct inode *vi)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
+	struct ntfs_inode *mrec_ni = ntfs_base_inode(ni);
 	struct ntfs_volume *vol = ni->vol;
 	struct runlist_element *rl;
 	s64 aligned_data_size;
@@ -89,7 +92,7 @@ static int ntfs_trim_prealloc(struct inode *vi)
 	int err = 0;
 
 	inode_lock(vi);
-	mutex_lock(&ni->mrec_lock);
+	mutex_lock(&mrec_ni->mrec_lock);
 	down_write(&ni->runlist.lock);
 
 	aligned_data_size = round_up(ni->data_size, vol->cluster_size);
@@ -124,7 +127,7 @@ static int ntfs_trim_prealloc(struct inode *vi)
 
 out_unlock:
 	up_write(&ni->runlist.lock);
-	mutex_unlock(&ni->mrec_lock);
+	mutex_unlock(&mrec_ni->mrec_lock);
 	inode_unlock(vi);
 
 	return err;
@@ -168,6 +171,7 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 	int err, ret = 0;
 	struct inode *parent_vi, *ia_vi;
 	struct ntfs_attr_search_ctx *ctx;
+	bool non_resident, stream;
 
 	ntfs_debug("Entering for inode 0x%llx.", ni->mft_no);
 
@@ -178,9 +182,24 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 	if (err)
 		return err;
 
-	if (!datasync || !NInoNonResident(NTFS_I(vi)))
+	stream = ntfs_inode_is_named_stream(ni);
+	non_resident = NInoNonResident(ni);
+	if (stream) {
+		ni = ni->ext.base_ntfs_ino;
+		vi = VFS_I(ni);
+	}
+
+	if (!datasync || !non_resident)
 		ret = __ntfs_write_inode(vi, 1);
 	write_inode_now(vi, !datasync);
+
+	/*
+	 * file_write_and_wait_range() already flushed this stream mapping.
+	 * Do not walk sibling attribute mappings while holding the base MFT
+	 * lock; ordinary file fsync retains its existing behavior below.
+	 */
+	if (stream)
+		goto sync_volume;
 
 	ctx = ntfs_attr_get_search_ctx(ni, NULL);
 	if (!ctx)
@@ -222,14 +241,16 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 			if (inode_state_read_once(attr_vi) & I_DIRTY_PAGES) {
 				spin_unlock(&attr_vi->i_lock);
 				filemap_write_and_wait(attr_vi->i_mapping);
-			} else
+			} else {
 				spin_unlock(&attr_vi->i_lock);
+			}
 			iput(attr_vi);
 		}
 	}
 	mutex_unlock(&ni->mrec_lock);
 	ntfs_attr_put_search_ctx(ctx);
 
+sync_volume:
 	write_inode_now(vol->mftbmp_ino, 1);
 	down_write(&vol->lcnbmp_lock);
 	write_inode_now(vol->lcnbmp_ino, 1);
@@ -258,8 +279,14 @@ static int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
+	struct ntfs_inode *base_ni = ntfs_base_inode(ni);
+	struct inode *time_vi = vi;
+	bool stream = ntfs_inode_is_named_stream(ni);
 	int err;
 	loff_t old_size = vi->i_size;
+
+	if (stream && NVolShutdown(ni->vol))
+		return -EIO;
 
 	if (NInoCompressed(ni) || NInoEncrypted(ni) || NInoWofCompressed(ni)) {
 		ntfs_warning(
@@ -280,7 +307,21 @@ static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 	 * readers cannot observe the size change until the attribute
 	 * updates below have completed.
 	 */
-	filemap_invalidate_lock(vi->i_mapping);
+	if (stream) {
+		filemap_invalidate_lock(vi->i_mapping);
+		err = filemap_write_and_wait(vi->i_mapping);
+		if (err)
+			goto out_unlock_mapping;
+
+		mutex_lock(&base_ni->mrec_lock);
+		err = ntfs_stream_inode_validate(vi);
+		if (err)
+			goto out_unlock_mrec;
+		time_vi = VFS_I(base_ni);
+	} else {
+		filemap_invalidate_lock(vi->i_mapping);
+	}
+
 	if (attr->ia_size > old_size) {
 		truncate_pagecache(vi, old_size);
 		i_size_write(vi, attr->ia_size);
@@ -289,9 +330,25 @@ static int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 		truncate_setsize(vi, attr->ia_size);
 	}
 
-	err = ntfs_truncate_vfs(vi, attr->ia_size, old_size);
-	if (err)
+	if (stream)
+		err = __ntfs_attr_truncate_vfs(ni, attr->ia_size, old_size);
+	else
+		err = ntfs_truncate_vfs(vi, attr->ia_size, old_size);
+	if (err) {
 		i_size_write(vi, old_size);
+		goto out_unlock_mrec;
+	}
+
+	if (stream) {
+		inode_set_mtime_to_ts(time_vi,
+				inode_set_ctime_current(time_vi));
+		mark_inode_dirty(time_vi);
+	}
+
+out_unlock_mrec:
+	if (stream)
+		mutex_unlock(&base_ni->mrec_lock);
+out_unlock_mapping:
 	filemap_invalidate_unlock(vi->i_mapping);
 
 	return err;
@@ -425,6 +482,341 @@ int ntfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 	return 0;
 }
 
+static struct dentry *ntfs_stream_base_dentry(struct inode *inode)
+{
+	struct inode *base_vi =
+		VFS_I(NTFS_I(inode)->ext.base_ntfs_ino);
+	struct dentry *dentry;
+
+	dentry = d_find_alias(base_vi);
+	if (dentry)
+		return dentry;
+	if (!igrab(base_vi))
+		return ERR_PTR(-ESTALE);
+	return d_obtain_alias(base_vi);
+}
+
+static int ntfs_stream_validate_for_mutation(struct inode *inode)
+{
+	struct ntfs_inode *base_ni = NTFS_I(inode)->ext.base_ntfs_ino;
+	int err;
+
+	mutex_lock(&base_ni->mrec_lock);
+	err = ntfs_stream_inode_validate(inode);
+	mutex_unlock(&base_ni->mrec_lock);
+	return err;
+}
+
+static int ntfs_stream_needs_remove_privs(struct mnt_idmap *idmap,
+		struct dentry *base_dentry)
+{
+	struct inode *base_vi = d_inode(base_dentry);
+	int kill;
+
+	if (IS_NOSEC(base_vi))
+		return 0;
+
+	/*
+	 * Let notify_change() perform the LSM killpriv check through the
+	 * exported VFS interface.
+	 */
+	kill = setattr_should_drop_suidgid(idmap, base_vi);
+	return kill | ATTR_KILL_PRIV;
+}
+
+static int ntfs_stream_file_modified(struct file *file)
+{
+	struct inode *inode = file_inode(file);
+	struct inode *base_vi =
+		VFS_I(NTFS_I(inode)->ext.base_ntfs_ino);
+	struct ntfs_inode *base_ni = NTFS_I(base_vi);
+	struct dentry *base_dentry;
+	struct iattr attr = {};
+	int err, kill;
+
+	base_dentry = ntfs_stream_base_dentry(inode);
+	if (IS_ERR(base_dentry))
+		return PTR_ERR(base_dentry);
+
+	inode_lock(base_vi);
+	err = ntfs_stream_validate_for_mutation(inode);
+	if (err)
+		goto out_unlock;
+
+	kill = ntfs_stream_needs_remove_privs(file_mnt_idmap(file),
+			base_dentry);
+	if (kill < 0) {
+		err = kill;
+		goto out_unlock;
+	}
+	if (kill) {
+		err = ntfs_stream_validate_for_mutation(inode);
+		if (err)
+			goto out_unlock;
+		attr.ia_valid = ATTR_FORCE | kill;
+		err = notify_change(file_mnt_idmap(file), base_dentry, &attr,
+				NULL);
+		if (err)
+			goto out_unlock;
+		inode_has_no_xattr(base_vi);
+	}
+
+	if (!IS_NOCMTIME(base_vi) &&
+	    !(file->f_mode & FMODE_NOCMTIME)) {
+		mutex_lock(&base_ni->mrec_lock);
+		if (NVolShutdown(base_ni->vol))
+			err = -EIO;
+		else
+			err = generic_update_time(base_vi, FS_UPD_CMTIME, 0);
+		mutex_unlock(&base_ni->mrec_lock);
+	}
+
+out_unlock:
+	inode_unlock(base_vi);
+	dput(base_dentry);
+	return err;
+}
+
+static int ntfs_file_modified(struct file *file)
+{
+	if (ntfs_inode_is_named_stream(NTFS_I(file_inode(file))))
+		return ntfs_stream_file_modified(file);
+	return file_modified(file);
+}
+
+static int ntfs_stream_claim(struct inode *inode)
+{
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct ntfs_inode *base_ni = ni->ext.base_ntfs_ino;
+	int err;
+
+	mutex_lock(&base_ni->mrec_lock);
+	if (NInoStreamUnlinked(ni))
+		err = -ESTALE;
+	else
+		err = ntfs_stream_inode_validate(inode);
+	if (!err) {
+		if (atomic_read(&ni->stream_open_count) < 0)
+			err = -ESTALE;
+		else
+			atomic_inc(&ni->stream_open_count);
+	}
+	mutex_unlock(&base_ni->mrec_lock);
+	return err;
+}
+
+static int ntfs_stream_permission(struct mnt_idmap *idmap,
+		struct inode *inode, int mask)
+{
+	return inode_permission(idmap,
+			VFS_I(NTFS_I(inode)->ext.base_ntfs_ino), mask);
+}
+
+static int ntfs_stream_getattr(struct mnt_idmap *idmap,
+		const struct path *path, struct kstat *stat,
+		unsigned int request_mask, unsigned int query_flags)
+{
+	struct inode *inode = d_backing_inode(path->dentry);
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct inode *base_vi = VFS_I(ni->ext.base_ntfs_ino);
+
+	generic_fillattr(idmap, request_mask, base_vi, stat);
+	stat->size = i_size_read(inode);
+	stat->blocks = (((u64)ni->i_dealloc_clusters <<
+			NTFS_SB(inode->i_sb)->cluster_size_bits) >> 9) +
+			inode->i_blocks;
+	stat->blksize = NTFS_SB(inode->i_sb)->cluster_size;
+	stat->result_mask |= STATX_BTIME;
+	stat->btime = NTFS_I(base_vi)->i_crtime;
+
+	if (NInoCompressed(ni))
+		stat->attributes |= STATX_ATTR_COMPRESSED;
+	if (NInoEncrypted(ni))
+		stat->attributes |= STATX_ATTR_ENCRYPTED;
+	if (base_vi->i_flags & S_IMMUTABLE)
+		stat->attributes |= STATX_ATTR_IMMUTABLE;
+	if (base_vi->i_flags & S_APPEND)
+		stat->attributes |= STATX_ATTR_APPEND;
+	stat->attributes_mask |= STATX_ATTR_COMPRESSED | STATX_ATTR_ENCRYPTED |
+			STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND;
+
+	if (request_mask & STATX_DIOALIGN) {
+		unsigned int align =
+			bdev_logical_block_size(inode->i_sb->s_bdev);
+
+		stat->result_mask |= STATX_DIOALIGN;
+		if (!NInoCompressed(ni) && !NInoEncrypted(ni)) {
+			stat->dio_mem_align = align;
+			stat->dio_offset_align = align;
+		}
+	}
+
+	return 0;
+}
+
+static int ntfs_stream_setattr_common(struct mnt_idmap *idmap,
+		struct inode *inode, struct iattr *attr)
+{
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct inode *base_vi = VFS_I(ni->ext.base_ntfs_ino);
+	struct dentry *base_dentry = NULL;
+	struct iattr base_attr = *attr;
+	int err;
+
+	if (attr->ia_valid & ATTR_SIZE) {
+		err = inode_permission(idmap, base_vi, MAY_WRITE);
+		if (err)
+			goto out;
+		if (IS_APPEND(base_vi) || IS_IMMUTABLE(base_vi)) {
+			err = -EPERM;
+			goto out;
+		}
+		if (!(ni->vol->vol_flags & VOLUME_IS_DIRTY)) {
+			err = ntfs_set_volume_flags(ni->vol, VOLUME_IS_DIRTY);
+			if (err)
+				goto out;
+		}
+		base_attr.ia_valid &= ~ATTR_SIZE;
+	}
+
+	if ((attr->ia_valid & ATTR_SIZE) || base_attr.ia_valid) {
+		int kill = 0;
+
+		base_dentry = ntfs_stream_base_dentry(inode);
+		if (IS_ERR(base_dentry)) {
+			err = PTR_ERR(base_dentry);
+			base_dentry = NULL;
+			goto out;
+		}
+		inode_lock(base_vi);
+		if ((attr->ia_valid & ATTR_SIZE) ||
+		    (base_attr.ia_valid &
+		     (ATTR_KILL_SUID | ATTR_KILL_SGID | ATTR_KILL_PRIV))) {
+			kill = ntfs_stream_needs_remove_privs(idmap,
+					base_dentry);
+			if (kill < 0) {
+				err = kill;
+				inode_unlock(base_vi);
+				goto out;
+			}
+			base_attr.ia_valid &= ~(ATTR_KILL_SUID |
+					ATTR_KILL_SGID | ATTR_KILL_PRIV);
+			base_attr.ia_valid |= kill;
+		}
+		err = ntfs_stream_validate_for_mutation(inode);
+		if (err) {
+			inode_unlock(base_vi);
+			goto out;
+		}
+		if (base_attr.ia_valid)
+			err = notify_change(idmap, base_dentry, &base_attr,
+					NULL);
+		else
+			err = 0;
+		inode_unlock(base_vi);
+		if (err)
+			goto out;
+	}
+
+	if (attr->ia_valid & ATTR_SIZE)
+		err = ntfs_setattr_size(inode, attr);
+	else
+		err = 0;
+out:
+	dput(base_dentry);
+	return err;
+}
+
+static int ntfs_stream_setattr(struct mnt_idmap *idmap,
+		struct dentry *dentry, struct iattr *attr)
+{
+	struct inode *inode = d_inode(dentry);
+	struct ntfs_inode *ni = NTFS_I(inode);
+	bool claimed = false;
+	int err;
+
+	if (NVolShutdown(ni->vol))
+		return -EIO;
+
+	if (!(attr->ia_valid & ATTR_FILE)) {
+		err = ntfs_stream_claim(inode);
+		if (err)
+			return err;
+		claimed = true;
+	}
+
+	err = ntfs_stream_setattr_common(idmap, inode, attr);
+	if (claimed)
+		ntfs_stream_put(inode);
+	return err;
+}
+
+static int ntfs_stream_truncate_file(struct file *file)
+{
+	struct inode *inode = file_inode(file);
+	struct iattr attr = {
+		.ia_size = 0,
+		.ia_valid = ATTR_SIZE | ATTR_MTIME | ATTR_CTIME | ATTR_FILE,
+		.ia_file = file,
+	};
+	int err;
+
+	if (NVolShutdown(NTFS_SB(inode->i_sb)))
+		return -EIO;
+
+	/*
+	 * The common setattr helper performs stream permission, privilege,
+	 * validation, page-cache, and NTFS attribute handling. ATTR_FILE
+	 * avoids taking a second stream claim.
+	 */
+	err = inode_lock_killable(inode);
+	if (err)
+		return err;
+	err = ntfs_stream_setattr_common(file_mnt_idmap(file), inode, &attr);
+	inode_unlock(inode);
+	return err;
+}
+
+static int ntfs_stream_update_time(struct inode *inode,
+		enum fs_update_time type, unsigned int flags)
+{
+	struct ntfs_inode *base_ni = NTFS_I(inode)->ext.base_ntfs_ino;
+	struct inode *base_vi = VFS_I(base_ni);
+	int err;
+
+	if (NVolShutdown(base_ni->vol))
+		return -EIO;
+
+	inode_lock(base_vi);
+	mutex_lock(&base_ni->mrec_lock);
+	err = ntfs_stream_inode_validate(inode);
+	if (!err)
+		err = generic_update_time(base_vi, type, flags);
+	mutex_unlock(&base_ni->mrec_lock);
+	inode_unlock(base_vi);
+	return err;
+}
+
+static ssize_t ntfs_stream_listxattr(struct dentry *dentry, char *buffer,
+		size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+#ifdef CONFIG_NTFS_FS_POSIX_ACL
+static struct posix_acl *ntfs_stream_get_acl(struct mnt_idmap *idmap,
+		struct dentry *dentry, int type)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static int ntfs_stream_set_acl(struct mnt_idmap *idmap,
+		struct dentry *dentry, struct posix_acl *acl, int type)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 static loff_t ntfs_file_llseek(struct file *file, loff_t offset, int whence)
 {
 	struct inode *inode = file->f_mapping->host;
@@ -501,7 +893,11 @@ static int ntfs_file_write_dio_end_io(struct kiocb *iocb, ssize_t size,
 	if (size) {
 		if (i_size_read(inode) < iocb->ki_pos + size) {
 			i_size_write(inode, iocb->ki_pos + size);
-			mark_inode_dirty(inode);
+			if (ntfs_inode_is_named_stream(NTFS_I(inode)))
+				mark_inode_dirty(VFS_I(
+					NTFS_I(inode)->ext.base_ntfs_ino));
+			else
+				mark_inode_dirty(inode);
 		}
 	}
 
@@ -558,6 +954,7 @@ out:
 static int ntfs_expand_for_write(struct ntfs_inode *ni, loff_t end)
 {
 	struct ntfs_volume *vol = ni->vol;
+	struct ntfs_inode *mrec_ni = ntfs_base_inode(ni);
 	loff_t prealloc_size = 0;
 	int err;
 
@@ -573,9 +970,9 @@ static int ntfs_expand_for_write(struct ntfs_inode *ni, loff_t end)
 		prealloc_size = ni->allocated_size + vol->preallocated_size;
 	}
 
-	mutex_lock(&ni->mrec_lock);
+	mutex_lock(&mrec_ni->mrec_lock);
 	err = ntfs_attr_expand(ni, end, prealloc_size);
-	mutex_unlock(&ni->mrec_lock);
+	mutex_unlock(&mrec_ni->mrec_lock);
 
 	return err;
 }
@@ -617,7 +1014,7 @@ static ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (ret <= 0)
 		goto out_lock;
 
-	err = file_modified(iocb->ki_filp);
+	err = ntfs_file_modified(iocb->ki_filp);
 	if (err) {
 		ret = err;
 		goto out_lock;
@@ -661,13 +1058,21 @@ static ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 out:
 	if (ret < 0 && ret != -EIOCBQUEUED) {
 		if (ni->initialized_size != old_init_size) {
-			mutex_lock(&ni->mrec_lock);
+			struct ntfs_inode *mrec_ni =
+				ntfs_base_inode(ni);
+
+			mutex_lock(&mrec_ni->mrec_lock);
 			ntfs_attr_set_initialized_size(ni, old_init_size);
-			mutex_unlock(&ni->mrec_lock);
+			mutex_unlock(&mrec_ni->mrec_lock);
 		}
 		if (ni->data_size != old_data_size) {
+			struct ntfs_inode *mrec_ni =
+				ntfs_base_inode(ni);
+
 			truncate_setsize(vi, old_data_size);
+			mutex_lock(&mrec_ni->mrec_lock);
 			ntfs_attr_truncate(ni, old_data_size);
+			mutex_unlock(&mrec_ni->mrec_lock);
 		}
 	}
 out_lock:
@@ -681,13 +1086,23 @@ static vm_fault_t ntfs_filemap_page_mkwrite(struct vm_fault *vmf)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
 	struct address_space *mapping = inode->i_mapping;
+	bool stream = ntfs_inode_is_named_stream(NTFS_I(inode));
+	int err;
 	vm_fault_t ret;
 
 	if (NInoWofCompressed(NTFS_I(inode)))
 		return VM_FAULT_SIGBUS;
 
 	sb_start_pagefault(inode->i_sb);
-	file_update_time(vmf->vma->vm_file);
+	if (stream) {
+		err = ntfs_stream_file_modified(vmf->vma->vm_file);
+		if (err) {
+			ret = vmf_error(err);
+			goto out;
+		}
+	} else {
+		file_update_time(vmf->vma->vm_file);
+	}
 
 	/*
 	 * Serialize against truncate/fallocate which hold the lock
@@ -697,6 +1112,7 @@ static vm_fault_t ntfs_filemap_page_mkwrite(struct vm_fault *vmf)
 	ret = iomap_page_mkwrite(vmf, &ntfs_page_mkwrite_iomap_ops, NULL);
 	filemap_invalidate_unlock_shared(mapping);
 
+out:
 	sb_end_pagefault(inode->i_sb);
 	return ret;
 }
@@ -882,6 +1298,69 @@ static int ntfs_ioctl_fitrim(struct ntfs_volume *vol, unsigned long arg)
 	return 0;
 }
 
+#define NTFS_STREAM_OPEN_ALLOWED_FLAGS \
+	(O_ACCMODE | O_APPEND | O_CLOEXEC | O_CREAT | O_DIRECT | O_DSYNC | \
+	 O_EXCL | O_LARGEFILE | O_NOATIME | O_NONBLOCK | O_SYNC | O_TRUNC)
+
+static const struct file_operations ntfs_stream_file_ops;
+
+static int ntfs_stream_finish_remove(struct inode *attr_vi)
+{
+	struct ntfs_inode *attr_ni = NTFS_I(attr_vi);
+	struct ntfs_inode *ni = attr_ni->ext.base_ntfs_ino;
+	int err;
+
+	mutex_lock(&ni->mrec_lock);
+	if (!NInoStreamUnlinked(attr_ni) ||
+	    atomic_cmpxchg(&attr_ni->stream_open_count, 0, -1)) {
+		err = 0;
+		goto out_unlock;
+	}
+	if (NInoBeingDeleted(ni) || !VFS_I(ni)->i_nlink) {
+		remove_inode_hash(attr_vi);
+		err = 0;
+		goto out_unlock;
+	}
+	mutex_unlock(&ni->mrec_lock);
+
+	truncate_inode_pages(attr_vi->i_mapping, 0);
+
+	mutex_lock(&ni->mrec_lock);
+	if (NVolShutdown(ni->vol)) {
+		err = -EIO;
+		goto out_unlock;
+	}
+	if (NInoBeingDeleted(ni) || !VFS_I(ni)->i_nlink) {
+		remove_inode_hash(attr_vi);
+		err = 0;
+		goto out_unlock;
+	}
+	err = ntfs_attr_rm(attr_ni);
+	if (!err) {
+		NInoClearDirty(attr_ni);
+		remove_inode_hash(attr_vi);
+	} else {
+		NInoSetBeingDeleted(attr_ni);
+		remove_inode_hash(attr_vi);
+		NVolSetErrors(ni->vol);
+		NVolSetShutdown(ni->vol);
+	}
+
+out_unlock:
+	mutex_unlock(&ni->mrec_lock);
+	return err;
+}
+
+int ntfs_stream_put(struct inode *vi)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+
+	if (atomic_dec_and_test(&ni->stream_open_count) &&
+	    NInoStreamUnlinked(ni))
+		return ntfs_stream_finish_remove(vi);
+	return 0;
+}
+
 /*
  * ntfs_remove_named_stream - Remove a named $DATA stream.
  *
@@ -893,7 +1372,7 @@ static int ntfs_ioctl_fitrim(struct ntfs_volume *vol, unsigned long arg)
  *              -ENOENT if stream not found
  */
 static int ntfs_remove_named_stream(struct ntfs_inode *ni, __le16 *uname,
-		u32 uname_len)
+		u32 uname_len, struct inode *expected_vi)
 {
 	struct inode *attr_vi;
 	struct ntfs_inode *attr_ni;
@@ -912,10 +1391,6 @@ static int ntfs_remove_named_stream(struct ntfs_inode *ni, __le16 *uname,
 	}
 
 	mutex_lock(&ni->mrec_lock);
-	if (NVolShutdown(ni->vol)) {
-		err = -EIO;
-		goto out_unlock;
-	}
 	if (NInoBeingDeleted(ni) || !VFS_I(ni)->i_nlink) {
 		err = -ENOENT;
 		goto out_unlock;
@@ -925,42 +1400,387 @@ static int ntfs_remove_named_stream(struct ntfs_inode *ni, __le16 *uname,
 		err = PTR_ERR(attr_vi);
 		goto out_unlock;
 	}
-	if (!attr_vi->i_nlink) {
-		err = -ENOENT;
-		iput(attr_vi);
-		goto out_unlock;
-	}
-	attr_ni = NTFS_I(attr_vi);
-	clear_nlink(attr_vi);
-	mutex_unlock(&ni->mrec_lock);
-
-	truncate_inode_pages(attr_vi->i_mapping, 0);
-
-	mutex_lock(&ni->mrec_lock);
-	if (NVolShutdown(ni->vol)) {
-		if (!NInoBeingDeleted(ni) && VFS_I(ni)->i_nlink)
-			set_nlink(attr_vi, VFS_I(ni)->i_nlink);
-		err = -EIO;
+	if (expected_vi && attr_vi != expected_vi) {
+		err = -ESTALE;
 		goto out_iput;
 	}
-	err = ntfs_attr_rm(attr_ni);
-	if (!err) {
-		NInoClearDirty(attr_ni);
-		remove_inode_hash(attr_vi);
-		inode_set_mtime_to_ts(VFS_I(ni),
-				inode_set_ctime_current(VFS_I(ni)));
-		mark_inode_dirty(VFS_I(ni));
-	} else {
-		NInoSetBeingDeleted(attr_ni);
-		remove_inode_hash(attr_vi);
-		NVolSetErrors(ni->vol);
-		NVolSetShutdown(ni->vol);
+
+	attr_ni = NTFS_I(attr_vi);
+	if (NInoStreamUnlinked(attr_ni)) {
+		err = -ENOENT;
+		goto out_iput;
 	}
+	err = ntfs_stream_inode_validate(attr_vi);
+	if (err)
+		goto out_iput;
+
+	NInoSetStreamUnlinked(attr_ni);
+	clear_nlink(attr_vi);
+	inode_set_mtime_to_ts(VFS_I(ni),
+			inode_set_ctime_current(VFS_I(ni)));
+	mark_inode_dirty(VFS_I(ni));
+	mutex_unlock(&ni->mrec_lock);
+
+	err = ntfs_stream_finish_remove(attr_vi);
+	iput(attr_vi);
+	return err;
+
 out_iput:
 	iput(attr_vi);
 out_unlock:
 	mutex_unlock(&ni->mrec_lock);
 	return err;
+}
+
+static int ntfs_stream_file_open(struct inode *inode, struct file *file)
+{
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct ntfs_inode *base_ni = ni->ext.base_ntfs_ino;
+	struct inode *base_vi = VFS_I(base_ni);
+	int mask = MAY_OPEN;
+	int err;
+
+	if (file->f_mode & FMODE_READ)
+		mask |= MAY_READ;
+	if (file->f_mode & FMODE_WRITE)
+		mask |= MAY_WRITE;
+	err = inode_permission(file_mnt_idmap(file), base_vi, mask);
+	if (err)
+		return err;
+
+	mutex_lock(&base_ni->mrec_lock);
+	if (NInoStreamUnlinked(ni))
+		err = -ENOENT;
+	else
+		err = ntfs_stream_inode_validate(inode);
+	if (err)
+		goto out_unlock;
+	if ((file->f_mode & FMODE_WRITE) &&
+	    (IS_IMMUTABLE(base_vi) ||
+	     (IS_APPEND(base_vi) && !(file->f_flags & O_APPEND)))) {
+		err = -EPERM;
+		goto out_unlock;
+	}
+	if ((file->f_flags & O_TRUNC) && IS_APPEND(base_vi)) {
+		err = -EPERM;
+		goto out_unlock;
+	}
+	if ((file->f_flags & O_NOATIME) &&
+	    !inode_owner_or_capable(file_mnt_idmap(file), base_vi)) {
+		err = -EPERM;
+		goto out_unlock;
+	}
+	err = ntfs_file_open(inode, file);
+	if (err)
+		goto out_unlock;
+	if (file->f_mode & FMODE_WRITE) {
+		err = get_write_access(base_vi);
+		if (err)
+			goto out_unlock;
+		file->private_data = base_vi;
+	}
+
+	atomic_inc(&ni->stream_open_count);
+out_unlock:
+	mutex_unlock(&base_ni->mrec_lock);
+	return err;
+}
+
+static int ntfs_stream_file_release(struct inode *inode, struct file *file)
+{
+	int err, remove_err;
+
+	err = ntfs_file_release(inode, file);
+	if (file->private_data) {
+		put_write_access(file->private_data);
+		file->private_data = NULL;
+	}
+	remove_err = ntfs_stream_put(inode);
+	if (!err)
+		err = remove_err;
+	return err;
+}
+
+static int ntfs_stream_open_access(struct file *filp, int flags)
+{
+	struct inode *inode = file_inode(filp);
+	struct mnt_idmap *idmap = file_mnt_idmap(filp);
+	int mask = MAY_OPEN;
+	int err;
+
+	switch (flags & O_ACCMODE) {
+	case O_RDONLY:
+		mask |= MAY_READ;
+		break;
+	case O_WRONLY:
+		mask |= MAY_WRITE;
+		break;
+	case O_RDWR:
+		mask |= MAY_READ | MAY_WRITE;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (flags & (O_CREAT | O_TRUNC))
+		mask |= MAY_WRITE;
+
+	err = inode_permission(idmap, inode, mask);
+	if (err)
+		return err;
+	if (IS_APPEND(inode)) {
+		if ((flags & O_ACCMODE) != O_RDONLY && !(flags & O_APPEND))
+			return -EPERM;
+		if (flags & O_TRUNC)
+			return -EPERM;
+	}
+	if ((flags & O_NOATIME) && !inode_owner_or_capable(idmap, inode))
+		return -EPERM;
+	return 0;
+}
+
+static long ntfs_ioctl_stream_open(struct file *filp, unsigned long arg)
+{
+	struct inode *base_vi = file_inode(filp);
+	struct ntfs_inode *ni = NTFS_I(base_vi);
+	struct ntfs_stream_open hdr;
+	struct ntfs_stream_open *req;
+	struct ntfs_attr_search_ctx *ctx = NULL;
+	struct inode *attr_vi = NULL;
+	struct dentry *stream_dentry;
+	struct file *stream_file;
+	struct path stream_path;
+	__le16 *uname = NULL, *sname;
+	size_t total_size;
+	int sname_len, err, fd;
+	bool got_write = false, utf16;
+
+	if (NVolShutdown(ni->vol))
+		return -EIO;
+	if (copy_from_user(&hdr, (void __user *)arg, sizeof(hdr)))
+		return -EFAULT;
+
+	if ((hdr.flags & ~NTFS_STREAM_FL_UTF16_NAME) || hdr.reserved ||
+		(hdr.open_flags & ~NTFS_STREAM_OPEN_ALLOWED_FLAGS))
+		return -EINVAL;
+
+	if (!hdr.name_len)
+		return -EINVAL;
+	utf16 = hdr.flags & NTFS_STREAM_FL_UTF16_NAME;
+	if (utf16) {
+		if ((hdr.name_len & 1) ||
+		    hdr.name_len > NTFS_MAX_NAME_LEN * sizeof(__le16))
+			return -EINVAL;
+	} else if (hdr.name_len >
+			NTFS_MAX_NAME_LEN * NLS_MAX_CHARSET_SIZE) {
+		return -EINVAL;
+	}
+
+	if ((hdr.open_flags & O_ACCMODE) == O_ACCMODE ||
+		((hdr.open_flags & O_ACCMODE) != O_RDONLY &&
+		 !(filp->f_mode & FMODE_WRITE)) ||
+		((hdr.open_flags & O_ACCMODE) != O_WRONLY &&
+		 !(filp->f_mode & FMODE_READ)) ||
+		((hdr.open_flags & (O_CREAT | O_TRUNC)) &&
+		 !(filp->f_mode & FMODE_WRITE)) ||
+		((hdr.open_flags & O_TRUNC) &&
+		 !(hdr.open_flags & O_ACCMODE)) ||
+		((hdr.open_flags & O_EXCL) && !(hdr.open_flags & O_CREAT)))
+		return -EBADF;
+
+	err = ntfs_stream_open_access(filp, hdr.open_flags);
+	if (err)
+		return err;
+
+	if (check_add_overflow(sizeof(hdr), (size_t)hdr.name_len, &total_size))
+		return -EOVERFLOW;
+
+	req = memdup_user((void __user *)arg, total_size);
+	if (IS_ERR(req))
+		return PTR_ERR(req);
+
+	if (req->name_len != hdr.name_len || req->flags != hdr.flags ||
+		req->open_flags != hdr.open_flags || req->reserved) {
+		err = -EINVAL;
+		goto out_free_req;
+	}
+	if (force_o_largefile())
+		hdr.open_flags |= O_LARGEFILE;
+
+	if (!utf16 && memchr(req->name, '\0', req->name_len)) {
+		err = -EINVAL;
+		goto out_free_req;
+	}
+
+	if (utf16) {
+		sname = (__le16 *)req->name;
+		sname_len = req->name_len / sizeof(__le16);
+	} else {
+		sname_len = ntfs_nlstoucs(ni->vol, req->name, req->name_len,
+				&uname, NTFS_MAX_NAME_LEN);
+		if (sname_len < 0) {
+			err = sname_len;
+			goto out_free_req;
+		}
+		sname = uname;
+	}
+
+	if (hdr.open_flags & (O_CREAT | O_TRUNC)) {
+		err = mnt_want_write_file(filp);
+		if (err)
+			goto out_free_req;
+		got_write = true;
+	}
+	if ((hdr.open_flags & O_CREAT) &&
+	    !(ni->vol->vol_flags & VOLUME_IS_DIRTY)) {
+		err = ntfs_set_volume_flags(ni->vol, VOLUME_IS_DIRTY);
+		if (err)
+			goto out_free_req;
+	}
+
+	mutex_lock(&ni->mrec_lock);
+	if (NVolShutdown(ni->vol)) {
+		err = -EIO;
+		goto out_unlock;
+	}
+	if (NInoBeingDeleted(ni) || !base_vi->i_nlink) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	if ((hdr.open_flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)) &&
+	    IS_IMMUTABLE(base_vi)) {
+		err = -EPERM;
+		goto out_unlock;
+	}
+	if (IS_APPEND(base_vi) &&
+	    (((hdr.open_flags & O_ACCMODE) != O_RDONLY &&
+	      !(hdr.open_flags & O_APPEND)) ||
+	     (hdr.open_flags & O_TRUNC))) {
+		err = -EPERM;
+		goto out_unlock;
+	}
+
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+
+	err = ntfs_attr_lookup(AT_DATA, sname, sname_len, CASE_SENSITIVE,
+		0, NULL, 0, ctx);
+	if (!err) {
+		if ((hdr.open_flags & (O_CREAT | O_EXCL)) ==
+				(O_CREAT | O_EXCL)) {
+			err = -EEXIST;
+			goto out_put_ctx;
+		}
+	} else if (err == -ENOENT && (hdr.open_flags & O_CREAT)) {
+		if (NVolShutdown(ni->vol)) {
+			err = -EIO;
+			goto out_put_ctx;
+		}
+		err = ntfs_attr_add(ni, AT_DATA, sname, sname_len, NULL, 0);
+		if (err)
+			goto out_put_ctx;
+		mark_mft_record_dirty(ni);
+		inode_set_mtime_to_ts(base_vi,
+				inode_set_ctime_current(base_vi));
+		mark_inode_dirty(base_vi);
+	} else if (err) {
+		goto out_put_ctx;
+	}
+
+	ntfs_attr_put_search_ctx(ctx);
+	ctx = NULL;
+	attr_vi = ntfs_attr_iget(base_vi, AT_DATA, sname, sname_len);
+	if (!IS_ERR(attr_vi)) {
+		if (NInoStreamUnlinked(NTFS_I(attr_vi)))
+			err = (hdr.open_flags & O_CREAT) ? -EBUSY : -ENOENT;
+		else
+			err = ntfs_stream_inode_validate(attr_vi);
+		if (err) {
+			iput(attr_vi);
+			attr_vi = ERR_PTR(err);
+		}
+	}
+out_unlock:
+	mutex_unlock(&ni->mrec_lock);
+	if (IS_ERR(attr_vi)) {
+		err = PTR_ERR(attr_vi);
+		attr_vi = NULL;
+		goto out_free_req;
+	}
+	if (!attr_vi)
+		goto out_free_req;
+
+	if (uname)
+		kmem_cache_free(ntfs_name_cache, uname);
+	kfree(req);
+	uname = NULL;
+	req = NULL;
+
+	attr_vi->i_op = &ntfs_stream_inode_ops;
+	attr_vi->i_fop = &ntfs_stream_file_ops;
+	stream_dentry = d_obtain_alias(attr_vi);
+	attr_vi = NULL;
+	if (IS_ERR(stream_dentry)) {
+		err = PTR_ERR(stream_dentry);
+		goto out;
+	}
+
+	stream_path.mnt = mntget(filp->f_path.mnt);
+	stream_path.dentry = stream_dentry;
+	stream_file = dentry_open(&stream_path, hdr.open_flags, current_cred());
+	path_put(&stream_path);
+	if (IS_ERR(stream_file)) {
+		err = PTR_ERR(stream_file);
+		goto out;
+	}
+	err = security_file_post_open(stream_file,
+			(stream_file->f_mode & FMODE_READ ? MAY_READ : 0) |
+			(stream_file->f_mode & FMODE_WRITE ? MAY_WRITE : 0));
+	if (err)
+		goto out_fput;
+
+	if (hdr.open_flags & O_TRUNC) {
+		err = ntfs_stream_truncate_file(stream_file);
+		if (err)
+			goto out_fput;
+	}
+
+	stream_file->f_flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
+	fd = get_unused_fd_flags(hdr.open_flags & O_CLOEXEC);
+	if (fd < 0) {
+		err = fd;
+		goto out_fput;
+	}
+	if (got_write) {
+		mnt_drop_write_file(filp);
+		got_write = false;
+	}
+	fd_install(fd, stream_file);
+	return fd;
+
+out_fput:
+	fput(stream_file);
+out:
+	if (attr_vi)
+		iput(attr_vi);
+out_free_req:
+	if (ctx) {
+		ntfs_attr_put_search_ctx(ctx);
+		mutex_unlock(&ni->mrec_lock);
+	}
+	if (got_write)
+		mnt_drop_write_file(filp);
+	if (uname)
+		kmem_cache_free(ntfs_name_cache, uname);
+	kfree(req);
+	return err;
+
+out_put_ctx:
+	ntfs_attr_put_search_ctx(ctx);
+	ctx = NULL;
+	goto out_unlock;
 }
 
 static long ntfs_ioctl_stream_remove(struct file *filp, unsigned long arg)
@@ -1046,7 +1866,7 @@ static long ntfs_ioctl_stream_remove(struct file *filp, unsigned long arg)
 
 	err = mnt_want_write_file(filp);
 	if (!err) {
-		err = ntfs_remove_named_stream(ni, sname, sname_len);
+		err = ntfs_remove_named_stream(ni, sname, sname_len, NULL);
 		mnt_drop_write_file(filp);
 	}
 
@@ -1102,6 +1922,11 @@ static int ntfs_ioctl_list_streams(struct file *filp, unsigned long arg)
 		if (a->non_resident &&
 		    a->data.non_resident.lowest_vcn)
 			continue;
+		if (ntfs_stream_is_unlinked(ni,
+				(__le16 *)((u8 *)a +
+				le16_to_cpu(a->name_offset)),
+				a->name_length))
+			continue;
 
 		if (utf16) {
 			name_len = a->name_length * sizeof(__le16);
@@ -1155,6 +1980,11 @@ static int ntfs_ioctl_list_streams(struct file *filp, unsigned long arg)
 			continue;
 		if (a->non_resident &&
 		    a->data.non_resident.lowest_vcn)
+			continue;
+		if (ntfs_stream_is_unlinked(ni,
+				(__le16 *)((u8 *)a +
+				le16_to_cpu(a->name_offset)),
+				a->name_length))
 			continue;
 		if (utf16) {
 			sn = NULL;
@@ -1247,6 +2077,8 @@ long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return ntfs_ioctl_stream_remove(filp, arg);
 	case NTFS_IOC_LIST_STREAMS:
 		return ntfs_ioctl_list_streams(filp, arg);
+	case NTFS_IOC_STREAM_OPEN:
+		return ntfs_ioctl_stream_open(filp, arg);
 	default:
 		return -ENOTTY;
 	}
@@ -1569,6 +2401,18 @@ out:
 	return err;
 }
 
+static const struct file_operations ntfs_stream_file_ops = {
+	.llseek		= ntfs_file_llseek,
+	.read_iter	= ntfs_file_read_iter,
+	.write_iter	= ntfs_file_write_iter,
+	.fsync		= ntfs_file_fsync,
+	.mmap_prepare	= ntfs_file_mmap_prepare,
+	.open		= ntfs_stream_file_open,
+	.release	= ntfs_stream_file_release,
+	.splice_read	= ntfs_file_splice_read,
+	.splice_write	= iter_file_splice_write,
+};
+
 const struct file_operations ntfs_file_ops = {
 	.llseek		= ntfs_file_llseek,
 	.read_iter	= ntfs_file_read_iter,
@@ -1593,6 +2437,19 @@ const struct inode_operations ntfs_file_inode_ops = {
 	.listxattr	= ntfs_listxattr,
 	.get_acl	= ntfs_get_acl,
 	.set_acl	= ntfs_set_acl,
+	.fiemap		= ntfs_fiemap,
+};
+
+const struct inode_operations ntfs_stream_inode_ops = {
+	.permission	= ntfs_stream_permission,
+	.setattr	= ntfs_stream_setattr,
+	.getattr	= ntfs_stream_getattr,
+	.listxattr	= ntfs_stream_listxattr,
+#ifdef CONFIG_NTFS_FS_POSIX_ACL
+	.get_acl	= ntfs_stream_get_acl,
+	.set_acl	= ntfs_stream_set_acl,
+#endif
+	.update_time	= ntfs_stream_update_time,
 	.fiemap		= ntfs_fiemap,
 };
 

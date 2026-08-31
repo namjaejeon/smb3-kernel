@@ -811,6 +811,32 @@ static int ntfs_test_inode_attr(struct inode *vi, void *data)
 		return 0;
 }
 
+static int ntfs_test_inode_stream(struct inode *vi, void *data)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	u64 mft_no = (u64)(uintptr_t)data;
+
+	return ni->mft_no == mft_no && ntfs_inode_is_named_stream(ni);
+}
+
+static void ntfs_invalidate_stream_inodes(struct ntfs_inode *ni)
+{
+	struct inode *attr_vi;
+	struct super_block *sb = VFS_I(ni)->i_sb;
+
+	lockdep_assert_held(&ni->mrec_lock);
+	while ((attr_vi = ilookup5(sb, ni->mft_no, ntfs_test_inode_stream,
+			(void *)(uintptr_t)ni->mft_no))) {
+		struct ntfs_inode *attr_ni = NTFS_I(attr_vi);
+
+		if (atomic_read(&attr_ni->stream_open_count) > 0)
+			NInoSetStreamUnlinked(attr_ni);
+		clear_nlink(attr_vi);
+		remove_inode_hash(attr_vi);
+		iput(attr_vi);
+	}
+}
+
 /*
  * ntfs_delete - delete file or directory from ntfs volume
  * @ni:         ntfs inode for object to delte
@@ -971,6 +997,7 @@ search:
 		NInoSetBeingDeleted(ni);
 		ntfs_delete_reparse_index(ni);
 		ntfs_delete_object_id_index(ni);
+		ntfs_invalidate_stream_inodes(ni);
 		link_count_zero = true;
 	}
 
@@ -1667,11 +1694,19 @@ static struct dentry *ntfs_fh_to_parent(struct super_block *sb, struct fid *fid,
 				    ntfs_nfs_get_inode);
 }
 
+static int ntfs_encode_fh(struct inode *inode, u32 *fh, int *max_len,
+		struct inode *parent)
+{
+	if (ntfs_inode_is_named_stream(NTFS_I(inode)))
+		return -EOPNOTSUPP;
+	return generic_encode_ino32_fh(inode, fh, max_len, parent);
+}
+
 /*
  * Export operations allowing NFS exporting of mounted NTFS partitions.
  */
 const struct export_operations ntfs_export_ops = {
-	.encode_fh = generic_encode_ino32_fh,
+	.encode_fh	= ntfs_encode_fh,
 	.get_parent	= ntfs_get_parent,	/* Find the parent of a given directory. */
 	.fh_to_dentry	= ntfs_fh_to_dentry,
 	.fh_to_parent	= ntfs_fh_to_parent,

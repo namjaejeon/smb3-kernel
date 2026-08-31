@@ -107,6 +107,7 @@ struct ntfs_inode {
 	__le32 type;
 	__le16 *name;
 	u32 name_len;
+	atomic_t stream_open_count;
 	struct runlist runlist;
 	s64 data_size;
 	s64 initialized_size;
@@ -178,6 +179,7 @@ struct ntfs_inode {
  * NI_BeingCreated		ntfs inode is being created.
  * NI_HasEA			ntfs inode has EA attribute.
  * NI_RunlistDirty		runlist need to be updated.
+ * NI_StreamUnlinked		Named stream is unlinked but still open.
  */
 enum {
 	NI_Dirty,
@@ -199,6 +201,7 @@ enum {
 	NI_BeingCreated,
 	NI_HasEA,
 	NI_RunlistDirty,
+	NI_StreamUnlinked,
 };
 
 /*
@@ -259,6 +262,7 @@ TAS_NINO_FNS(FileNameDirty)
 NINO_FNS(BeingDeleted)
 NINO_FNS(HasEA)
 NINO_FNS(RunlistDirty)
+NINO_FNS(StreamUnlinked)
 
 /*
  * The full structure containing a ntfs_inode and a vfs struct inode. Used for
