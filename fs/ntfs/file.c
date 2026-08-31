@@ -15,6 +15,8 @@
 #include <linux/posix_acl_xattr.h>
 #include <linux/compat.h>
 #include <linux/falloc.h>
+#include <linux/overflow.h>
+#include <uapi/linux/ntfs.h>
 
 #include "lcnalloc.h"
 #include "ntfs.h"
@@ -23,6 +25,7 @@
 #include "iomap.h"
 #include "bitmap.h"
 #include "volume.h"
+#include "mft.h"
 
 #include <linux/filelock.h>
 
@@ -879,6 +882,356 @@ static int ntfs_ioctl_fitrim(struct ntfs_volume *vol, unsigned long arg)
 	return 0;
 }
 
+/*
+ * ntfs_remove_named_stream - Remove a named $DATA stream.
+ *
+ * @ni:		NTFS inode
+ * @uname:	Stream name
+ * @uname_len:	Name length in Unicode characters
+ *
+ * Return:	0 on success, negative error
+ *              -ENOENT if stream not found
+ */
+static int ntfs_remove_named_stream(struct ntfs_inode *ni, __le16 *uname,
+		u32 uname_len)
+{
+	struct inode *attr_vi;
+	struct ntfs_inode *attr_ni;
+	int err;
+
+	if (!ni || !uname || uname_len == 0)
+		return -EINVAL;
+	if (NVolShutdown(ni->vol))
+		return -EIO;
+	if (IS_APPEND(VFS_I(ni)) || IS_IMMUTABLE(VFS_I(ni)))
+		return -EPERM;
+	if (!(ni->vol->vol_flags & VOLUME_IS_DIRTY)) {
+		err = ntfs_set_volume_flags(ni->vol, VOLUME_IS_DIRTY);
+		if (err)
+			return err;
+	}
+
+	mutex_lock(&ni->mrec_lock);
+	if (NVolShutdown(ni->vol)) {
+		err = -EIO;
+		goto out_unlock;
+	}
+	if (NInoBeingDeleted(ni) || !VFS_I(ni)->i_nlink) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	attr_vi = ntfs_attr_iget(VFS_I(ni), AT_DATA, uname, uname_len);
+	if (IS_ERR(attr_vi)) {
+		err = PTR_ERR(attr_vi);
+		goto out_unlock;
+	}
+	if (!attr_vi->i_nlink) {
+		err = -ENOENT;
+		iput(attr_vi);
+		goto out_unlock;
+	}
+	attr_ni = NTFS_I(attr_vi);
+	clear_nlink(attr_vi);
+	mutex_unlock(&ni->mrec_lock);
+
+	truncate_inode_pages(attr_vi->i_mapping, 0);
+
+	mutex_lock(&ni->mrec_lock);
+	if (NVolShutdown(ni->vol)) {
+		if (!NInoBeingDeleted(ni) && VFS_I(ni)->i_nlink)
+			set_nlink(attr_vi, VFS_I(ni)->i_nlink);
+		err = -EIO;
+		goto out_iput;
+	}
+	err = ntfs_attr_rm(attr_ni);
+	if (!err) {
+		NInoClearDirty(attr_ni);
+		remove_inode_hash(attr_vi);
+		inode_set_mtime_to_ts(VFS_I(ni),
+				inode_set_ctime_current(VFS_I(ni)));
+		mark_inode_dirty(VFS_I(ni));
+	} else {
+		NInoSetBeingDeleted(attr_ni);
+		remove_inode_hash(attr_vi);
+		NVolSetErrors(ni->vol);
+		NVolSetShutdown(ni->vol);
+	}
+out_iput:
+	iput(attr_vi);
+out_unlock:
+	mutex_unlock(&ni->mrec_lock);
+	return err;
+}
+
+static long ntfs_ioctl_stream_remove(struct file *filp, unsigned long arg)
+{
+	struct inode *inode = file_inode(filp);
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct ntfs_stream_remove __user *ureq =
+		(struct ntfs_stream_remove __user *)arg;
+	struct ntfs_stream_remove *req;
+	size_t header_size = sizeof(struct ntfs_stream_remove);
+	size_t total_size;
+	char *kname;
+	__le16 *uname = NULL, *sname;
+	int err, sname_len;
+	bool utf16;
+	struct ntfs_stream_remove hdr;
+
+	if (NVolShutdown(ni->vol))
+		return -EIO;
+
+	/* First copy fixed header */
+	if (copy_from_user(&hdr, ureq, header_size))
+		return -EFAULT;
+
+	if (!(filp->f_mode & FMODE_WRITE) ||
+	    (hdr.flags & ~NTFS_STREAM_FL_UTF16_NAME) || hdr.reserved)
+		return -EINVAL;
+
+	utf16 = hdr.flags & NTFS_STREAM_FL_UTF16_NAME;
+
+	if (hdr.name_len == 0)
+		return -EINVAL;
+	if (utf16) {
+		/* UTF-16LE byte count: must be even and within the limit. */
+		if ((hdr.name_len & 1) ||
+		    hdr.name_len > NTFS_MAX_NAME_LEN * sizeof(__le16))
+			return -EINVAL;
+	} else if (hdr.name_len >
+			NTFS_MAX_NAME_LEN * NLS_MAX_CHARSET_SIZE) {
+		return -EINVAL;
+	}
+
+	if (check_add_overflow(header_size, (size_t)hdr.name_len, &total_size))
+		return -EOVERFLOW;
+
+	req = memdup_user(ureq, total_size);
+	if (IS_ERR(req))
+		return PTR_ERR(req);
+
+	kname = (char *)req->name;
+
+	if (req->name_len != hdr.name_len || req->flags != hdr.flags ||
+	    req->reserved) {
+		err = -EINVAL;
+		goto out_free;
+	}
+
+	if (utf16) {
+		/* Name is already on-disk UTF-16LE; use it in place. */
+		sname = (__le16 *)kname;
+		sname_len = req->name_len / sizeof(__le16);
+	} else {
+		if (memchr(kname, '\0', req->name_len)) {
+			err = -EINVAL;
+			goto out_free;
+		}
+		sname_len = ntfs_nlstoucs(ni->vol, kname, req->name_len,
+				&uname, NTFS_MAX_NAME_LEN);
+		if (sname_len < 0) {
+			err = sname_len;
+			goto out_free;
+		}
+		sname = uname;
+	}
+
+	err = inode_permission(file_mnt_idmap(filp), inode, MAY_WRITE);
+	if (err)
+		goto out_free;
+	if (IS_APPEND(inode) || IS_IMMUTABLE(inode)) {
+		err = -EPERM;
+		goto out_free;
+	}
+
+	err = mnt_want_write_file(filp);
+	if (!err) {
+		err = ntfs_remove_named_stream(ni, sname, sname_len);
+		mnt_drop_write_file(filp);
+	}
+
+out_free:
+	if (uname)
+		kmem_cache_free(ntfs_name_cache, uname);
+	kfree(req);
+	return err;
+}
+
+static int ntfs_ioctl_list_streams(struct file *filp, unsigned long arg)
+{
+	struct inode *inode = file_inode(filp);
+	struct ntfs_inode *ni = NTFS_I(inode);
+	struct ntfs_list_streams hdr;
+	struct ntfs_stream_entry *entry, *last_entry = NULL;
+	size_t required = 0;
+	void *kbuf = NULL;
+	void __user *ubuf;
+	struct attr_record *a;
+	struct ntfs_attr_search_ctx *actx;
+	int ret = 0, err, count = 0;
+	size_t entry_size, offset = 0;
+	const size_t name_offset = offsetof(struct ntfs_stream_entry, name);
+	unsigned int name_len;
+	unsigned char *sn;
+	bool utf16;
+
+	if (NVolShutdown(ni->vol))
+		return -EIO;
+
+	if (copy_from_user(&hdr, (void __user *)arg, sizeof(hdr)))
+		return -EFAULT;
+
+	if ((hdr.flags & ~NTFS_STREAM_FL_UTF16_NAME) || hdr.reserved)
+		return -EINVAL;
+
+	utf16 = hdr.flags & NTFS_STREAM_FL_UTF16_NAME;
+
+	ubuf = (void __user *)arg + sizeof(hdr);
+
+	mutex_lock(&ni->mrec_lock);
+	actx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!actx) {
+		mutex_unlock(&ni->mrec_lock);
+		return -ENOMEM;
+	}
+
+	while ((err = ntfs_attrs_walk(actx)) == 0) {
+		a = actx->attr;
+		if (a->type != AT_DATA || !a->name_length)
+			continue;
+		if (a->non_resident &&
+		    a->data.non_resident.lowest_vcn)
+			continue;
+
+		if (utf16) {
+			name_len = a->name_length * sizeof(__le16);
+		} else {
+			sn = ntfs_attr_name_get(ni->vol,
+					(__le16 *)((u8 *)a + le16_to_cpu(a->name_offset)),
+					a->name_length);
+			if (!sn) {
+				ret = -EIO;
+				goto out;
+			}
+			name_len = strlen(sn);
+			ntfs_attr_name_free(&sn);
+		}
+
+		entry_size = ALIGN(name_offset + name_len, 8);
+
+		if (required > SIZE_MAX - entry_size) {
+			ret = -EOVERFLOW;
+			goto out;
+		}
+		required += entry_size;
+		count++;
+	}
+	if (err != -ENOENT) {
+		ret = err;
+		goto out;
+	}
+
+	hdr.stream_count = count;
+	hdr.bytes_returned = required;
+
+	if (!count)
+		goto out;
+
+	if (hdr.buffer_size < required) {
+		ret = -ENOSPC;
+		goto out;
+	}
+
+	kbuf = kvzalloc(required, GFP_NOFS);
+	if (!kbuf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ntfs_attr_reinit_search_ctx(actx);
+	while ((err = ntfs_attrs_walk(actx)) == 0) {
+		a = actx->attr;
+		if (a->type != AT_DATA || !a->name_length)
+			continue;
+		if (a->non_resident &&
+		    a->data.non_resident.lowest_vcn)
+			continue;
+		if (utf16) {
+			sn = NULL;
+			name_len = a->name_length * sizeof(__le16);
+		} else {
+			sn = ntfs_attr_name_get(ni->vol,
+					(__le16 *)((u8 *)a + le16_to_cpu(a->name_offset)),
+					a->name_length);
+			if (!sn) {
+				ret = -EIO;
+				goto out;
+			}
+			name_len = strlen(sn);
+		}
+
+		entry_size = ALIGN(name_offset + name_len, 8);
+		if (offset > required - entry_size) {
+			ret = -EOVERFLOW;
+			ntfs_attr_name_free(&sn);
+			goto out;
+		}
+
+		entry = (struct ntfs_stream_entry *)(kbuf + offset);
+
+		if (a->non_resident) {
+			entry->size = le64_to_cpu(a->data.non_resident.data_size);
+			entry->alloc_size =
+				le64_to_cpu(a->data.non_resident.allocated_size);
+
+		} else {
+			entry->size = le32_to_cpu(a->data.resident.value_length);
+			entry->alloc_size = le32_to_cpu(a->length) -
+				le16_to_cpu(a->data.resident.value_offset);
+		}
+
+		entry->name_len = name_len;
+		entry->name_offset = name_offset;
+		if (utf16)
+			memcpy(entry->name,
+			       (u8 *)a + le16_to_cpu(a->name_offset), name_len);
+		else
+			memcpy(entry->name, sn, name_len);
+		ntfs_attr_name_free(&sn);
+
+		entry->next_entry_off = entry_size;
+		last_entry = entry;
+		offset += entry_size;
+	}
+	if (err != -ENOENT) {
+		ret = err;
+	} else {
+		/* The chain terminates at the last entry. */
+		if (last_entry)
+			last_entry->next_entry_off = 0;
+		hdr.bytes_returned = offset;
+	}
+
+out:
+	ntfs_attr_put_search_ctx(actx);
+	mutex_unlock(&ni->mrec_lock);
+
+	if (ret && ret != -ENOSPC)
+		goto out_free;
+
+	if (!ret && kbuf && copy_to_user(ubuf, kbuf, hdr.bytes_returned)) {
+		ret = -EFAULT;
+		goto out_free;
+	}
+
+	if (copy_to_user((void __user *)arg, &hdr, sizeof(hdr)))
+		ret = -EFAULT;
+
+out_free:
+	kvfree(kbuf);
+	return ret;
+}
+
 long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
@@ -890,6 +1243,10 @@ long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return ntfs_ioctl_set_volume_label(filp, arg);
 	case FITRIM:
 		return ntfs_ioctl_fitrim(NTFS_SB(file_inode(filp)->i_sb), arg);
+	case NTFS_IOC_STREAM_REMOVE:
+		return ntfs_ioctl_stream_remove(filp, arg);
+	case NTFS_IOC_LIST_STREAMS:
+		return ntfs_ioctl_list_streams(filp, arg);
 	default:
 		return -ENOTTY;
 	}
