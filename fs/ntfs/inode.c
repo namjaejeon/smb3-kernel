@@ -1527,6 +1527,10 @@ static int ntfs_read_locked_attr_inode(struct inode *base_vi, struct inode *vi)
 		vi->i_blocks = ni->itype.compressed.size >> 9;
 	else
 		vi->i_blocks = ni->allocated_size >> 9;
+	if (ni->type == AT_DATA && ni->name_len) {
+		vi->i_op = &ntfs_stream_inode_ops;
+		vi->i_fop = &ntfs_stream_file_ops;
+	}
 	/*
 	 * Make sure the base inode does not go away and attach it to the
 	 * attribute inode.
@@ -2490,6 +2494,10 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 		seq_puts(sf, ",symlink=native");
 	else
 		seq_puts(sf, ",symlink=wsl");
+	if (NVolStreamsWindows(vol))
+		seq_puts(sf, ",streams_interface=windows");
+	else
+		seq_puts(sf, ",streams_interface=none");
 	if (vol->sb->s_flags & SB_POSIXACL)
 		seq_puts(sf, ",acl");
 	return 0;

@@ -169,4 +169,14 @@ symlink=wsl|native      Configure how symbolic links are created. Under
                         Linux) compatible symlinks are created. Under
                         "native", Windows native symbolic links are
                         created.
+
+streams_interface=      Select the named-stream pathname interface:
+                        "none" (default) treats ':' as an ordinary filename
+                        character, while "windows" interprets the final
+                        component of a path such as "file:stream" as a named
+                        $DATA stream and hides conflicting ':' filenames from
+                        directory listings. The ioctl interface is available
+                        in both modes. An unlinked stream remains available to
+                        existing open file descriptions; recreating its name
+                        returns ``-EBUSY`` until the final close.
 ======================= ====================================================

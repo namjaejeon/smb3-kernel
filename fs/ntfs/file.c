@@ -1302,8 +1302,6 @@ static int ntfs_ioctl_fitrim(struct ntfs_volume *vol, unsigned long arg)
 	(O_ACCMODE | O_APPEND | O_CLOEXEC | O_CREAT | O_DIRECT | O_DSYNC | \
 	 O_EXCL | O_LARGEFILE | O_NOATIME | O_NONBLOCK | O_SYNC | O_TRUNC)
 
-static const struct file_operations ntfs_stream_file_ops;
-
 static int ntfs_stream_finish_remove(struct inode *attr_vi)
 {
 	struct ntfs_inode *attr_ni = NTFS_I(attr_vi);
@@ -1371,7 +1369,7 @@ int ntfs_stream_put(struct inode *vi)
  * Return:	0 on success, negative error
  *              -ENOENT if stream not found
  */
-static int ntfs_remove_named_stream(struct ntfs_inode *ni, __le16 *uname,
+int ntfs_remove_named_stream(struct ntfs_inode *ni, __le16 *uname,
 		u32 uname_len, struct inode *expected_vi)
 {
 	struct inode *attr_vi;
@@ -2401,7 +2399,7 @@ out:
 	return err;
 }
 
-static const struct file_operations ntfs_stream_file_ops = {
+const struct file_operations ntfs_stream_file_ops = {
 	.llseek		= ntfs_file_llseek,
 	.read_iter	= ntfs_file_read_iter,
 	.write_iter	= ntfs_file_write_iter,

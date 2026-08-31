@@ -617,6 +617,16 @@ static inline int ntfs_filldir(struct ntfs_volume *vol,
 		ntfs_debug("Skipping hidden file.");
 		return 0;
 	}
+	if (NVolStreamsWindows(vol)) {
+		unsigned int i;
+
+		for (i = 0; i < ie->key.file_name.file_name_length; i++) {
+			if (le16_to_cpu(ie->key.file_name.file_name[i]) == ':') {
+				ntfs_debug("Skipping file name containing a stream separator.");
+				return 0;
+			}
+		}
+	}
 
 	name_len = ntfs_ucstonls(vol, (__le16 *)&ie->key.file_name.file_name,
 			ie->key.file_name.file_name_length, &name,
@@ -626,7 +636,6 @@ static inline int ntfs_filldir(struct ntfs_volume *vol,
 				(long long)MREF_LE(ie->data.dir.indexed_file));
 		return 0;
 	}
-
 	mref = MREF_LE(ie->data.dir.indexed_file);
 	if (ie->key.file_name.file_attributes &
 			FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT)
