@@ -20,6 +20,32 @@
 #include "iomap.h"
 #include "object_id.h"
 
+int ntfs_check_stream_name(const __le16 *name, unsigned int name_len)
+{
+	unsigned int i;
+
+	if (!name_len || name_len > NTFS_MAX_NAME_LEN)
+		return -EINVAL;
+
+	for (i = 0; i < name_len; i++) {
+		u16 c = le16_to_cpu(name[i]);
+
+		if (c == 0 || c == '/' || c == '\\' || c == ':')
+			return -EINVAL;
+		if (c >= 0xd800 && c <= 0xdbff) {
+			if (++i >= name_len)
+				return -EINVAL;
+			c = le16_to_cpu(name[i]);
+			if (c < 0xdc00 || c > 0xdfff)
+				return -EINVAL;
+		} else if (c >= 0xdc00 && c <= 0xdfff) {
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
 /*
  * ntfs_test_inode - compare two (possibly fake) inodes for equality
  * @vi:		vfs inode which to test

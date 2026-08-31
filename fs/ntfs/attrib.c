@@ -5338,7 +5338,7 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 		err = ntfs_attr_map_whole_runlist(ni);
 		if (err)
 			return err;
-		ctx = ntfs_attr_get_search_ctx(ni, NULL);
+		ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 		if (!ctx) {
 			ntfs_error(sb, "%s: Failed to get search context", __func__);
 			return -ENOMEM;

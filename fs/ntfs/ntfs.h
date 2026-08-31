@@ -254,6 +254,7 @@ bool ntfs_names_are_equal(const __le16 *s1, size_t s1_len,
 		const __le16 *upcase, const u32 upcase_size);
 int ntfs_force_shutdown(struct super_block *sb, u32 flags);
 long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+int ntfs_check_stream_name(const __le16 *name, unsigned int name_len);
 #ifdef CONFIG_COMPAT
 long ntfs_compat_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg);
