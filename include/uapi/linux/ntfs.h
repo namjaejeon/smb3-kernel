@@ -11,7 +11,8 @@
 #define NTFS_IOC_MAGIC	0xEF
 
 /*
- * Flags for ntfs_stream_remove.flags and ntfs_list_streams.flags.
+ * Flags for ntfs_stream_remove.flags, ntfs_stream_open.flags, and
+ * ntfs_list_streams.flags.
  *
  * NTFS_STREAM_FL_UTF16_NAME makes stream names raw UTF-16LE, exactly as
  * stored on disk, instead of encoding them with the mounted filesystem NLS.
@@ -19,7 +20,7 @@
  * not representable in the mount NLS (e.g. for Wine, which works in UTF-16
  * natively). When set, the name length fields count bytes of UTF-16LE and
  * must therefore be even. This flag affects names only; stream contents are
- * always raw bytes when accessed through a stream file descriptor.
+ * always raw bytes when accessed through the returned file descriptor.
  */
 #define NTFS_STREAM_FL_UTF16_NAME	0x1
 
@@ -38,6 +39,31 @@ struct ntfs_stream_remove {
 	__u32 name_len;
 	__u32 flags;
 	__aligned_u64 reserved;
+	__u8 name[];
+};
+
+/*
+ * ntfs named stream open ioctl structure.
+ *
+ * @name_len:	Stream name length in bytes, not including any terminating
+ *		NUL. When NTFS_STREAM_FL_UTF16_NAME is set this is a UTF-16LE
+ *		byte count and must be even.
+ * @flags:	Bit mask of NTFS_STREAM_FL_* flags. Other bits must be zero.
+ * @open_flags: Linux O_* flags for the returned stream file descriptor.
+ * @reserved:	Must be zero.
+ * @name:	Bare stream name, encoded using the same rules as
+ *		NTFS_IOC_STREAM_REMOVE.
+ *
+ * The ioctl returns a new file descriptor on success. O_CREAT creates an
+ * empty named stream when it does not already exist. O_EXCL requires O_CREAT.
+ * The access, append, truncate, direct-I/O, large-file, synchronous-I/O,
+ * non-blocking, no-atime, and close-on-exec O_* flags are supported.
+ */
+struct ntfs_stream_open {
+	__u32 name_len;
+	__u32 flags;
+	__u32 open_flags;
+	__u32 reserved;
 	__u8 name[];
 };
 
@@ -103,5 +129,7 @@ struct ntfs_list_streams {
 	_IOW(NTFS_IOC_MAGIC, 3, struct ntfs_stream_remove)
 #define NTFS_IOC_LIST_STREAMS \
 	_IOWR(NTFS_IOC_MAGIC, 4, struct ntfs_list_streams)
+#define NTFS_IOC_STREAM_OPEN \
+	_IOW(NTFS_IOC_MAGIC, 5, struct ntfs_stream_open)
 
 #endif /* _UAPI_LINUX_NTFS_H */

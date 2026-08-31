@@ -174,6 +174,7 @@ extern const struct address_space_operations ntfs_mft_aops;
 
 extern const struct  file_operations ntfs_file_ops;
 extern const struct inode_operations ntfs_file_inode_ops;
+extern const struct inode_operations ntfs_stream_inode_ops;
 extern const  struct inode_operations ntfs_symlink_inode_operations;
 extern const struct inode_operations ntfs_special_inode_operations;
 
@@ -254,6 +255,11 @@ bool ntfs_names_are_equal(const __le16 *s1, size_t s1_len,
 		const __le16 *upcase, const u32 upcase_size);
 int ntfs_force_shutdown(struct super_block *sb, u32 flags);
 long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
+int ntfs_stream_inode_validate(struct inode *vi);
+bool ntfs_stream_is_unlinked(struct ntfs_inode *base_ni,
+		const __le16 *name, u32 name_len);
+int ntfs_stream_put(struct inode *vi);
+void ntfs_stream_inode_refresh(struct inode *vi);
 #ifdef CONFIG_COMPAT
 long ntfs_compat_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg);

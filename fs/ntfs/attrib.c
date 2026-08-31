@@ -2315,12 +2315,13 @@ int ntfs_attr_set(struct ntfs_inode *ni, s64 ofs, s64 cnt, const u8 val)
 int ntfs_attr_set_initialized_size(struct ntfs_inode *ni, loff_t new_size)
 {
 	struct ntfs_attr_search_ctx *ctx;
+	struct ntfs_inode *base_ni = ntfs_base_inode(ni);
 	int err = 0;
 
 	if (!NInoNonResident(ni))
 		return -EINVAL;
 
-	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 	if (!ctx)
 		return -ENOMEM;
 
@@ -4306,7 +4307,7 @@ static int ntfs_non_resident_attr_shrink(struct ntfs_inode *ni,
 			goto unlock_runlist;
 		}
 
-		ctx = ntfs_attr_get_search_ctx(ni, NULL);
+		ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 		if (!ctx) {
 			ntfs_error(vol->sb, "%s: Failed to get search context", __func__);
 			err = -ENOMEM;

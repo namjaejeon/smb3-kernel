@@ -610,6 +610,8 @@ static int ntfs_getxattr(const struct xattr_handler *handler,
 	struct ntfs_inode *ni = NTFS_I(inode);
 	int err;
 
+	if (ntfs_inode_is_named_stream(ni))
+		return -EOPNOTSUPP;
 	if (NVolShutdown(ni->vol))
 		return -EIO;
 
@@ -883,6 +885,8 @@ static int ntfs_setxattr(const struct xattr_handler *handler,
 	int err;
 	__le32 fattr;
 
+	if (ntfs_inode_is_named_stream(ni))
+		return -EOPNOTSUPP;
 	if (NVolShutdown(ni->vol))
 		return -EIO;
 
