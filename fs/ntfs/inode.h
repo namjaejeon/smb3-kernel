@@ -286,6 +286,18 @@ static inline struct inode *VFS_I(struct ntfs_inode *ni)
 	return &container_of(ni, struct big_ntfs_inode, ntfs_inode)->vfs_inode;
 }
 
+static inline bool ntfs_inode_is_named_stream(struct ntfs_inode *ni)
+{
+	return NInoAttr(ni) && ni->type == AT_DATA && ni->name_len;
+}
+
+static inline struct ntfs_inode *ntfs_base_inode(struct ntfs_inode *ni)
+{
+	if (NInoAttr(ni) && ni->nr_extents == -1 && ni->ext.base_ntfs_ino)
+		return ni->ext.base_ntfs_ino;
+	return ni;
+}
+
 /*
  * ntfs_attr - ntfs in memory attribute structure
  *
