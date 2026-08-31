@@ -121,6 +121,8 @@ int ntfs_attr_truncate_i_locked(struct ntfs_inode *ni, const s64 newsize,
 			       struct ntfs_inode *locked_ni);
 int ntfs_attr_truncate(struct ntfs_inode *ni, const s64 newsize);
 int ntfs_attr_rm(struct ntfs_inode *ni);
+int ntfs_attr_remove_locked(struct ntfs_inode *ni, const __le32 type,
+		__le16 *name, u32 name_len, struct inode **attr_vi);
 int ntfs_attr_exist(struct ntfs_inode *ni, const __le32 type, __le16 *name,
 		u32 name_len);
 int ntfs_attr_remove(struct ntfs_inode *ni, const __le32 type, __le16 *name,

@@ -610,6 +610,8 @@ static int ntfs_getxattr(const struct xattr_handler *handler,
 	struct ntfs_inode *ni = NTFS_I(inode);
 	int err;
 
+	if (ntfs_inode_is_named_stream(ni))
+		return -EOPNOTSUPP;
 	if (NVolShutdown(ni->vol))
 		return -EIO;
 
@@ -668,7 +670,8 @@ static int ntfs_new_attr_flags(struct ntfs_inode *ni, __le32 fattr)
 	}
 
 	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-			CASE_SENSITIVE, 0, NULL, 0, ctx);
+			ntfs_inode_is_named_stream(ni) ?
+			IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (err) {
 		err = -EINVAL;
 		goto err_out;
@@ -716,8 +719,9 @@ static int ntfs_new_attr_flags(struct ntfs_inode *ni, __le32 fattr)
 			goto err_out;
 
 		ntfs_attr_reinit_search_ctx(ctx);
-		err = ntfs_attr_lookup(ni->type, ni->name,
-				ni->name_len, CASE_SENSITIVE,
+		err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+				ntfs_inode_is_named_stream(ni) ?
+				IGNORE_CASE : CASE_SENSITIVE,
 				0, NULL, 0, ctx);
 		if (err) {
 			err = -EINVAL;
@@ -883,6 +887,8 @@ static int ntfs_setxattr(const struct xattr_handler *handler,
 	int err;
 	__le32 fattr;
 
+	if (ntfs_inode_is_named_stream(ni))
+		return -EOPNOTSUPP;
 	if (NVolShutdown(ni->vol))
 		return -EIO;
 

@@ -169,7 +169,8 @@ int ntfs_map_runlist_nolock(struct ntfs_inode *ni, s64 vcn, struct ntfs_attr_sea
 	}
 	if (ctx_needs_reset) {
 		err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-				CASE_SENSITIVE, vcn, NULL, 0, ctx);
+				ntfs_inode_is_named_stream(ni) ?
+				IGNORE_CASE : CASE_SENSITIVE, vcn, NULL, 0, ctx);
 		if (unlikely(err)) {
 			if (err == -ENOENT)
 				err = -EIO;
@@ -1987,7 +1988,8 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 		goto err_out;
 	}
 	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-			CASE_SENSITIVE, 0, NULL, 0, ctx);
+			ntfs_inode_is_named_stream(ni) ?
+			IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (unlikely(err)) {
 		if (err == -ENOENT)
 			err = -EIO;
@@ -2315,17 +2317,19 @@ int ntfs_attr_set(struct ntfs_inode *ni, s64 ofs, s64 cnt, const u8 val)
 int ntfs_attr_set_initialized_size(struct ntfs_inode *ni, loff_t new_size)
 {
 	struct ntfs_attr_search_ctx *ctx;
+	struct ntfs_inode *base_ni = ntfs_base_inode(ni);
 	int err = 0;
 
 	if (!NInoNonResident(ni))
 		return -EINVAL;
 
-	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 	if (!ctx)
 		return -ENOMEM;
 
 	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-			       CASE_SENSITIVE, 0, NULL, 0, ctx);
+			       ntfs_inode_is_named_stream(ni) ?
+			       IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (err)
 		goto out_ctx;
 
@@ -2402,6 +2406,7 @@ int ntfs_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	struct mft_record *m;
 	int err, offset;
 	struct ntfs_inode *base_ni;
+	u32 ic;
 
 	if (!ni || (!name && name_len))
 		return -EINVAL;
@@ -2431,7 +2436,8 @@ int ntfs_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	 * attribute in @ni->mrec, not any extent inode in case if @ni is base
 	 * file record.
 	 */
-	err = ntfs_attr_find(type, name, name_len, CASE_SENSITIVE, val, size, ctx);
+	ic = type == AT_DATA && name_len ? IGNORE_CASE : CASE_SENSITIVE;
+	err = ntfs_attr_find(type, name, name_len, ic, val, size, ctx);
 	if (!err) {
 		err = -EEXIST;
 		ntfs_debug("Attribute already present.\n");
@@ -2523,6 +2529,7 @@ static int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	struct mft_record *m;
 	struct ntfs_inode *base_ni;
 	int err, offset;
+	u32 ic;
 
 	if (!ni || dataruns_size <= 0 || (!name && name_len))
 		return -EINVAL;
@@ -2552,7 +2559,8 @@ static int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	 * attribute in @ni->mrec, not any extent inode in case if @ni is base
 	 * file record.
 	 */
-	err = ntfs_attr_find(type, name, name_len, CASE_SENSITIVE, NULL, 0, ctx);
+	ic = type == AT_DATA && name_len ? IGNORE_CASE : CASE_SENSITIVE;
+	err = ntfs_attr_find(type, name, name_len, ic, NULL, 0, ctx);
 	if (!err) {
 		err = -EEXIST;
 		pr_err("Attribute 0x%x already present\n", type);
@@ -2626,7 +2634,7 @@ static int ntfs_non_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 	 * update of attribute list.
 	 */
 	ntfs_attr_reinit_search_ctx(ctx);
-	err = ntfs_attr_lookup(type, name, name_len, CASE_SENSITIVE,
+	err = ntfs_attr_lookup(type, name, name_len, ic,
 				lowest_vcn, NULL, 0, ctx);
 	if (err) {
 		pr_err("%s: attribute lookup failed\n", __func__);
@@ -3095,6 +3103,7 @@ int ntfs_attr_open(struct ntfs_inode *ni, const __le32 type,
 	struct attr_record *a;
 	bool cs;
 	struct ntfs_inode *base_ni;
+	u32 ic;
 	int err;
 
 	if (!ni || !ni->vol)
@@ -3103,10 +3112,7 @@ int ntfs_attr_open(struct ntfs_inode *ni, const __le32 type,
 	ntfs_debug("Entering for inode %lld, attr 0x%x.\n",
 			ni->mft_no, type);
 
-	if (NInoAttr(ni))
-		base_ni = ni->ext.base_ntfs_ino;
-	else
-		base_ni = ni;
+	base_ni = ntfs_base_inode(ni);
 
 	if (name && name != AT_UNNAMED && name != I30) {
 		name = ntfs_ucsndup(name, name_len);
@@ -3124,7 +3130,8 @@ int ntfs_attr_open(struct ntfs_inode *ni, const __le32 type,
 		goto err_out;
 	}
 
-	err = ntfs_attr_lookup(type, name, name_len, 0, 0, NULL, 0, ctx);
+	ic = type == AT_DATA && name_len ? IGNORE_CASE : CASE_SENSITIVE;
+	err = ntfs_attr_lookup(type, name, name_len, ic, 0, NULL, 0, ctx);
 	if (err)
 		goto put_err_out;
 
@@ -3309,7 +3316,9 @@ int ntfs_attr_map_whole_runlist(struct ntfs_inode *ni)
 			not_mapped = 1;
 
 		err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-					CASE_SENSITIVE, next_vcn, NULL, 0, ctx);
+					ntfs_inode_is_named_stream(ni) ?
+					IGNORE_CASE : CASE_SENSITIVE, next_vcn,
+					NULL, 0, ctx);
 		if (err)
 			break;
 
@@ -3394,6 +3403,7 @@ int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx, struct ntfs_inode
 	struct ntfs_attr_search_ctx *nctx;
 	struct attr_record *a;
 	int err;
+	u32 ic;
 	struct mft_record *ni_mrec;
 	struct super_block *sb;
 
@@ -3429,9 +3439,11 @@ int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx, struct ntfs_inode
 	 * attribute in @ni->mrec, not any extent inode in case if @ni is base
 	 * file record.
 	 */
-	err = ntfs_attr_find(a->type, (__le16 *)((u8 *)a + le16_to_cpu(a->name_offset)),
-				a->name_length, CASE_SENSITIVE, NULL,
-				0, nctx);
+	ic = a->type == AT_DATA && a->name_length ?
+			IGNORE_CASE : CASE_SENSITIVE;
+	err = ntfs_attr_find(a->type,
+			(__le16 *)((u8 *)a + le16_to_cpu(a->name_offset)),
+			a->name_length, ic, NULL, 0, nctx);
 	if (!err) {
 		ntfs_debug("Attribute of such type, with same name already present in this MFT record.\n");
 		err = -EEXIST;
@@ -3763,7 +3775,9 @@ retry:
 	finished_build = false;
 	start_rl = ni->runlist.rl;
 	while (!(err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-				CASE_SENSITIVE, from_vcn, NULL, 0, ctx))) {
+				ntfs_inode_is_named_stream(ni) ?
+				IGNORE_CASE : CASE_SENSITIVE, from_vcn, NULL,
+				0, ctx))) {
 		unsigned int de_cnt = 0;
 
 		a = ctx->attr;
@@ -3952,7 +3966,8 @@ retry:
 	if (!first_updated) {
 		ntfs_attr_reinit_search_ctx(ctx);
 		err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-				CASE_SENSITIVE, 0, NULL, 0, ctx);
+				ntfs_inode_is_named_stream(ni) ?
+				IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 		if (!err) {
 			a = ctx->attr;
 			a->data.non_resident.allocated_size = cpu_to_le64(ni->allocated_size);
@@ -3974,7 +3989,9 @@ retry:
 		ntfs_attr_reinit_search_ctx(ctx);
 		ntfs_debug("Deallocate marked extents.\n");
 		while (!(err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-				CASE_SENSITIVE, 0, NULL, 0, ctx))) {
+				ntfs_inode_is_named_stream(ni) ?
+				IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0,
+				ctx))) {
 			if (le64_to_cpu(ctx->attr->data.non_resident.highest_vcn) !=
 					NTFS_VCN_DELETE_MARK)
 				continue;
@@ -4306,7 +4323,7 @@ static int ntfs_non_resident_attr_shrink(struct ntfs_inode *ni,
 			goto unlock_runlist;
 		}
 
-		ctx = ntfs_attr_get_search_ctx(ni, NULL);
+		ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
 		if (!ctx) {
 			ntfs_error(vol->sb, "%s: Failed to get search context", __func__);
 			err = -ENOMEM;
@@ -4365,8 +4382,9 @@ static int ntfs_non_resident_attr_shrink(struct ntfs_inode *ni,
 		return -ENOMEM;
 	}
 
-	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len, CASE_SENSITIVE,
-				0, NULL, 0, ctx);
+	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+				ntfs_inode_is_named_stream(ni) ?
+				IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (err) {
 		if (err == -ENOENT)
 			err = -EIO;
@@ -4652,8 +4670,9 @@ static int ntfs_non_resident_attr_expand(struct ntfs_inode *ni, const s64 newsiz
 		goto rollback;
 	}
 
-	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len, CASE_SENSITIVE,
-			       0, NULL, 0, ctx);
+	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+			       ntfs_inode_is_named_stream(ni) ?
+			       IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (err) {
 		if (err == -ENOENT)
 			err = -EIO;
@@ -4757,7 +4776,8 @@ attr_resize_again:
 	}
 
 	err = ntfs_attr_lookup(attr_ni->type, attr_ni->name, attr_ni->name_len,
-			0, 0, NULL, 0, ctx);
+			ntfs_inode_is_named_stream(attr_ni) ?
+			IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (err) {
 		ntfs_error(sb, "ntfs_attr_lookup failed");
 		goto put_err_out;
@@ -4903,7 +4923,8 @@ attr_resize_again:
 	/* Point search context back to attribute which we need resize. */
 	ntfs_attr_reinit_search_ctx(ctx);
 	err = ntfs_attr_lookup(attr_ni->type, attr_ni->name, attr_ni->name_len,
-			CASE_SENSITIVE, 0, NULL, 0, ctx);
+			ntfs_inode_is_named_stream(attr_ni) ?
+			IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (err) {
 		ntfs_error(sb, "%s: Attribute lookup failed 2", __func__);
 		goto put_err_out;
@@ -5154,7 +5175,8 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 	}
 
 	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-			CASE_SENSITIVE, vcn, NULL, 0, ctx);
+			ntfs_inode_is_named_stream(ni) ?
+			IGNORE_CASE : CASE_SENSITIVE, vcn, NULL, 0, ctx);
 	if (err) {
 		ntfs_error(vol->sb,
 			   "ntfs_attr_lookup failed, ntfs inode(mft_no : %llu) type : 0x%x, err : %d",
@@ -5322,11 +5344,10 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 	int err = 0, ret = 0;
 	struct ntfs_inode *base_ni;
 	struct super_block *sb = ni->vol->sb;
+	u32 ic;
 
-	if (NInoAttr(ni))
-		base_ni = ni->ext.base_ntfs_ino;
-	else
-		base_ni = ni;
+	base_ni = ntfs_base_inode(ni);
+	ic = ntfs_inode_is_named_stream(ni) ? IGNORE_CASE : CASE_SENSITIVE;
 
 	ntfs_debug("Entering for inode 0x%llx, attr 0x%x.\n",
 			(long long) ni->mft_no, ni->type);
@@ -5358,7 +5379,7 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 		return -ENOMEM;
 	}
 	while (!(err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-				CASE_SENSITIVE, 0, NULL, 0, ctx))) {
+				ic, 0, NULL, 0, ctx))) {
 		err = ntfs_attr_record_rm(ctx);
 		if (err) {
 			ntfs_error(sb,
@@ -5380,6 +5401,7 @@ int ntfs_attr_exist(struct ntfs_inode *ni, const __le32 type, __le16 *name,
 		u32 name_len)
 {
 	struct ntfs_attr_search_ctx *ctx;
+	u32 ic;
 	int ret;
 
 	ntfs_debug("Entering\n");
@@ -5391,39 +5413,56 @@ int ntfs_attr_exist(struct ntfs_inode *ni, const __le32 type, __le16 *name,
 		return 0;
 	}
 
-	ret = ntfs_attr_lookup(type, name, name_len, CASE_SENSITIVE,
+	ic = type == AT_DATA && name_len ? IGNORE_CASE : CASE_SENSITIVE;
+	ret = ntfs_attr_lookup(type, name, name_len, ic,
 			0, NULL, 0, ctx);
 	ntfs_attr_put_search_ctx(ctx);
 
 	return !ret;
 }
 
-int ntfs_attr_remove(struct ntfs_inode *ni, const __le32 type, __le16 *name,
-		u32 name_len)
+int ntfs_attr_remove_locked(struct ntfs_inode *ni, const __le32 type,
+		__le16 *name, u32 name_len, struct inode **attr_vi)
 {
 	int err;
-	struct inode *attr_vi;
 	struct ntfs_inode *attr_ni;
 
 	ntfs_debug("Entering\n");
 
-	if (!ni)
+	if (!ni || !attr_vi)
 		return -EINVAL;
 
-	attr_vi = ntfs_attr_iget(VFS_I(ni), type, name, name_len);
-	if (IS_ERR(attr_vi)) {
-		err = PTR_ERR(attr_vi);
+	*attr_vi = ntfs_attr_iget(VFS_I(ni), type, name, name_len);
+	if (IS_ERR(*attr_vi)) {
+		err = PTR_ERR(*attr_vi);
+		*attr_vi = NULL;
 		ntfs_error(ni->vol->sb, "Failed to open attribute 0x%02x of inode 0x%llx",
 				type, (unsigned long long)ni->mft_no);
 		return err;
 	}
-	attr_ni = NTFS_I(attr_vi);
+	attr_ni = NTFS_I(*attr_vi);
 
 	err = ntfs_attr_rm(attr_ni);
-	if (err)
+	if (err) {
 		ntfs_error(ni->vol->sb, "Failed to remove attribute 0x%02x of inode 0x%llx",
 				type, (unsigned long long)ni->mft_no);
-	iput(attr_vi);
+	} else {
+		NInoClearDirty(attr_ni);
+		clear_nlink(*attr_vi);
+		remove_inode_hash(*attr_vi);
+	}
+	return err;
+}
+
+int ntfs_attr_remove(struct ntfs_inode *ni, const __le32 type, __le16 *name,
+		u32 name_len)
+{
+	struct inode *attr_vi = NULL;
+	int err;
+
+	err = ntfs_attr_remove_locked(ni, type, name, name_len, &attr_vi);
+	if (attr_vi)
+		iput(attr_vi);
 	return err;
 }
 
@@ -5559,8 +5598,9 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
 		return ret;
 	}
 
-	ret = ntfs_attr_lookup(ni->type, ni->name, ni->name_len, CASE_SENSITIVE,
-			       0, NULL, 0, ctx);
+	ret = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+			       ntfs_inode_is_named_stream(ni) ?
+			       IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (ret) {
 		ntfs_attr_put_search_ctx(ctx);
 		return ret;
@@ -5647,8 +5687,9 @@ int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn, 
 		goto out_rl;
 	}
 
-	ret = ntfs_attr_lookup(ni->type, ni->name, ni->name_len, CASE_SENSITIVE,
-			       0, NULL, 0, ctx);
+	ret = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+			       ntfs_inode_is_named_stream(ni) ?
+			       IGNORE_CASE : CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (ret)
 		goto out_ctx;
 

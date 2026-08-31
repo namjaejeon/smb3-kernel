@@ -173,7 +173,9 @@ extern const struct address_space_operations ntfs_aops;
 extern const struct address_space_operations ntfs_mft_aops;
 
 extern const struct  file_operations ntfs_file_ops;
+extern const struct  file_operations ntfs_stream_file_ops;
 extern const struct inode_operations ntfs_file_inode_ops;
+extern const struct inode_operations ntfs_stream_inode_ops;
 extern const  struct inode_operations ntfs_symlink_inode_operations;
 extern const struct inode_operations ntfs_special_inode_operations;
 
@@ -184,6 +186,8 @@ extern const struct  file_operations ntfs_empty_file_ops;
 extern const struct inode_operations ntfs_empty_inode_ops;
 
 extern const struct export_operations ntfs_export_ops;
+void ntfs_set_default_dentry_ops(struct super_block *sb);
+int ntfs_check_stream_name(const __le16 *name, unsigned int name_len);
 
 /*
  * NTFS_SB - return the ntfs volume given a vfs super block
@@ -254,7 +258,13 @@ bool ntfs_names_are_equal(const __le16 *s1, size_t s1_len,
 		const __le16 *upcase, const u32 upcase_size);
 int ntfs_force_shutdown(struct super_block *sb, u32 flags);
 long ntfs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
-int ntfs_check_stream_name(const __le16 *name, unsigned int name_len);
+int ntfs_remove_named_stream(struct ntfs_inode *ni, __le16 *uname,
+		u32 uname_len, struct inode *expected_vi);
+int ntfs_stream_inode_validate(struct inode *vi);
+bool ntfs_stream_is_unlinked(struct ntfs_inode *base_ni,
+		const __le16 *name, u32 name_len);
+int ntfs_stream_put(struct inode *vi);
+void ntfs_stream_inode_refresh(struct inode *vi);
 #ifdef CONFIG_COMPAT
 long ntfs_compat_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg);

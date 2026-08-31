@@ -311,7 +311,9 @@ static int parse_wof_chunk_table(struct ntfs_inode *base_ni,
 			goto out_unlock_mrec;
 		}
 		ret = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
-				       CASE_SENSITIVE, 0, NULL, 0, ctx);
+				       ntfs_inode_is_named_stream(ni) ?
+				       IGNORE_CASE : CASE_SENSITIVE,
+				       0, NULL, 0, ctx);
 		if (ret)
 			goto out_put_ctx;
 
@@ -399,7 +401,9 @@ static int ntfs_read_wof_chunk(struct ntfs_volume *vol,
 	}
 
 	err = ntfs_attr_lookup(wof_ni->type, wof_ni->name, wof_ni->name_len,
-			       CASE_SENSITIVE, 0, NULL, 0, ctx);
+			       ntfs_inode_is_named_stream(wof_ni) ?
+			       IGNORE_CASE : CASE_SENSITIVE,
+			       0, NULL, 0, ctx);
 	if (err)
 		goto out_put_ctx;
 
