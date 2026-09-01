@@ -135,6 +135,7 @@ jobs:
               ;;
             kasan)
               ./scripts/config --enable CONFIG_KASAN
+              ./scripts/config --enable CONFIG_KASAN_GENERIC
               ./scripts/config --disable CONFIG_KCSAN
               ./scripts/config --disable CONFIG_KCSAN_EARLY_ENABLE
               ./scripts/config --disable CONFIG_KFENCE
@@ -180,6 +181,7 @@ jobs:
               ;;
             kasan)
               check_enabled CONFIG_KASAN
+              check_enabled CONFIG_KASAN_GENERIC
               check_disabled CONFIG_KCSAN
               check_disabled CONFIG_KFENCE
               check_disabled CONFIG_PROVE_LOCKING
@@ -211,6 +213,7 @@ jobs:
           #!/usr/bin/env bash
           set -u
 
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
           XFSTESTS_DIR="${XFSTESTS_DIR:-$PWD/xfstests-dev}"
           EXPORT_BASE="${EXPORT_BASE:-/var/tmp/kci-ksmbd}"
           SMB_USER=linkinjeon
@@ -386,6 +389,7 @@ jobs:
       - name: Show results
         if: always()
         run: |
+          mkdir -p test-results
           summary_file=test-results/xfstests-ksmbd.txt
           summary=$(grep -E "^(Failed [0-9]+ of [0-9]+ tests|Passed all [0-9]+ tests)$" \
             "$summary_file" 2>/dev/null | tail -1 || true)
