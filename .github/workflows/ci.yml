@@ -330,7 +330,6 @@ jobs:
           timeout 14400 vng --rw --verbose \
             --memory 8G --cpus "$(nproc)" \
             --append 'panic_on_warn=0' --network user --user root \
-            --kdir "$GITHUB_WORKSPACE" \
             --exec "cd $GITHUB_WORKSPACE && bash .github/xfstests-ksmbd.sh" \
             2>&1 | tee test-results/vng-output.txt
           vm_status=${PIPESTATUS[0]}
