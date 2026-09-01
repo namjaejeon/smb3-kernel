@@ -12,22 +12,17 @@ jobs:
   # directly by this workflow. The repository is the kernel under test;
   # ksmbd-tools and xfstests are fetched next to it.
   #
-  # One parallel leg per sanitizer, starting from defconfig and enabling
-  # only the sanitizer and filesystem options needed by this test.
-  # KFENCE is off next to full KASAN coverage and on for KCSAN.
+  # One parallel leg per kernel-debugging variant, starting from defconfig
+  # and enabling only the options needed by that variant.
   ksmbd-xfstests:
     strategy:
       fail-fast: false
       matrix:
         include:
+          - sanitizer: normal
           - sanitizer: kasan
-            config_check: CONFIG_KASAN=y
           - sanitizer: kcsan
-            config_check: CONFIG_KCSAN=y
-          # kmsan leg deactivated for now (too slow for the 6h job limit);
-          # uncomment and add its compiler probe before re-enabling.
-          # - sanitizer: kmsan
-          #   config_check: CONFIG_KMSAN=y
+          - sanitizer: lockdep
     name: ksmbd-xfstests (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest
     # GitHub-hosted maximum; the VM timeout below is 4h so reporting and
@@ -130,35 +125,84 @@ jobs:
           ./scripts/config --enable CONFIG_SMB_SERVER
           ./scripts/config --enable CONFIG_SMB_SERVER_CHECK_CAP_NET_ADMIN
           ./scripts/config --enable CONFIG_DEBUG_KERNEL
-          if [ "${{ matrix.sanitizer }}" = "kasan" ]; then
-            ./scripts/config --enable CONFIG_KASAN
-            ./scripts/config --disable CONFIG_KFENCE
-          else
-            ./scripts/config --enable CONFIG_KCSAN
-            ./scripts/config --enable CONFIG_KCSAN_EARLY_ENABLE
-            ./scripts/config --enable CONFIG_KFENCE
-          fi
+          case "${{ matrix.sanitizer }}" in
+            normal)
+              ./scripts/config --disable CONFIG_KASAN
+              ./scripts/config --disable CONFIG_KCSAN
+              ./scripts/config --disable CONFIG_KCSAN_EARLY_ENABLE
+              ./scripts/config --disable CONFIG_KFENCE
+              ./scripts/config --disable CONFIG_PROVE_LOCKING
+              ;;
+            kasan)
+              ./scripts/config --enable CONFIG_KASAN
+              ./scripts/config --disable CONFIG_KCSAN
+              ./scripts/config --disable CONFIG_KCSAN_EARLY_ENABLE
+              ./scripts/config --disable CONFIG_KFENCE
+              ./scripts/config --disable CONFIG_PROVE_LOCKING
+              ;;
+            kcsan)
+              ./scripts/config --disable CONFIG_KASAN
+              ./scripts/config --enable CONFIG_KCSAN
+              ./scripts/config --enable CONFIG_KCSAN_EARLY_ENABLE
+              ./scripts/config --enable CONFIG_KFENCE
+              ./scripts/config --disable CONFIG_PROVE_LOCKING
+              ;;
+            lockdep)
+              ./scripts/config --disable CONFIG_KASAN
+              ./scripts/config --disable CONFIG_KCSAN
+              ./scripts/config --disable CONFIG_KCSAN_EARLY_ENABLE
+              ./scripts/config --disable CONFIG_KFENCE
+              ./scripts/config --enable CONFIG_PROVE_LOCKING
+              ;;
+            *)
+              echo "::error::unknown kernel variant: ${{ matrix.sanitizer }}"
+              exit 1
+              ;;
+          esac
           make LLVM=1 olddefconfig
 
       - name: Verify kernel configuration
         run: |
           grep -x "CONFIG_CIFS=y" .config
           grep -x "CONFIG_SMB_SERVER=y" .config
-          grep -x "${{ matrix.config_check }}" .config
-          grep -E "CONFIG_(CC_IS_CLANG|CC_VERSION_TEXT|DEBUG_KERNEL|KASAN|KCSAN|KCSAN_EARLY_ENABLE|KFENCE)[= ]" .config || true
+          check_enabled() {
+            grep -qx "$1=y" .config
+          }
+          check_disabled() {
+            grep -Eq "^$1=n$|^# $1 is not set$" .config
+          }
+          case "${{ matrix.sanitizer }}" in
+            normal)
+              check_disabled CONFIG_KASAN
+              check_disabled CONFIG_KCSAN
+              check_disabled CONFIG_KFENCE
+              check_disabled CONFIG_PROVE_LOCKING
+              ;;
+            kasan)
+              check_enabled CONFIG_KASAN
+              check_disabled CONFIG_KCSAN
+              check_disabled CONFIG_KFENCE
+              check_disabled CONFIG_PROVE_LOCKING
+              ;;
+            kcsan)
+              check_enabled CONFIG_KCSAN
+              check_enabled CONFIG_KCSAN_EARLY_ENABLE
+              check_enabled CONFIG_KFENCE
+              check_disabled CONFIG_KASAN
+              check_disabled CONFIG_PROVE_LOCKING
+              ;;
+            lockdep)
+              check_enabled CONFIG_PROVE_LOCKING
+              check_enabled CONFIG_LOCKDEP
+              check_disabled CONFIG_KASAN
+              check_disabled CONFIG_KCSAN
+              check_disabled CONFIG_KFENCE
+              ;;
+          esac
+          grep -E "CONFIG_(CC_IS_CLANG|CC_VERSION_TEXT|DEBUG_KERNEL|KASAN|KCSAN|KCSAN_EARLY_ENABLE|KFENCE|PROVE_LOCKING|LOCKDEP)[= ]" .config || true
 
       - name: Build kernel
         run: make -j"$(nproc)" LLVM=1
-
-      # olddefconfig drops sanitizer options whose dependencies are unmet;
-      # fail loudly instead of silently testing an unsanitized kernel,
-      # and dump the dependency state so the cause is visible in the log.
-      - name: Verify ${{ matrix.sanitizer }} is enabled
-        run: |
-          grep -x "${{ matrix.config_check }}" .config && exit 0
-          echo "::error::${{ matrix.sanitizer }} was dropped by olddefconfig; dependency state:"
-          grep -E "CONFIG_(CC_IS_CLANG|CC_VERSION_TEXT|HAVE_ARCH_KMSAN|HAVE_KMSAN_COMPILER|HAVE_ARCH_KCSAN|HAVE_KCSAN_COMPILER|DEBUG_KERNEL|PREEMPT_RT|KASAN|KCSAN|KMSAN|KFENCE)[= ]" .config || true
-          exit 1
 
       - name: Prepare ksmbd xfstests guest script
         run: |
@@ -340,6 +384,35 @@ jobs:
       - name: Show results
         if: always()
         run: |
+          summary_file=test-results/xfstests-ksmbd.txt
+          summary=$(grep -E "^(Failed [0-9]+ of [0-9]+ tests|Passed all [0-9]+ tests)$" \
+            "$summary_file" 2>/dev/null | tail -1 || true)
+          failed_tests=$(sed -n 's/^Failures:[[:space:]]*//p' "$summary_file" 2>/dev/null | head -1 || true)
+          not_run_tests=$(sed -n 's/^Not run:[[:space:]]*//p' "$summary_file" 2>/dev/null | head -1 || true)
+          passed_count=0
+          failed_count=0
+          total_count=0
+          if [[ "$summary" =~ ^Failed[[:space:]]+([0-9]+)[[:space:]]+of[[:space:]]+([0-9]+)[[:space:]]+tests$ ]]; then
+            failed_count=${BASH_REMATCH[1]}
+            total_count=${BASH_REMATCH[2]}
+            passed_count=$((total_count - failed_count))
+          elif [[ "$summary" =~ ^Passed[[:space:]]+all[[:space:]]+([0-9]+)[[:space:]]+tests$ ]]; then
+            total_count=${BASH_REMATCH[1]}
+            passed_count=$total_count
+          fi
+          not_run_count=0
+          if [ -n "$not_run_tests" ]; then
+            read -r -a not_run_array <<< "$not_run_tests"
+            not_run_count=${#not_run_array[@]}
+          fi
+          {
+            echo "Passed: $passed_count"
+            echo "Failed: $failed_count"
+            echo "Not run: $not_run_count"
+            echo "Total: $total_count"
+            echo "Failed test cases: ${failed_tests:-none}"
+          } | tee test-results/xfstests-summary.txt
+          echo ""
           echo "=== XFSTESTS SUMMARY ==="
           grep -E "^(Failures:|Failed [0-9]+ of|Passed all|Not run:)" test-results/xfstests-ksmbd.txt 2>/dev/null || echo "(no summary)"
           echo ""
@@ -351,6 +424,8 @@ jobs:
           {
             echo "## xfstests over ksmbd (${{ matrix.sanitizer }})"
             echo '```'
+            cat test-results/xfstests-summary.txt
+            echo ""
             grep -E "^(Failures:|Failed [0-9]+ of|Passed all|Not run:)" test-results/xfstests-ksmbd.txt 2>/dev/null || echo "xfstests did not complete"
             echo '```'
           } >> $GITHUB_STEP_SUMMARY
