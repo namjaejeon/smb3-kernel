@@ -266,6 +266,9 @@ jobs:
           cat > "$EXPORT_BASE/smb.conf" <<SMB_CONF
           [global]
               netbios name = KSMBD-CI
+              server multi channel support = yes
+              smb2 leases = yes
+              durable handles = yes
 
           [test]
               path = $EXPORT_BASE/test
