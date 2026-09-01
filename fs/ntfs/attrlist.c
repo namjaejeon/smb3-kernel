@@ -433,6 +433,13 @@ int ntfs_attrlist_entry_add(struct ntfs_inode *ni, struct attr_record *attr)
 	if (err) {
 		ni->attr_list = old_al;
 		ni->attr_list_size -= entry_len;
+		if (ntfs_attrlist_update(ni)) {
+			ntfs_error(ni->vol->sb,
+					"Failed to restore attribute list.\n");
+			NVolSetErrors(ni->vol);
+			NVolSetShutdown(ni->vol);
+			err = -EIO;
+		}
 		goto err_out;
 	}
 	kvfree(old_al);
@@ -495,4 +502,57 @@ int ntfs_attrlist_entry_rm(struct ntfs_attr_search_ctx *ctx)
 	base_ni->attr_list_size = new_al_len;
 
 	return ntfs_attrlist_update(base_ni);
+}
+
+int ntfs_attrlist_entry_rm_before_record(struct ntfs_attr_search_ctx *ctx)
+{
+	struct ntfs_inode *base_ni;
+	struct attr_list_entry *ale;
+	u8 *new_al;
+	u8 *old_al;
+	int new_al_len;
+	int old_al_len;
+	int err;
+
+	if (!ctx || !ctx->ntfs_ino || !ctx->al_entry)
+		return -EINVAL;
+
+	base_ni = ctx->base_ntfs_ino ?
+			ctx->base_ntfs_ino : ctx->ntfs_ino;
+	if (!NInoAttrList(base_ni))
+		return -ENOENT;
+
+	ale = ctx->al_entry;
+	new_al_len = base_ni->attr_list_size - le16_to_cpu(ale->length);
+	new_al = kvzalloc(new_al_len, GFP_NOFS);
+	if (!new_al)
+		return -ENOMEM;
+
+	memcpy(new_al, base_ni->attr_list,
+			(u8 *)ale - base_ni->attr_list);
+	memcpy(new_al + ((u8 *)ale - base_ni->attr_list),
+			(u8 *)ale + le16_to_cpu(ale->length),
+			new_al_len - ((u8 *)ale - base_ni->attr_list));
+
+	old_al = base_ni->attr_list;
+	old_al_len = base_ni->attr_list_size;
+	base_ni->attr_list = new_al;
+	base_ni->attr_list_size = new_al_len;
+
+	err = ntfs_attrlist_update(base_ni);
+	if (err) {
+		base_ni->attr_list = old_al;
+		base_ni->attr_list_size = old_al_len;
+		if (ntfs_attrlist_update(base_ni)) {
+			ntfs_error(base_ni->vol->sb,
+					"Failed to restore attribute list.\n");
+			NVolSetErrors(base_ni->vol);
+			NVolSetShutdown(base_ni->vol);
+			err = -EIO;
+		}
+		kvfree(new_al);
+		return err;
+	}
+	kvfree(old_al);
+	return 0;
 }

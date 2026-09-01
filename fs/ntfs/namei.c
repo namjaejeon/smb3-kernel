@@ -284,12 +284,6 @@ static int ntfs_stream_d_revalidate(struct inode *dir,
 		ret = stream_len;
 		goto out;
 	}
-	if (stream_len != ni->name_len ||
-	    !ntfs_names_are_equal(stream_name, stream_len, ni->name,
-			ni->name_len, CASE_SENSITIVE, ni->vol->upcase,
-			ni->vol->upcase_len))
-		goto out;
-
 	base_vi = ntfs_stream_lookup_inode_by_name(dir, base_name, base_len);
 	if (IS_ERR(base_vi)) {
 		err = PTR_ERR(base_vi);
@@ -303,7 +297,13 @@ static int ntfs_stream_d_revalidate(struct inode *dir,
 	}
 
 	mutex_lock(&NTFS_I(base_vi)->mrec_lock);
-	err = ntfs_stream_inode_validate(inode);
+	if (stream_len != ni->name_len ||
+	    !ntfs_names_are_equal(stream_name, stream_len, ni->name,
+			ni->name_len, CASE_SENSITIVE, ni->vol->upcase,
+			ni->vol->upcase_len))
+		err = -ESTALE;
+	else
+		err = ntfs_stream_inode_validate(inode);
 	mutex_unlock(&NTFS_I(base_vi)->mrec_lock);
 	iput(base_vi);
 	if (!err)
@@ -1832,6 +1832,159 @@ err_out:
 	return err;
 }
 
+static int ntfs_rename_named_stream(struct inode *old_dir,
+		struct dentry *old_dentry, struct inode *new_dir,
+		struct dentry *new_dentry, unsigned int flags)
+{
+	struct ntfs_volume *vol = NTFS_SB(old_dir->i_sb);
+	struct inode *old_base_vi = NULL, *new_base_vi = NULL;
+	struct inode *stream_vi = d_inode(old_dentry);
+	struct ntfs_inode *base_ni;
+	struct ntfs_inode *stream_ni;
+	__le16 *old_base_name = NULL, *old_stream_name = NULL;
+	__le16 *new_base_name = NULL, *new_stream_name = NULL;
+	__le16 *cached_name = NULL;
+	int old_base_len, old_stream_len;
+	int new_base_len, new_stream_len;
+	int old_result, new_result;
+	int err;
+
+	if (flags & (RENAME_EXCHANGE | RENAME_WHITEOUT))
+		return -EINVAL;
+	if (d_inode(new_dentry))
+		return flags & RENAME_NOREPLACE ? -EEXIST : -EOPNOTSUPP;
+
+	old_result = ntfs_stream_path_names(vol, &old_dentry->d_name,
+			&old_base_name, &old_base_len, &old_stream_name,
+			&old_stream_len);
+	if (old_result < 0)
+		return old_result;
+	new_result = ntfs_stream_path_names(vol, &new_dentry->d_name,
+			&new_base_name, &new_base_len, &new_stream_name,
+			&new_stream_len);
+	if (new_result < 0) {
+		err = new_result;
+		goto out;
+	}
+	if (!old_result || !new_result) {
+		err = -EXDEV;
+		goto out;
+	}
+	if (!stream_vi ||
+	    !ntfs_inode_is_named_stream(NTFS_I(stream_vi))) {
+		err = -ESTALE;
+		goto out;
+	}
+
+	old_base_vi = ntfs_stream_lookup_inode_by_name(old_dir,
+			old_base_name, old_base_len);
+	if (IS_ERR(old_base_vi)) {
+		err = PTR_ERR(old_base_vi);
+		old_base_vi = NULL;
+		goto out;
+	}
+	new_base_vi = ntfs_stream_lookup_inode_by_name(new_dir,
+			new_base_name, new_base_len);
+	if (IS_ERR(new_base_vi)) {
+		err = PTR_ERR(new_base_vi);
+		new_base_vi = NULL;
+		goto out;
+	}
+	if (old_base_vi != new_base_vi) {
+		err = -EXDEV;
+		goto out;
+	}
+	if (!S_ISREG(old_base_vi->i_mode)) {
+		err = -EISDIR;
+		goto out;
+	}
+
+	base_ni = NTFS_I(old_base_vi);
+	stream_ni = NTFS_I(stream_vi);
+
+	cached_name = kmemdup(new_stream_name,
+			(new_stream_len + 1) * sizeof(__le16), GFP_NOFS);
+	if (!cached_name) {
+		err = -ENOMEM;
+		goto out;
+	}
+	cached_name[new_stream_len] = 0;
+
+	if (!(vol->vol_flags & VOLUME_IS_DIRTY)) {
+		err = ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+		if (err)
+			goto out;
+	}
+
+	mutex_lock(&base_ni->mrec_lock);
+	if (NVolShutdown(vol)) {
+		err = -EIO;
+		goto out_unlock;
+	}
+	if (NInoBeingDeleted(base_ni) || !old_base_vi->i_nlink) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	if (IS_APPEND(old_base_vi) || IS_IMMUTABLE(old_base_vi)) {
+		err = -EPERM;
+		goto out_unlock;
+	}
+	if (stream_ni->ext.base_ntfs_ino != base_ni ||
+	    stream_ni->name_len != old_stream_len ||
+	    !ntfs_names_are_equal(stream_ni->name, stream_ni->name_len,
+		    old_stream_name, old_stream_len, CASE_SENSITIVE,
+		    vol->upcase, vol->upcase_len)) {
+		err = -ESTALE;
+		goto out_unlock;
+	}
+	if (NInoStreamUnlinked(stream_ni)) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	err = ntfs_stream_inode_validate(stream_vi);
+	if (err)
+		goto out_unlock;
+	if (ntfs_stream_is_unlinked(base_ni, new_stream_name,
+			new_stream_len)) {
+		err = -EBUSY;
+		goto out_unlock;
+	}
+
+	down_write(&stream_ni->runlist.lock);
+	err = ntfs_attr_rename(base_ni, AT_DATA, old_stream_name,
+			old_stream_len, new_stream_name, new_stream_len);
+	if (err)
+		goto out_unlock_runlist;
+
+	ntfs_stream_inode_set_name(stream_vi, cached_name,
+			new_stream_len);
+	cached_name = NULL;
+	inode_set_mtime_to_ts(old_base_vi,
+			inode_set_ctime_current(old_base_vi));
+	mark_inode_dirty(old_base_vi);
+	ntfs_stream_inode_refresh(stream_vi);
+
+out_unlock_runlist:
+	up_write(&stream_ni->runlist.lock);
+out_unlock:
+	mutex_unlock(&base_ni->mrec_lock);
+out:
+	kfree(cached_name);
+	if (new_base_vi)
+		iput(new_base_vi);
+	if (old_base_vi)
+		iput(old_base_vi);
+	if (new_stream_name)
+		kmem_cache_free(ntfs_name_cache, new_stream_name);
+	if (new_base_name)
+		kmem_cache_free(ntfs_name_cache, new_base_name);
+	if (old_stream_name)
+		kmem_cache_free(ntfs_name_cache, old_stream_name);
+	if (old_base_name)
+		kmem_cache_free(ntfs_name_cache, old_base_name);
+	return err;
+}
+
 static int ntfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 		struct dentry *old_dentry, struct inode *new_dir,
 		struct dentry *new_dentry, unsigned int flags)
@@ -1851,6 +2004,11 @@ static int ntfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 
 	if (NVolShutdown(old_dir_ni->vol))
 		return -EIO;
+
+	if (ntfs_stream_path_has_colon(vol, &old_dentry->d_name) ||
+	    ntfs_stream_path_has_colon(vol, &new_dentry->d_name))
+		return ntfs_rename_named_stream(old_dir, old_dentry, new_dir,
+				new_dentry, flags);
 
 	err = ntfs_stream_path_check(vol, &old_dentry->d_name);
 	if (err)

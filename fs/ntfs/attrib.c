@@ -3009,6 +3009,473 @@ err_out:
 	return err;
 }
 
+struct ntfs_attr_record_image {
+	struct list_head list;
+	u32 length;
+	u8 record[];
+};
+
+static int ntfs_attr_record_named_length(const struct attr_record *a,
+		u8 name_len, u32 *new_length)
+{
+	u32 header_length;
+	u32 payload_length;
+	u32 old_length = le32_to_cpu(a->length);
+
+	if (!a->non_resident) {
+		u32 name_offset = le16_to_cpu(a->name_offset);
+		u32 value_offset = le16_to_cpu(a->data.resident.value_offset);
+		u32 value_length = le32_to_cpu(a->data.resident.value_length);
+
+		header_length = name_offset;
+		if (header_length < offsetof(struct attr_record,
+				data.resident.reserved) +
+				sizeof(a->data.resident.reserved) ||
+		    header_length > value_offset ||
+		    header_length + a->name_length * sizeof(__le16) >
+				value_offset ||
+		    value_offset > old_length || value_length > old_length ||
+		    value_offset + value_length > old_length)
+			return -EIO;
+		payload_length = (value_length + 7) & ~7;
+	} else {
+		u32 name_offset = le16_to_cpu(a->name_offset);
+		u32 mapping_offset =
+			le16_to_cpu(a->data.non_resident.mapping_pairs_offset);
+
+		header_length = name_offset;
+		if (header_length < offsetof(struct attr_record,
+				data.non_resident.compressed_size) ||
+		    header_length > mapping_offset ||
+		    header_length + a->name_length * sizeof(__le16) >
+				mapping_offset ||
+		    mapping_offset > old_length)
+			return -EIO;
+		payload_length = old_length - mapping_offset;
+	}
+
+	*new_length = header_length +
+			((name_len * sizeof(__le16) + 7) & ~7) +
+			payload_length;
+	return 0;
+}
+
+static int ntfs_attr_record_insert_named(struct ntfs_inode *ni,
+		const struct attr_record *source, const __le16 *name,
+		u8 name_len)
+{
+	struct ntfs_attr_search_ctx *ctx;
+	struct ntfs_inode *base_ni;
+	struct attr_record *a;
+	struct mft_record *m;
+	u32 header_length;
+	u32 new_length;
+	u32 payload_length;
+	int err;
+
+	err = ntfs_attr_record_named_length(source, name_len, &new_length);
+	if (err)
+		return err;
+
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx)
+		return -ENOMEM;
+
+	err = ntfs_attr_find(source->type, name, name_len, CASE_SENSITIVE,
+			NULL, 0, ctx);
+	if (!err) {
+		if (!source->non_resident || !ctx->attr->non_resident ||
+		    source->data.non_resident.lowest_vcn ==
+		    ctx->attr->data.non_resident.lowest_vcn)
+			err = -EALREADY;
+		else
+			err = -EEXIST;
+		goto out;
+	}
+	if (err != -ENOENT)
+		goto out;
+
+	a = ctx->attr;
+	m = ctx->mrec;
+	err = ntfs_make_room_for_attr(m, (u8 *)a, new_length);
+	if (err)
+		goto out;
+
+	if (!source->non_resident) {
+		u32 value_length =
+			le32_to_cpu(source->data.resident.value_length);
+		u32 value_offset =
+			le16_to_cpu(source->data.resident.value_offset);
+
+		header_length = le16_to_cpu(source->name_offset);
+		payload_length = (value_length + 7) & ~7;
+		memset(a, 0, new_length);
+		memcpy(a, source, header_length);
+		a->data.resident.value_offset =
+			cpu_to_le16(new_length - payload_length);
+		memcpy((u8 *)a +
+				le16_to_cpu(a->data.resident.value_offset),
+				(u8 *)source + value_offset, value_length);
+	} else {
+		u32 mapping_offset =
+			le16_to_cpu(source->data.non_resident.mapping_pairs_offset);
+
+		header_length = le16_to_cpu(source->name_offset);
+		payload_length = le32_to_cpu(source->length) - mapping_offset;
+		memset(a, 0, new_length);
+		memcpy(a, source, header_length);
+		a->data.non_resident.mapping_pairs_offset =
+			cpu_to_le16(new_length - payload_length);
+		memcpy((u8 *)a + le16_to_cpu(
+				a->data.non_resident.mapping_pairs_offset),
+				(u8 *)source + mapping_offset, payload_length);
+	}
+
+	a->length = cpu_to_le32(new_length);
+	a->name_length = name_len;
+	a->name_offset = name_len ? cpu_to_le16(header_length) : 0;
+	a->instance = m->next_attr_instance;
+	if (name_len)
+		memcpy((u8 *)a + header_length, name,
+				name_len * sizeof(__le16));
+	m->next_attr_instance = cpu_to_le16(
+			(le16_to_cpu(m->next_attr_instance) + 1) & 0xffff);
+
+	base_ni = ni->nr_extents == -1 ? ni->ext.base_ntfs_ino : ni;
+	if (source->type != AT_ATTRIBUTE_LIST && NInoAttrList(base_ni)) {
+		err = ntfs_attrlist_entry_add(ni, a);
+		if (err) {
+			ntfs_attr_record_resize(m, a, 0);
+			mark_mft_record_dirty(ni);
+			goto out;
+		}
+	}
+	mark_mft_record_dirty(ni);
+	err = 0;
+out:
+	ntfs_attr_put_search_ctx(ctx);
+	return err;
+}
+
+static int ntfs_attr_record_insert_any(struct ntfs_inode *base_ni,
+		const struct attr_record *source, const __le16 *name,
+		u8 name_len)
+{
+	struct ntfs_inode *extent_ni = NULL;
+	int err;
+	int i;
+
+retry:
+	err = ntfs_attr_record_insert_named(base_ni, source, name, name_len);
+	if (!err)
+		return 0;
+	if (err != -ENOSPC && err != -EEXIST)
+		return err;
+
+	err = ntfs_inode_attach_all_extents(base_ni);
+	if (err)
+		return err;
+	for (i = 0; i < base_ni->nr_extents; i++) {
+		err = ntfs_attr_record_insert_named(
+				base_ni->ext.extent_ntfs_inos[i], source,
+				name, name_len);
+		if (!err)
+			return 0;
+		if (err != -ENOSPC && err != -EEXIST)
+			return err;
+	}
+
+	if (!NInoAttrList(base_ni)) {
+		err = ntfs_inode_add_attrlist(base_ni);
+		if (err)
+			return err;
+		goto retry;
+	}
+
+	err = ntfs_mft_record_alloc(base_ni->vol, 0, &extent_ni, base_ni,
+			NULL, -1);
+	if (err)
+		return err;
+	unmap_mft_record(extent_ni);
+
+	err = ntfs_attr_record_insert_named(extent_ni, source, name, name_len);
+	if (!err)
+		return 0;
+
+	if (ntfs_mft_record_free(base_ni->vol, extent_ni))
+		ntfs_error(base_ni->vol->sb,
+				"Failed to free unused extent MFT record.\n");
+	ntfs_inode_close(extent_ni);
+	return err;
+}
+
+static int ntfs_attr_record_images_collect(struct ntfs_inode *ni,
+		__le32 type, const __le16 *name, u8 name_len,
+		struct list_head *images)
+{
+	struct ntfs_attr_record_image *image;
+	struct ntfs_attr_search_ctx *ctx;
+	int err;
+
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx)
+		return -ENOMEM;
+
+	while (!(err = ntfs_attr_lookup(type, name, name_len,
+			CASE_SENSITIVE, 0, NULL, 0, ctx))) {
+		u32 length = le32_to_cpu(ctx->attr->length);
+
+		image = kmalloc(struct_size(image, record, length), GFP_NOFS);
+		if (!image) {
+			err = -ENOMEM;
+			goto out;
+		}
+		image->length = length;
+		memcpy(image->record, ctx->attr, length);
+		list_add_tail(&image->list, images);
+	}
+	if (err == -ENOENT)
+		err = list_empty(images) ? -ENOENT : 0;
+out:
+	ntfs_attr_put_search_ctx(ctx);
+	return err;
+}
+
+static void ntfs_attr_record_images_free(struct list_head *images)
+{
+	struct ntfs_attr_record_image *image, *next;
+
+	list_for_each_entry_safe(image, next, images, list) {
+		list_del(&image->list);
+		kfree(image);
+	}
+}
+
+static int ntfs_attr_record_rm_rename(struct ntfs_attr_search_ctx *ctx)
+{
+	struct ntfs_attr_search_ctx *record_ctx;
+	struct ntfs_inode *base_ni;
+	struct ntfs_inode *ni;
+	struct attr_record *a;
+	struct mft_record *m;
+	__le16 *name;
+	__le32 type;
+	__le16 instance;
+	s64 lowest_vcn;
+	u8 name_len;
+	bool empty;
+	bool list_removed = false;
+	int err;
+
+	if (!ctx || !ctx->ntfs_ino || !ctx->mrec || !ctx->attr)
+		return -EINVAL;
+
+	ni = ctx->ntfs_ino;
+	base_ni = ctx->base_ntfs_ino ? ctx->base_ntfs_ino : ni;
+	a = ctx->attr;
+	type = a->type;
+	name_len = a->name_length;
+	instance = a->instance;
+	lowest_vcn = a->non_resident ?
+			le64_to_cpu(a->data.non_resident.lowest_vcn) : 0;
+	name = kmemdup((u8 *)a + le16_to_cpu(a->name_offset),
+			name_len * sizeof(__le16), GFP_NOFS);
+	if (!name)
+		return -ENOMEM;
+
+	record_ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!record_ctx) {
+		kfree(name);
+		return -ENOMEM;
+	}
+
+	if (NInoAttrList(base_ni) && type != AT_ATTRIBUTE_LIST) {
+		err = ntfs_attrlist_entry_rm_before_record(ctx);
+		if (err)
+			goto out;
+		list_removed = true;
+	}
+
+	ntfs_attr_reinit_search_ctx(record_ctx);
+	err = ntfs_attr_find(type, name, name_len, CASE_SENSITIVE,
+			NULL, 0, record_ctx);
+	if (err || record_ctx->attr->instance != instance ||
+	    (record_ctx->attr->non_resident &&
+	     le64_to_cpu(record_ctx->attr->data.non_resident.lowest_vcn) !=
+	     lowest_vcn)) {
+		err = -EIO;
+		goto committed_error;
+	}
+
+	m = record_ctx->mrec;
+	a = record_ctx->attr;
+	err = ntfs_attr_record_resize(m, a, 0);
+	if (err)
+		goto committed_error;
+	mark_mft_record_dirty(ni);
+	empty = le32_to_cpu(m->bytes_in_use) -
+			le16_to_cpu(m->attrs_offset) == 8;
+	ntfs_attr_put_search_ctx(record_ctx);
+	record_ctx = NULL;
+
+	if (empty && ni != base_ni) {
+		ntfs_attr_reinit_search_ctx(ctx);
+		err = ntfs_mft_record_free(ni->vol, ni);
+		if (err)
+			goto out;
+		ntfs_inode_close(ni);
+	}
+	goto out;
+
+committed_error:
+	if (list_removed) {
+		ntfs_error(base_ni->vol->sb,
+				"Failed to remove attribute after updating its attribute-list entry.\n");
+		NVolSetErrors(base_ni->vol);
+		NVolSetShutdown(base_ni->vol);
+		err = -EIO;
+	}
+out:
+	if (record_ctx)
+		ntfs_attr_put_search_ctx(record_ctx);
+	kfree(name);
+	return err;
+}
+
+static int ntfs_attr_records_remove(struct ntfs_inode *ni, __le32 type,
+		const __le16 *name, u8 name_len)
+{
+	struct ntfs_attr_search_ctx *ctx;
+	int err;
+
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx)
+		return -ENOMEM;
+
+	while (!(err = ntfs_attr_lookup(type, name, name_len,
+			CASE_SENSITIVE, 0, NULL, 0, ctx))) {
+		err = ntfs_attr_record_rm_rename(ctx);
+		if (err)
+			goto out;
+		ntfs_attr_reinit_search_ctx(ctx);
+	}
+	if (err == -ENOENT)
+		err = 0;
+out:
+	ntfs_attr_put_search_ctx(ctx);
+	return err;
+}
+
+static int ntfs_attr_records_restore(struct ntfs_inode *ni,
+		struct list_head *images, const __le16 *name, u8 name_len)
+{
+	struct ntfs_attr_record_image *image;
+	struct ntfs_attr_search_ctx *ctx;
+	int err;
+
+	list_for_each_entry(image, images, list) {
+		struct attr_record *a = (struct attr_record *)image->record;
+		s64 lowest_vcn = a->non_resident ?
+				le64_to_cpu(a->data.non_resident.lowest_vcn) : 0;
+
+		ctx = ntfs_attr_get_search_ctx(ni, NULL);
+		if (!ctx)
+			return -ENOMEM;
+		err = ntfs_attr_lookup(a->type, name, name_len,
+				CASE_SENSITIVE, lowest_vcn, NULL, 0, ctx);
+		if (!err && a->non_resident &&
+		    (!ctx->attr->non_resident ||
+		     ctx->attr->data.non_resident.lowest_vcn !=
+		     a->data.non_resident.lowest_vcn))
+			err = -ENOENT;
+		ntfs_attr_put_search_ctx(ctx);
+		if (!err)
+			continue;
+		if (err != -ENOENT)
+			return err;
+		err = ntfs_attr_record_insert_any(ni, a, name, name_len);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+int ntfs_attr_rename(struct ntfs_inode *ni, __le32 type,
+		const __le16 *old_name, u8 old_name_len,
+		const __le16 *new_name, u8 new_name_len)
+{
+	struct ntfs_attr_record_image *image;
+	struct ntfs_attr_search_ctx *ctx;
+	LIST_HEAD(images);
+	int err;
+	int rollback_err;
+
+	if (!ni || !old_name || !old_name_len || !new_name || !new_name_len)
+		return -EINVAL;
+	if (ni->nr_extents == -1)
+		ni = ni->ext.base_ntfs_ino;
+
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx)
+		return -ENOMEM;
+	err = ntfs_attr_lookup(type, new_name, new_name_len,
+			CASE_SENSITIVE, 0, NULL, 0, ctx);
+	ntfs_attr_put_search_ctx(ctx);
+	if (!err)
+		return -EEXIST;
+	if (err != -ENOENT)
+		return err;
+
+	err = ntfs_attr_record_images_collect(ni, type, old_name,
+			old_name_len, &images);
+	if (err)
+		goto out;
+
+	list_for_each_entry(image, &images, list) {
+		err = ntfs_attr_record_insert_any(ni,
+				(struct attr_record *)image->record,
+				new_name, new_name_len);
+		if (err)
+			goto remove_new;
+	}
+
+	err = ntfs_attr_records_remove(ni, type, old_name, old_name_len);
+	if (!err)
+		goto out;
+	if (NVolShutdown(ni->vol))
+		goto out;
+
+	rollback_err = ntfs_attr_records_restore(ni, &images, old_name,
+			old_name_len);
+	if (!rollback_err)
+		rollback_err = ntfs_attr_records_remove(ni, type, new_name,
+				new_name_len);
+	if (rollback_err) {
+		ntfs_error(ni->vol->sb,
+				"Failed to roll back attribute rename.\n");
+		NVolSetErrors(ni->vol);
+		NVolSetShutdown(ni->vol);
+		err = -EIO;
+	}
+	goto out;
+
+remove_new:
+	if (NVolShutdown(ni->vol))
+		goto out;
+	rollback_err = ntfs_attr_records_remove(ni, type, new_name,
+			new_name_len);
+	if (rollback_err) {
+		ntfs_error(ni->vol->sb,
+				"Failed to remove partial renamed attribute.\n");
+		NVolSetErrors(ni->vol);
+		NVolSetShutdown(ni->vol);
+		err = -EIO;
+	}
+out:
+	ntfs_attr_record_images_free(&images);
+	return err;
+}
+
 /*
  * __ntfs_attr_init - primary initialization of an ntfs attribute structure
  * @ni:		ntfs attribute inode to initialize

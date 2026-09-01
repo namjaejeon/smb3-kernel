@@ -249,6 +249,24 @@ struct inode *ntfs_attr_iget(struct inode *base_vi, __le32 type,
 	return vi;
 }
 
+void ntfs_stream_inode_set_name(struct inode *vi, __le16 *name,
+		u32 name_len)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	__le16 *old_name;
+
+	lockdep_assert_held(&ni->ext.base_ntfs_ino->mrec_lock);
+	lockdep_assert_held_write(&ni->runlist.lock);
+	WARN_ON(!ntfs_inode_is_named_stream(ni));
+
+	old_name = ni->name;
+	remove_inode_hash(vi);
+	ni->name = name;
+	ni->name_len = name_len;
+	insert_inode_hash(vi);
+	kfree(old_name);
+}
+
 void ntfs_stream_inode_refresh(struct inode *vi)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
@@ -2521,7 +2539,11 @@ int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
 	if (old_init_size >= new_size)
 		return 0;
 
+	mutex_lock(&mrec_ni->mrec_lock);
+	down_write(&ni->runlist.lock);
 	err = ntfs_attr_map_whole_runlist(ni);
+	up_write(&ni->runlist.lock);
+	mutex_unlock(&mrec_ni->mrec_lock);
 	if (err)
 		return err;
 
