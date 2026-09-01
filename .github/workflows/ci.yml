@@ -169,7 +169,8 @@ jobs:
             grep -qx "$1=y" .config
           }
           check_disabled() {
-            grep -Eq "^$1=n$|^# $1 is not set$" .config
+            # Kconfig can omit a symbol when one of its dependencies is unmet.
+            ! grep -Eq "^$1=(y|m)$" .config
           }
           case "${{ matrix.sanitizer }}" in
             normal)
