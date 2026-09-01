@@ -7,8 +7,10 @@
  */
 
 #include <linux/exportfs.h>
+#include <linux/fsnotify.h>
 #include <linux/iversion.h>
 #include <linux/namei.h>
+#include <linux/security.h>
 
 #include "ntfs.h"
 #include "time.h"
@@ -630,12 +632,14 @@ static int ntfs_sd_add_everyone(struct ntfs_inode *ni)
 
 static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *dir,
 		__le16 *name, u8 name_len, mode_t mode, dev_t dev,
-		const char *target, int target_len)
+		const char *target, int target_len, __le16 *stream_name,
+		u8 stream_name_len, struct inode **stream_vi)
 {
 	struct ntfs_inode *dir_ni = NTFS_I(dir);
 	struct ntfs_volume *vol = dir_ni->vol;
 	struct ntfs_inode *ni;
 	bool rollback_data = false, rollback_sd = false, rollback_reparse = false;
+	bool rollback_stream = false;
 	struct file_name_attr *fn = NULL;
 	struct standard_information *si = NULL;
 	int err = 0, fn_len, si_len;
@@ -645,6 +649,9 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	__le64 parent_mft_ref;
 	u64 child_mft_ref;
 	__le16 ea_size;
+
+	if (stream_vi)
+		*stream_vi = NULL;
 
 	vi = new_inode(vol->sb);
 	if (!vi)
@@ -839,6 +846,25 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 		if (err)
 			goto err_out;
 
+		if (stream_name_len) {
+			err = ntfs_attr_add(ni, AT_DATA, stream_name,
+					stream_name_len, NULL, 0);
+			if (err) {
+				ntfs_error(sb,
+					"Failed to add named DATA attribute.\n");
+				goto err_out;
+			}
+			rollback_stream = true;
+
+			*stream_vi = ntfs_attr_iget(vi, AT_DATA, stream_name,
+					stream_name_len);
+			if (IS_ERR(*stream_vi)) {
+				err = PTR_ERR(*stream_vi);
+				*stream_vi = NULL;
+				goto err_out;
+			}
+		}
+
 		if (S_ISLNK(mode)) {
 			if (NVolSymlinkNative(vol))
 				err = ntfs_reparse_set_native_symlink(ni, target, target_len);
@@ -932,6 +958,16 @@ static struct ntfs_inode *__ntfs_create(struct mnt_idmap *idmap, struct inode *d
 	return ni;
 
 err_out:
+	if (stream_vi && *stream_vi) {
+		clear_nlink(*stream_vi);
+		remove_inode_hash(*stream_vi);
+		iput(*stream_vi);
+		*stream_vi = NULL;
+	}
+
+	if (rollback_stream)
+		ntfs_attr_remove(ni, AT_DATA, stream_name, stream_name_len);
+
 	if (rollback_sd)
 		ntfs_attr_remove(ni, AT_SECURITY_DESCRIPTOR, AT_UNNAMED, 0);
 
@@ -967,6 +1003,37 @@ err_out:
 	remove_inode_hash(vi);
 	discard_new_inode(vi);
 	return ERR_PTR(err);
+}
+
+static struct dentry *ntfs_stream_prepare_base_dentry(struct mnt_idmap *idmap,
+		struct inode *dir, struct dentry *stream_dentry,
+		const struct ntfs_stream_path *path, umode_t mode)
+{
+	struct qstr base_qstr = {
+		.name = path->base_name,
+		.len = path->base_len,
+	};
+	struct dentry *base_dentry;
+	int err;
+
+	base_qstr.hash = full_name_hash(stream_dentry->d_parent,
+			base_qstr.name, base_qstr.len);
+	base_dentry = d_lookup(stream_dentry->d_parent, &base_qstr);
+	if (!base_dentry) {
+		base_dentry = d_alloc(stream_dentry->d_parent, &base_qstr);
+		if (!base_dentry)
+			return ERR_PTR(-ENOMEM);
+		d_rehash(base_dentry);
+	}
+
+	err = may_create_dentry(idmap, dir, base_dentry);
+	if (!err)
+		err = security_inode_create(dir, base_dentry, mode);
+	if (err) {
+		dput(base_dentry);
+		return ERR_PTR(err);
+	}
+	return base_dentry;
 }
 
 static int ntfs_stream_path_names(struct ntfs_volume *vol,
@@ -1113,12 +1180,19 @@ static int ntfs_create(struct mnt_idmap *idmap, struct inode *dir,
 {
 	struct ntfs_volume *vol = NTFS_SB(dir->i_sb);
 	struct ntfs_inode *ni;
-	struct inode *stream_vi;
+	struct ntfs_stream_path stream_path;
+	struct dentry *base_dentry;
+	struct inode *stream_vi = NULL;
 	__le16 *uname, *base_name = NULL, *stream_name = NULL;
 	int uname_len, stream_len, path_result, err;
 
 	if (NVolShutdown(vol))
 		return -EIO;
+
+	path_result = ntfs_stream_path_parse(vol, &dentry->d_name,
+			&stream_path);
+	if (path_result < 0)
+		return path_result;
 
 	path_result = ntfs_stream_path_names(vol, &dentry->d_name, &base_name,
 			&uname_len, &stream_name, &stream_len);
@@ -1127,13 +1201,48 @@ static int ntfs_create(struct mnt_idmap *idmap, struct inode *dir,
 			return path_result;
 		stream_vi = ntfs_create_named_stream(idmap, dir, base_name,
 				uname_len, stream_name, stream_len);
+		if (IS_ERR(stream_vi) && PTR_ERR(stream_vi) == -ENOENT) {
+			base_dentry = ntfs_stream_prepare_base_dentry(idmap, dir,
+					dentry, &stream_path, mode);
+			if (IS_ERR(base_dentry)) {
+				err = PTR_ERR(base_dentry);
+				goto out_free_stream_names;
+			}
+
+			if (!(vol->vol_flags & VOLUME_IS_DIRTY)) {
+				err = ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+				if (err)
+					goto out_dput_base;
+			}
+
+			ni = __ntfs_create(idmap, dir, base_name, uname_len,
+					S_IFREG | mode, 0, NULL, 0,
+					stream_name, stream_len, &stream_vi);
+			if (IS_ERR(ni)) {
+				err = PTR_ERR(ni);
+				goto out_dput_base;
+			}
+
+			d_instantiate_new(base_dentry, VFS_I(ni));
+			fsnotify_create(dir, base_dentry);
+			dput(base_dentry);
+		}
+		if (IS_ERR(stream_vi)) {
+			err = PTR_ERR(stream_vi);
+			goto out_free_stream_names;
+		}
 		kmem_cache_free(ntfs_name_cache, stream_name);
 		kmem_cache_free(ntfs_name_cache, base_name);
-		if (IS_ERR(stream_vi))
-			return PTR_ERR(stream_vi);
 		ntfs_stream_set_dentry_ops(dentry);
 		d_instantiate(dentry, stream_vi);
 		return 0;
+
+out_dput_base:
+		dput(base_dentry);
+out_free_stream_names:
+		kmem_cache_free(ntfs_name_cache, stream_name);
+		kmem_cache_free(ntfs_name_cache, base_name);
+		return err;
 	}
 
 	uname_len = ntfs_nlstoucs(vol, dentry->d_name.name, dentry->d_name.len,
@@ -1153,7 +1262,8 @@ static int ntfs_create(struct mnt_idmap *idmap, struct inode *dir,
 	if (!(vol->vol_flags & VOLUME_IS_DIRTY))
 		ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
 
-	ni = __ntfs_create(idmap, dir, uname, uname_len, S_IFREG | mode, 0, NULL, 0);
+	ni = __ntfs_create(idmap, dir, uname, uname_len, S_IFREG | mode, 0,
+			NULL, 0, NULL, 0, NULL);
 	kmem_cache_free(ntfs_name_cache, uname);
 	if (IS_ERR(ni))
 		return PTR_ERR(ni);
@@ -1548,7 +1658,8 @@ static struct dentry *ntfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 	if (!(vol->vol_flags & VOLUME_IS_DIRTY))
 		ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
 
-	ni = __ntfs_create(idmap, dir, uname, uname_len, mode, 0, NULL, 0);
+	ni = __ntfs_create(idmap, dir, uname, uname_len, mode, 0,
+			NULL, 0, NULL, 0, NULL);
 	kmem_cache_free(ntfs_name_cache, uname);
 	if (IS_ERR(ni)) {
 		err = PTR_ERR(ni);
@@ -1917,7 +2028,7 @@ static int ntfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
 		ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
 
 	ni = __ntfs_create(idmap, dir, usrc, usrc_len, S_IFLNK | 0777, 0,
-			   symname, symlen);
+			   symname, symlen, NULL, 0, NULL);
 	kmem_cache_free(ntfs_name_cache, usrc);
 	if (IS_ERR(ni)) {
 		err = PTR_ERR(ni);
@@ -1971,11 +2082,11 @@ static int ntfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	case S_IFCHR:
 	case S_IFBLK:
 		ni = __ntfs_create(idmap, dir, uname, uname_len,
-				mode, rdev, NULL, 0);
+				mode, rdev, NULL, 0, NULL, 0, NULL);
 		break;
 	default:
 		ni = __ntfs_create(idmap, dir, uname, uname_len,
-				mode, 0, NULL, 0);
+				mode, 0, NULL, 0, NULL, 0, NULL);
 	}
 
 	kmem_cache_free(ntfs_name_cache, uname);
