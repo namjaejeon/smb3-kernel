@@ -1015,6 +1015,36 @@ out:
 	return rc;
 }
 
+/**
+ * ksmbd_sign_rdma() - sign an SMB Direct payload
+ * @conn: connection containing the negotiated signing algorithm
+ * @key: session or channel signing key
+ * @buf: payload to sign
+ * @buflen: payload length
+ * @sig: buffer receiving the 16-byte SMB signature
+ *
+ * Return: 0 on success, or -EOPNOTSUPP for an unsupported algorithm
+ */
+int ksmbd_sign_rdma(struct ksmbd_conn *conn, char *key, void *buf,
+		    unsigned int buflen, u8 *sig)
+{
+	u8 hmac[SMB2_HMACSHA256_SIZE];
+	struct kvec iov = {
+		.iov_base = buf,
+		.iov_len = buflen,
+	};
+
+	if (conn->signing_algorithm == SIGNING_ALG_HMAC_SHA256_LE) {
+		ksmbd_sign_smb2_pdu(conn, key, &iov, 1, hmac);
+		memcpy(sig, hmac, SMB2_SIGNATURE_SIZE);
+	} else if (conn->signing_algorithm == SIGNING_ALG_AES_CMAC_LE) {
+		ksmbd_sign_smb3_pdu(conn, key, &iov, 1, sig);
+	} else {
+		return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
 int ksmbd_crypt_message(struct ksmbd_work *work, struct kvec *iov,
 			unsigned int nvec, int enc)
 {

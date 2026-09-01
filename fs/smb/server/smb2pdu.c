@@ -1398,6 +1398,9 @@ static int build_rdma_ctx(struct smb2_neg_context *ctxt,
 	if (transform_ids & BIT(SMB2_RDMA_TRANSFORM_ENCRYPTION))
 		pneg_ctxt->RDMATransformIds[count++] =
 			cpu_to_le16(SMB2_RDMA_TRANSFORM_ENCRYPTION);
+	if (transform_ids & BIT(SMB2_RDMA_TRANSFORM_SIGNING))
+		pneg_ctxt->RDMATransformIds[count++] =
+			cpu_to_le16(SMB2_RDMA_TRANSFORM_SIGNING);
 	if (!count)
 		pneg_ctxt->RDMATransformIds[count++] =
 			cpu_to_le16(SMB2_RDMA_TRANSFORM_NONE);
@@ -1729,7 +1732,8 @@ static __le32 decode_rdma_ctx(struct ksmbd_conn *conn,
 	for (i = 0; i < count; i++) {
 		u16 id = le16_to_cpu(pneg_ctxt->RDMATransformIds[i]);
 
-		if (id == SMB2_RDMA_TRANSFORM_ENCRYPTION)
+		if (id == SMB2_RDMA_TRANSFORM_ENCRYPTION ||
+		    id == SMB2_RDMA_TRANSFORM_SIGNING)
 			conn->rdma_transform_ids |= BIT(id);
 	}
 	return STATUS_SUCCESS;
@@ -1926,11 +1930,13 @@ int smb2_handle_negotiate(struct ksmbd_work *work)
 			conn->rdma_transform_ids &=
 				~BIT(SMB2_RDMA_TRANSFORM_ENCRYPTION);
 		ksmbd_debug(RDMA,
-			    "RDMA transform negotiation: transport=%s context=%s encryption=%s cipher=0x%04x\n",
+			    "RDMA transform negotiation: transport=%s context=%s encryption=%s signing=%s cipher=0x%04x\n",
 			    conn->transport->ops->rdma_read ? "rdma" : "tcp",
 			    conn->rdma_transform_negotiated ? "present" : "absent",
 			    conn->rdma_transform_ids &
 			    BIT(SMB2_RDMA_TRANSFORM_ENCRYPTION) ? "enabled" : "disabled",
+			    conn->rdma_transform_ids &
+			    BIT(SMB2_RDMA_TRANSFORM_SIGNING) ? "enabled" : "disabled",
 			    le16_to_cpu(conn->cipher_type));
 
 		rc = init_smb3_11_server(conn);
@@ -8766,6 +8772,22 @@ static int smb2_set_rdma_key(struct ksmbd_work *work,
 }
 
 /**
+ * smb3_rdma_signing_key() - obtain the signing key for this channel
+ * @work: request work item with an established session
+ *
+ * Return: channel signing key, or the primary session key as a fallback
+ */
+static char *smb3_rdma_signing_key(struct ksmbd_work *work)
+{
+	struct channel *chann;
+
+	chann = lookup_chann_list(work->sess, work->conn);
+	if (chann)
+		return chann->smb3signingkey;
+	return work->sess->smb3signingkey;
+}
+
+/**
  * smb2_prep_rdma_read() - transform an RDMA READ payload
  * @work: request work item
  * @req: READ request controlling encryption or signing
@@ -8773,8 +8795,8 @@ static int smb2_set_rdma_key(struct ksmbd_work *work,
  * @data: data that will be transferred through RDMA
  * @datalen: data length
  *
- * Encrypt the payload in place and encode the detached crypto metadata in
- * the response buffer.
+ * Encrypt or sign the payload in place and encode the detached crypto
+ * metadata in the response buffer.
  *
  * Return: metadata length, zero when no transform applies, or negative errno
  */
@@ -8791,14 +8813,19 @@ static int smb2_prep_rdma_read(struct ksmbd_work *work,
 	u16 transform_type;
 	int err;
 
-	if (!work->encrypted ||
-	    !(conn->rdma_transform_ids & BIT(SMB2_RDMA_TRANSFORM_ENCRYPTION)))
+	if (work->encrypted &&
+	    (conn->rdma_transform_ids & BIT(SMB2_RDMA_TRANSFORM_ENCRYPTION))) {
+		transform_type = SMB2_RDMA_TRANSFORM_TYPE_ENCRYPTION;
+		nonce_len = (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
+			     conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM) ?
+			SMB3_AES_GCM_NONCE : SMB3_AES_CCM_NONCE;
+	} else if ((req->hdr.Flags & SMB2_FLAGS_SIGNED) &&
+		   (conn->rdma_transform_ids &
+		    BIT(SMB2_RDMA_TRANSFORM_SIGNING))) {
+		transform_type = SMB2_RDMA_TRANSFORM_TYPE_SIGNING;
+	} else {
 		return 0;
-
-	transform_type = SMB2_RDMA_TRANSFORM_TYPE_ENCRYPTION;
-	nonce_len = (conn->cipher_type == SMB2_ENCRYPTION_AES128_GCM ||
-		     conn->cipher_type == SMB2_ENCRYPTION_AES256_GCM) ?
-		SMB3_AES_GCM_NONCE : SMB3_AES_CCM_NONCE;
+	}
 
 	transform = (struct smb2_rdma_transform *)rsp->Buffer;
 	crypto = (struct smb2_rdma_crypto_transform *)(transform + 1);
@@ -8812,15 +8839,21 @@ static int smb2_prep_rdma_read(struct ksmbd_work *work,
 	crypto->NonceLength = cpu_to_le16(nonce_len);
 	nonce = crypto->Signature + SMB2_SIGNATURE_SIZE;
 
-	get_random_bytes(nonce, nonce_len);
-	err = ksmbd_crypt_rdma(conn,
-			       work->sess->smb3encryptionkey,
-			       data, datalen, nonce, nonce_len,
-			       crypto->Signature,
-			       SMB2_SIGNATURE_SIZE, true);
+	if (transform_type == SMB2_RDMA_TRANSFORM_TYPE_ENCRYPTION) {
+		get_random_bytes(nonce, nonce_len);
+		err = ksmbd_crypt_rdma(conn,
+				       work->sess->smb3encryptionkey,
+				       data, datalen, nonce, nonce_len,
+				       crypto->Signature,
+				       SMB2_SIGNATURE_SIZE, true);
+	} else {
+		err = ksmbd_sign_rdma(conn, smb3_rdma_signing_key(work), data,
+				      datalen, crypto->Signature);
+	}
 	if (err) {
-		pr_err("RDMA READ encryption failed: session=%llu payload=%u rc=%d\n",
-		       work->sess->id, datalen, err);
+		pr_err("RDMA READ %s failed: session=%llu payload=%u rc=%d\n",
+		       transform_type == SMB2_RDMA_TRANSFORM_TYPE_ENCRYPTION ?
+		       "encryption" : "signing", work->sess->id, datalen, err);
 		return err;
 	}
 
@@ -8829,9 +8862,11 @@ static int smb2_prep_rdma_read(struct ksmbd_work *work,
 	rsp->Flags = SMB2_READFLAG_RESPONSE_RDMA_TRANSFORM;
 	rsp->DataLength = cpu_to_le32(transform_len);
 	ksmbd_debug(RDMA,
-		    "RDMA READ encryption prepared: session=%llu cipher=0x%04x payload=%u transform=%u nonce=%u tag=%u\n",
-		    work->sess->id, le16_to_cpu(conn->cipher_type), datalen,
-		    transform_len, nonce_len, SMB2_SIGNATURE_SIZE);
+		    "RDMA READ %s prepared: session=%llu cipher=0x%04x payload=%u transform=%u nonce=%u tag=%u\n",
+		    transform_type == SMB2_RDMA_TRANSFORM_TYPE_ENCRYPTION ?
+		    "encryption" : "signing", work->sess->id,
+		    le16_to_cpu(conn->cipher_type), datalen, transform_len,
+		    nonce_len, SMB2_SIGNATURE_SIZE);
 	return transform_len;
 }
 
@@ -8963,6 +8998,12 @@ static int smb2_parse_rdma_write_transform(struct ksmbd_work *work,
 			SMB3_AES_GCM_NONCE : SMB3_AES_CCM_NONCE;
 		if (info->nonce_len != expected_nonce_len)
 			return -EBADMSG;
+	} else if (info->type == SMB2_RDMA_TRANSFORM_TYPE_SIGNING) {
+		if (!(work->conn->rdma_transform_ids &
+		      BIT(SMB2_RDMA_TRANSFORM_SIGNING)) ||
+		    !(req->hdr.Flags & SMB2_FLAGS_SIGNED) || info->nonce_len ||
+		    info->signature_len != SMB2_SIGNATURE_SIZE)
+			return -EINVAL;
 	} else {
 		return -EINVAL;
 	}
@@ -8979,8 +9020,10 @@ static int smb2_parse_rdma_write_transform(struct ksmbd_work *work,
 		return err;
 
 	ksmbd_debug(RDMA,
-		    "RDMA WRITE encryption metadata: session=%llu cipher=0x%04x payload=%u channel=0x%x descriptors=%zu nonce=%u tag=%u\n",
-		    work->sess->id, le16_to_cpu(work->conn->cipher_type),
+		    "RDMA WRITE %s metadata: session=%llu cipher=0x%04x payload=%u channel=0x%x descriptors=%zu nonce=%u tag=%u\n",
+		    info->type == SMB2_RDMA_TRANSFORM_TYPE_ENCRYPTION ?
+		    "encryption" : "signing", work->sess->id,
+		    le16_to_cpu(work->conn->cipher_type),
 		    le32_to_cpu(req->RemainingBytes), le32_to_cpu(info->channel),
 		    info->desc_len / sizeof(*info->desc), info->nonce_len,
 		    info->signature_len);
@@ -9344,7 +9387,7 @@ out:
  * @length: transfer length
  * @sync: request synchronous storage completion
  *
- * Receive the payload, authenticate or decrypt it when required, and write it
+ * Receive the payload, authenticate or verify it when required, and write it
  * to the target file.
  *
  * Return: written byte count on success, otherwise a negative errno
@@ -9356,6 +9399,7 @@ static ssize_t smb2_write_rdma(struct ksmbd_work *work,
 			       struct ksmbd_file *fp, loff_t offset,
 			       size_t length, bool sync)
 {
+	u8 signature[SMB2_SIGNATURE_SIZE];
 	char *data_buf;
 	int ret;
 	ssize_t nbytes;
@@ -9368,7 +9412,7 @@ static ssize_t smb2_write_rdma(struct ksmbd_work *work,
 				   desc_len);
 	if (ret < 0) {
 		if (transform)
-			pr_err("RDMA WRITE encrypted transfer failed: session=%llu payload=%zu rdma_read_rc=%d\n",
+			pr_err("RDMA WRITE transformed transfer failed: session=%llu payload=%zu rdma_read_rc=%d\n",
 			       work->sess->id, length, ret);
 		kvfree(data_buf);
 		return ret;
@@ -9387,13 +9431,30 @@ static ssize_t smb2_write_rdma(struct ksmbd_work *work,
 			kvfree(data_buf);
 			return ret == -ENOMEM ? ret : -EBADMSG;
 		}
+	} else if (transform) {
+		ret = ksmbd_sign_rdma(work->conn,
+				      smb3_rdma_signing_key(work), data_buf,
+				      length, signature);
+		if (ret) {
+			pr_err("RDMA WRITE signing failed: session=%llu payload=%zu rc=%d\n",
+			       work->sess->id, length, ret);
+			kvfree(data_buf);
+			return ret;
+		}
+		if (crypto_memneq(signature, transform->crypto->Signature,
+				  transform->signature_len)) {
+			pr_err("RDMA WRITE signature mismatch: session=%llu payload=%zu\n",
+			       work->sess->id, length);
+			kvfree(data_buf);
+			return -EKEYREJECTED;
+		}
 	}
 
 	ret = ksmbd_vfs_write(work, fp, data_buf, length, &offset, sync, &nbytes);
 	kvfree(data_buf);
 	if (ret < 0) {
 		if (transform)
-			pr_err("RDMA WRITE encrypted file write failed: session=%llu payload=%zu rc=%d\n",
+			pr_err("RDMA WRITE transformed file write failed: session=%llu payload=%zu rc=%d\n",
 			       work->sess->id, length, ret);
 		return ret;
 	}
@@ -9514,7 +9575,7 @@ int smb2_write(struct ksmbd_work *work)
 			err = smb2_parse_rdma_write_transform(work, req,
 							      &rdma_transform);
 			if (err) {
-				pr_err("RDMA WRITE encryption metadata rejected: session=%llu rc=%d\n",
+				pr_err("RDMA WRITE transform metadata rejected: session=%llu rc=%d\n",
 				       work->sess ? work->sess->id : 0, err);
 				goto out;
 			}

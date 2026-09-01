@@ -42,6 +42,8 @@ int ksmbd_crypt_rdma(struct ksmbd_conn *conn, const u8 *key,
 		     void *buf, unsigned int buflen, const u8 *nonce,
 		     unsigned int nonce_len, u8 *tag, unsigned int tag_len,
 		     bool enc);
+int ksmbd_sign_rdma(struct ksmbd_conn *conn, char *key, void *buf,
+		    unsigned int buflen, u8 *sig);
 void ksmbd_copy_gss_neg_header(void *buf);
 int ksmbd_auth_ntlmv2(struct ksmbd_conn *conn, struct ksmbd_session *sess,
 		      struct ntlmv2_resp *ntlmv2, int blen, char *domain_name,
