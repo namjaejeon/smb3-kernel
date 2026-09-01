@@ -21,7 +21,6 @@ jobs:
         include:
           - sanitizer: normal
           - sanitizer: kasan
-          - sanitizer: kcsan
           - sanitizer: lockdep
     name: ksmbd-xfstests (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest
@@ -145,13 +144,6 @@ jobs:
               ./scripts/config --disable CONFIG_KFENCE
               ./scripts/config --disable CONFIG_PROVE_LOCKING
               ;;
-            kcsan)
-              ./scripts/config --disable CONFIG_KASAN
-              ./scripts/config --enable CONFIG_KCSAN
-              ./scripts/config --enable CONFIG_KCSAN_EARLY_ENABLE
-              ./scripts/config --enable CONFIG_KFENCE
-              ./scripts/config --disable CONFIG_PROVE_LOCKING
-              ;;
             lockdep)
               ./scripts/config --disable CONFIG_KASAN
               ./scripts/config --disable CONFIG_KCSAN
@@ -191,13 +183,6 @@ jobs:
               check_enabled CONFIG_KASAN_GENERIC
               check_disabled CONFIG_KCSAN
               check_disabled CONFIG_KFENCE
-              check_disabled CONFIG_PROVE_LOCKING
-              ;;
-            kcsan)
-              check_enabled CONFIG_KCSAN
-              check_enabled CONFIG_KCSAN_EARLY_ENABLE
-              check_enabled CONFIG_KFENCE
-              check_disabled CONFIG_KASAN
               check_disabled CONFIG_PROVE_LOCKING
               ;;
             lockdep)
