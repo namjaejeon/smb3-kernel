@@ -81,8 +81,10 @@ jobs:
             sudo apt-get install -y -qq clang-$LLVM_VER lld-$LLVM_VER llvm-$LLVM_VER
             break
           done
-          echo "/usr/lib/llvm-$LLVM_VER/bin" >> $GITHUB_PATH
-          /usr/lib/llvm-$LLVM_VER/bin/clang --version
+          LLVM_BIN="/usr/lib/llvm-$LLVM_VER/bin"
+          echo "LLVM_BIN=$LLVM_BIN" >> "$GITHUB_ENV"
+          echo "$LLVM_BIN" >> "$GITHUB_PATH"
+          "$LLVM_BIN/clang" --version
 
       - name: Install virtme-ng
         run: |
@@ -103,7 +105,7 @@ jobs:
           cd ksmbd-tools
           ./autogen.sh
           ./configure --sysconfdir=/etc --with-rundir=/run
-          make CC=clang -j`nproc`
+          make CC="$LLVM_BIN/clang" -j`nproc`
           sudo make install
 
       # xfstests is hosted on git.kernel.org; actions/checkout can only
@@ -115,7 +117,7 @@ jobs:
 
       - name: Configure kernel
         run: |
-          make LLVM=1 defconfig
+          make LLVM="$LLVM_BIN/" defconfig
           ./scripts/config --disable CONFIG_KUNIT
           ./scripts/config --enable CONFIG_CIFS
           ./scripts/config --enable CONFIG_CIFS_XATTR
@@ -125,6 +127,8 @@ jobs:
           ./scripts/config --enable CONFIG_SMB_SERVER
           ./scripts/config --enable CONFIG_SMB_SERVER_CHECK_CAP_NET_ADMIN
           ./scripts/config --enable CONFIG_DEBUG_KERNEL
+          ./scripts/config --enable CONFIG_SYSFS
+          ./scripts/config --disable CONFIG_SLUB_TINY
           case "${{ matrix.sanitizer }}" in
             normal)
               ./scripts/config --disable CONFIG_KASAN
@@ -160,12 +164,15 @@ jobs:
               exit 1
               ;;
           esac
-          make LLVM=1 olddefconfig
+          make LLVM="$LLVM_BIN/" olddefconfig
 
       - name: Verify kernel configuration
         run: |
+          echo "LLVM_BIN=$LLVM_BIN"
+          "$LLVM_BIN/clang" --version
           grep -x "CONFIG_CIFS=y" .config
           grep -x "CONFIG_SMB_SERVER=y" .config
+          grep -E '^(CONFIG_(CC_IS_|CLANG_VERSION|GCC_VERSION|CC_HAS_KASAN_GENERIC|HAVE_ARCH_KASAN|SYSFS|SLUB_TINY|KASAN|KASAN_GENERIC|KASAN_OUTLINE|KASAN_INLINE))' .config || true
           check_enabled() {
             grep -qx "$1=y" .config
           }
@@ -204,7 +211,7 @@ jobs:
           grep -E "CONFIG_(CC_IS_CLANG|CC_VERSION_TEXT|DEBUG_KERNEL|KASAN|KCSAN|KCSAN_EARLY_ENABLE|KFENCE|PROVE_LOCKING|LOCKDEP)[= ]" .config || true
 
       - name: Build kernel
-        run: make -j"$(nproc)" LLVM=1
+        run: make -j"$(nproc)" LLVM="$LLVM_BIN/"
 
       - name: Prepare ksmbd xfstests guest script
         run: |
