@@ -321,7 +321,7 @@ jobs:
           log "running ${#TESTS[@]} xfstests"
           echo "=== XFSTESTS START ==="
           set +e
-          ./check -d -T -R xunit "${TESTS[@]}"
+          ./check -T -R xunit "${TESTS[@]}"
           status=$?
           set -e
           echo "=== XFSTESTS END ==="
