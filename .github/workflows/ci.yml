@@ -1,4 +1,4 @@
-name: ksmbd xfstests CI
+name: ksmbd xfstests and smbtorture CI
 
 on:
   push:
@@ -8,9 +8,10 @@ on:
     - cron: '0 0 * * *'
 
 jobs:
-  # xfstests over cifs.ko against the in-kernel SMB server (ksmbd), driven
-  # directly by this workflow. The repository is the kernel under test;
-  # ksmbd-tools and xfstests are fetched next to it.
+  # xfstests and smbtorture over cifs.ko against the in-kernel SMB server
+  # (ksmbd), driven directly by this workflow. The repository is the kernel
+  # under test; ksmbd-tools, xfstests, and the smbtorture client are fetched
+  # next to it.
   #
   # One parallel leg per kernel-debugging variant, starting from defconfig
   # and enabling only the options needed by that variant.
@@ -22,9 +23,9 @@ jobs:
           - sanitizer: normal
           - sanitizer: kasan
           - sanitizer: lockdep
-    name: ksmbd-xfstests (${{ matrix.sanitizer }})
+    name: ksmbd-xfstests + smbtorture (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest
-    # GitHub-hosted maximum; the VM timeout below is 4h so reporting and
+    # GitHub-hosted maximum; the VM timeout below is 5h so reporting and
     # uploads still run after a sanitizer-slow leg exhausts the VM time.
     timeout-minutes: 360
     steps:
@@ -56,10 +57,10 @@ jobs:
             libacl1-dev libaio-dev libattr1-dev libcap-dev libdw-dev \
             libelf-dev libgdbm-dev libgdbm-compat-dev libglib2.0-dev \
             libmount-dev libnl-3-dev libnl-genl-3-dev libssl-dev \
-            iproute2 libtool libtool-bin liburing-dev pkg-config quota \
+            iproute2 iptables libtool libtool-bin liburing-dev pkg-config quota \
             python3-venv qemu-system-x86 qemu-utils rsync sqlite3 \
-            uuid-dev uuid-runtime xfsprogs xfslibs-dev clang lld cargo rustc \
-            wget
+            samba-testsuite uuid-dev uuid-runtime xfsprogs xfslibs-dev \
+            clang lld cargo rustc wget
           # xfstests secondary users must exist on the host. They are shared
           # into the guest by virtme-ng.
           sudo useradd -m fsgqa || true
@@ -113,6 +114,27 @@ jobs:
         run: |
           git clone --depth 1 https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git
           make -j`nproc` -C xfstests-dev
+
+      # run.sh invokes smbtorture as ./bin/smbtorture. Keep that layout while
+      # using the distro test client so the complete list can be shared with
+      # local Samba builds.
+      - name: Prepare smbtorture
+        run: |
+          mkdir -p smbtorture/bin
+          SMBTORTURE_BIN=$(dpkg -L samba-testsuite | awk '$0 ~ /\/smbtorture$/ { print; exit }')
+          test -x "$SMBTORTURE_BIN"
+          "$SMBTORTURE_BIN" --version || true
+          rm -f smbtorture/bin/smbtorture
+          cat > smbtorture/bin/smbtorture <<SMBTORTURE_WRAPPER
+          #!/usr/bin/env bash
+          set +e
+          test_name="\${!#}"
+          "$SMBTORTURE_BIN" "\$@"
+          status=\$?
+          printf 'SMBTORTURE_RESULT\t%s\t%s\n' "\$status" "\$test_name"
+          exit "\$status"
+          SMBTORTURE_WRAPPER
+          chmod 755 smbtorture/bin/smbtorture
 
       - name: Configure kernel
         run: |
@@ -199,7 +221,7 @@ jobs:
       - name: Build kernel
         run: make -j"$(nproc)" LLVM="$LLVM_BIN/"
 
-      - name: Prepare ksmbd xfstests guest script
+      - name: Prepare ksmbd test guest script
         run: |
           mkdir -p .github
           cat > .github/xfstests-ksmbd.sh <<'KSMBD_SCRIPT'
@@ -207,8 +229,12 @@ jobs:
           set -u
 
           export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+          REPO_DIR="$PWD"
           XFSTESTS_DIR="${XFSTESTS_DIR:-$PWD/xfstests-dev}"
+          SMBTORTURE_DIR="${SMBTORTURE_DIR:-$REPO_DIR/smbtorture}"
+          SMBTORTURE_LIST="${SMBTORTURE_LIST:-$REPO_DIR/run.sh}"
           EXPORT_BASE="${EXPORT_BASE:-/var/tmp/kci-ksmbd}"
+          SMBTORTURE_EXPORT=/mnt/3
           SMB_USER=linkinjeon
           SMB_PASS=1234
           CIFS_MOUNT_OPTIONS='-ousername=linkinjeon,password=1234,noperm,vers=3.11,actimeo=0,mfsymlinks'
@@ -241,11 +267,33 @@ jobs:
               generic/567 generic/568 generic/590 generic/591 generic/599
           )
 
-          log() { echo "[ksmbd-xfstests] $*"; }
+          log() { echo "[ksmbd-test] $*"; }
           fail() {
-              echo "[ksmbd-xfstests] FATAL: $*"
+              echo "[ksmbd-test] FATAL: $*"
               dmesg | tail -80 || true
               exit 1
+          }
+
+          mountd_pid=
+          stop_ksmbd() {
+              ksmbd.control -s 2 2>/dev/null || true
+              if [ -n "${mountd_pid:-}" ]; then
+                  kill "$mountd_pid" 2>/dev/null || true
+                  wait "$mountd_pid" 2>/dev/null || true
+                  mountd_pid=
+              fi
+          }
+
+          start_ksmbd() {
+              local config=$1
+              local log_file=$2
+
+              ksmbd.mountd -n -C "$config" -P "$EXPORT_BASE/ksmbdpwd.db" \
+                  > "$log_file" 2>&1 &
+              mountd_pid=$!
+              sleep 2
+              kill -0 "$mountd_pid" 2>/dev/null || \
+                  fail "ksmbd.mountd exited while loading $config"
           }
 
           mount -t tmpfs tmpfs /run 2>/dev/null || true
@@ -254,6 +302,9 @@ jobs:
           command -v ksmbd.adduser >/dev/null || fail "ksmbd.adduser not found"
           command -v mount.cifs >/dev/null || fail "mount.cifs not found"
           [ -x "$XFSTESTS_DIR/check" ] || fail "xfstests check not found at $XFSTESTS_DIR"
+          [ -x "$SMBTORTURE_DIR/bin/smbtorture" ] || \
+              fail "smbtorture not found at $SMBTORTURE_DIR/bin/smbtorture"
+          [ -f "$SMBTORTURE_LIST" ] || fail "smbtorture test list not found at $SMBTORTURE_LIST"
 
           mkdir -m 777 -p "$EXPORT_BASE/test" "$EXPORT_BASE/scratch" || \
               fail "cannot create SMB export directories"
@@ -279,13 +330,11 @@ jobs:
 
           ksmbd.adduser -P "$EXPORT_BASE/ksmbdpwd.db" -a "$SMB_USER" -p "$SMB_PASS" || \
               fail "ksmbd.adduser failed"
+          ksmbd.adduser -P "$EXPORT_BASE/ksmbdpwd.db" -a testuser -p "$SMB_PASS" || \
+              fail "ksmbd.adduser failed for testuser"
           mkdir -p /etc/ksmbd
-          ksmbd.mountd -n -C "$EXPORT_BASE/smb.conf" -P "$EXPORT_BASE/ksmbdpwd.db" \
-              > "$EXPORT_BASE/ksmbd.mountd.log" 2>&1 &
-          mountd_pid=$!
-          trap 'ksmbd.control -s 2>/dev/null || true; kill "$mountd_pid" 2>/dev/null || true' EXIT
-          sleep 2
-          kill -0 "$mountd_pid" 2>/dev/null || fail "ksmbd.mountd exited"
+          trap 'stop_ksmbd' EXIT
+          start_ksmbd "$EXPORT_BASE/smb.conf" "$EXPORT_BASE/ksmbd.mountd.log"
 
           mount -t cifs "$CIFS_MOUNT_OPTIONS" "//127.0.0.1/test" \
               "$EXPORT_BASE/mnt-test" || fail "CIFS smoke mount failed"
@@ -308,22 +357,63 @@ jobs:
           echo "=== XFSTESTS START ==="
           set +e
           ./check -T -R xunit "${TESTS[@]}"
-          status=$?
+          xfstests_status=$?
           set -e
           echo "=== XFSTESTS END ==="
+
+          # xfstests and smbtorture intentionally use different server
+          # configurations. xfstests must not receive fake_fscaps; restart
+          # ksmbd before running the smbtorture list with that option enabled.
+          umount "$EXPORT_BASE/mnt-test" 2>/dev/null || true
+          umount "$EXPORT_BASE/mnt-scratch" 2>/dev/null || true
+          stop_ksmbd
+          rm -rf "$SMBTORTURE_EXPORT"/*
+          mkdir -m 777 -p "$SMBTORTURE_EXPORT" || \
+              fail "cannot create smbtorture share"
+          cat > "$EXPORT_BASE/ksmbd.conf" <<SMBTORTURE_CONF
+          [global]
+              netbios name = KSMBD-CI
+              server multi channel support = yes
+              smb2 leases = yes
+              durable handles = yes
+              share:fake_fscaps = 0
+
+          [cifsd-test3]
+              path = $SMBTORTURE_EXPORT
+              writeable = yes
+              read only = no
+          SMBTORTURE_CONF
+          grep -Eq '^[[:space:]]*share:fake_fscaps[[:space:]]*=[[:space:]]*0[[:space:]]*$' \
+              "$EXPORT_BASE/ksmbd.conf" || \
+              fail "smbtorture ksmbd.conf is missing share:fake_fscaps"
+          log "restarting ksmbd with share:fake_fscaps = 0 for smbtorture"
+          start_ksmbd "$EXPORT_BASE/ksmbd.conf" \
+              "$EXPORT_BASE/ksmbd-smbtorture.mountd.log"
+
+          cd "$SMBTORTURE_DIR" || fail "cannot enter smbtorture directory"
+          log "running smbtorture list from $SMBTORTURE_LIST"
+          echo "=== SMBTORTURE START ==="
+          set +e
+          bash "$SMBTORTURE_LIST" 2>&1 | tee "$EXPORT_BASE/smbtorture.log"
+          smbtorture_status=${PIPESTATUS[0]}
+          set -e
+          echo "=== SMBTORTURE END ==="
+          echo "=== SMBTORTURE STATUS: $smbtorture_status ==="
           echo "=== FULL DMESG ==="
           dmesg || true
-          exit "$status"
+          log "xfstests exit status: $xfstests_status"
+          log "smbtorture exit status: $smbtorture_status"
+          exit "$smbtorture_status"
           KSMBD_SCRIPT
           chmod 755 .github/xfstests-ksmbd.sh
 
       # Run the kernel built above in a copy-on-write virtme-ng guest. The
-      # guest sees the checked-out tree, ksmbd-tools, and xfstests directory.
-      - name: Run xfstests
+      # guest sees the checked-out tree, ksmbd-tools, xfstests, and smbtorture.
+      - name: Run xfstests and smbtorture
         run: |
           mkdir -p test-results
           set +e
-          timeout 14400 vng --rw --verbose \
+          timeout 18000 vng --rw --verbose \
             --memory 8G --cpus "$(nproc)" \
             --append 'panic_on_warn=0' --network user --user root \
             --exec "cd $GITHUB_WORKSPACE && bash .github/xfstests-ksmbd.sh" \
@@ -334,6 +424,9 @@ jobs:
           awk '/^=== XFSTESTS START ===$/ {in_xfs=1; next} \
                /^=== XFSTESTS END ===$/ {in_xfs=0} in_xfs' \
             test-results/vng-output.txt > test-results/xfstests-ksmbd.txt
+          awk '/^=== SMBTORTURE START ===$/ {in_smb=1; next} \
+               /^=== SMBTORTURE END ===$/ {in_smb=0} in_smb' \
+            test-results/vng-output.txt > test-results/smbtorture-ksmbd.txt
           awk '/^=== FULL DMESG ===$/ {in_dmesg=1; next} in_dmesg' \
             test-results/vng-output.txt > test-results/dmesg.txt
           cp -f xfstests-dev/local.config test-results/local.config 2>/dev/null || true
@@ -367,15 +460,30 @@ jobs:
             tail -80 test-results/vng-output.txt
             exit 1
           fi
-          echo "virtme-ng exited with status $vm_status after xfstests completed"
+          if ! grep -q '=== SMBTORTURE END ===' test-results/vng-output.txt; then
+            echo "::error::smbtorture did not complete (virtme-ng status: $vm_status)"
+            tail -80 test-results/vng-output.txt
+            exit 1
+          fi
+          smbtorture_status=$(sed -n 's/^=== SMBTORTURE STATUS: \([0-9][0-9]*\) ===$/\1/p' \
+            test-results/vng-output.txt | tail -1)
+          echo "smbtorture exited with status ${smbtorture_status:-unknown}"
+          echo "virtme-ng exited with status $vm_status after xfstests and smbtorture completed"
 
       # Individual test failures must NOT fail the job (they are reported
-      # instead); only a broken harness. xfstests never reached its
-      # summary line (boot panic, mount failure) is a CI failure.
+      # instead); only a broken harness. Missing xfstests or smbtorture
+      # completion markers (boot panic, mount failure) is a CI failure.
       - name: Verify xfstests completed
         run: |
           grep -qE "^(Failed [0-9]+ of|Passed all)" test-results/xfstests-ksmbd.txt 2>/dev/null && exit 0
           echo "::error::xfstests never completed -- guest environment failure. Last guest output:"
+          tail -80 test-results/vng-output.txt 2>/dev/null || echo "(no vng output at all -- VM did not boot?)"
+          exit 1
+
+      - name: Verify smbtorture completed
+        run: |
+          grep -q '^=== SMBTORTURE END ===$' test-results/vng-output.txt && exit 0
+          echo "::error::smbtorture never completed -- guest environment failure. Last guest output:"
           tail -80 test-results/vng-output.txt 2>/dev/null || echo "(no vng output at all -- VM did not boot?)"
           exit 1
 
@@ -420,12 +528,61 @@ jobs:
           echo ""
           echo "=== KERNEL DMESG BUGS ==="
           grep -E "(BUG:|KASAN:|KCSAN:|KMSAN:|UBSAN:|Oops:|WARNING:)" test-results/dmesg.txt 2>/dev/null || echo "(none)"
+          smbtorture_status=$(sed -n 's/^=== SMBTORTURE STATUS: \([0-9][0-9]*\) ===$/\1/p' \
+            test-results/vng-output.txt 2>/dev/null | tail -1 || true)
+          smbtorture_tests=$(grep -cE '^\./bin/smbtorture ' run.sh 2>/dev/null || true)
+          smbtorture_result_file=test-results/smbtorture-ksmbd.txt
+          smbtorture_passed=0
+          smbtorture_failed=0
+          smbtorture_failed_names=
+          smbtorture_passed=$(awk -F '\t' \
+            '$1 == "SMBTORTURE_RESULT" && $2 == 0 { count++ } END { print count + 0 }' \
+            "$smbtorture_result_file" 2>/dev/null) || smbtorture_passed=0
+          smbtorture_failed=$(awk -F '\t' \
+            '$1 == "SMBTORTURE_RESULT" && $2 != 0 { count++ } END { print count + 0 }' \
+            "$smbtorture_result_file" 2>/dev/null) || smbtorture_failed=0
+          smbtorture_failed_names=$(awk -F '\t' \
+            '$1 == "SMBTORTURE_RESULT" && $2 != 0 { printf "%s (exit %s)\n", $3, $2 }' \
+            "$smbtorture_result_file" 2>/dev/null) || smbtorture_failed_names=
+          smbtorture_invoked=$((smbtorture_passed + smbtorture_failed))
+          echo ""
+          echo "=== SMBTORTURE SUMMARY ==="
+          echo "Tests listed: ${smbtorture_tests:-unknown}"
+          echo "Tests invoked: $smbtorture_invoked"
+          echo "Passed: $smbtorture_passed"
+          echo "Failed: $smbtorture_failed"
+          echo "Exit status: ${smbtorture_status:-unknown}"
+          echo "Failed test names:"
+          if [ "$smbtorture_failed" -gt 0 ]; then
+            printf '%s\n' "$smbtorture_failed_names"
+          else
+            echo "none"
+          fi
           {
             echo "## xfstests over ksmbd (${{ matrix.sanitizer }})"
             echo '```'
             cat test-results/xfstests-summary.txt
             echo ""
             grep -E "^(Failures:|Failed [0-9]+ of|Passed all|Not run:)" test-results/xfstests-ksmbd.txt 2>/dev/null || echo "xfstests did not complete"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## smbtorture over ksmbd (${{ matrix.sanitizer }})"
+            echo '```'
+            echo "Tests listed: ${smbtorture_tests:-unknown}"
+            echo "Tests invoked: $smbtorture_invoked"
+            echo "Passed: $smbtorture_passed"
+            echo "Failed: $smbtorture_failed"
+            echo "Exit status: ${smbtorture_status:-unknown}"
+            echo ""
+            echo "Failed test names:"
+            if [ "$smbtorture_failed" -gt 0 ]; then
+              while IFS= read -r failed_test; do
+                echo "- $failed_test"
+              done <<< "$smbtorture_failed_names"
+            else
+              echo "- none"
+            fi
             echo '```'
           } >> $GITHUB_STEP_SUMMARY
 
@@ -436,6 +593,7 @@ jobs:
           name: xfstests-results-${{ matrix.sanitizer }}
           path: |
             test-results/xfstests-ksmbd.txt
+            test-results/smbtorture-ksmbd.txt
             test-results/xfstests-failures.txt
             test-results/xfstests-results/
 
