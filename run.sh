@@ -486,10 +486,6 @@ sudo rm -rf /mnt/3/*
 ./bin/smbtorture //127.0.0.1/cifsd-test3/ -Ulinkinjeon%1234 smb2.setinfo
 ./bin/smbtorture //127.0.0.1/cifsd-test3/ -Ulinkinjeon%1234 --option=torture:filename=testfile smb2.set-sparse-ioctl
 ./bin/smbtorture //127.0.0.1/cifsd-test3/ -Ulinkinjeon%1234 smb2.ioctl-on-stream
-./bin/smbtorture //127.0.0.1/cifsd-test3/ -Ulinkinjeon%1234 smb2.
-./bin/smbtorture //127.0.0.1/cifsd-test3/ -Ulinkinjeon%1234 smb2.
-./bin/smbtorture //127.0.0.1/cifsd-test3/ -Ulinkinjeon%1234 smb2.
-./bin/smbtorture //127.0.0.1/cifsd-test3/ -Ulinkinjeon%1234 smb2.
 
 # smb2 replay tests
 ./bin/smbtorture //127.0.0.1/cifsd-test3/ -Ulinkinjeon%1234 smb2.replay.replay-commands

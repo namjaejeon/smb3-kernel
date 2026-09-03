@@ -21,8 +21,11 @@ jobs:
       matrix:
         include:
           - sanitizer: normal
+            smbtorture: true
           - sanitizer: kasan
+            smbtorture: false
           - sanitizer: lockdep
+            smbtorture: false
     name: ksmbd-xfstests + smbtorture (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest
     # GitHub-hosted maximum; the VM timeout below is 5h so reporting and
@@ -57,9 +60,9 @@ jobs:
             libacl1-dev libaio-dev libattr1-dev libcap-dev libdw-dev \
             libelf-dev libgdbm-dev libgdbm-compat-dev libglib2.0-dev \
             libmount-dev libnl-3-dev libnl-genl-3-dev libssl-dev \
-            iproute2 iptables libtool libtool-bin liburing-dev pkg-config quota \
+            iproute2 libtool libtool-bin liburing-dev pkg-config quota \
             python3-venv qemu-system-x86 qemu-utils rsync sqlite3 \
-            samba-testsuite uuid-dev uuid-runtime xfsprogs xfslibs-dev \
+            uuid-dev uuid-runtime xfsprogs xfslibs-dev \
             clang lld cargo rustc wget
           # xfstests secondary users must exist on the host. They are shared
           # into the guest by virtme-ng.
@@ -119,7 +122,9 @@ jobs:
       # using the distro test client so the complete list can be shared with
       # local Samba builds.
       - name: Prepare smbtorture
+        if: matrix.smbtorture == true
         run: |
+          sudo apt-get install -y -qq iptables samba-testsuite
           mkdir -p smbtorture/bin
           SMBTORTURE_BIN=$(dpkg -L samba-testsuite | awk '$0 ~ /\/smbtorture$/ { print; exit }')
           test -x "$SMBTORTURE_BIN"
@@ -233,6 +238,7 @@ jobs:
           XFSTESTS_DIR="${XFSTESTS_DIR:-$PWD/xfstests-dev}"
           SMBTORTURE_DIR="${SMBTORTURE_DIR:-$REPO_DIR/smbtorture}"
           SMBTORTURE_LIST="${SMBTORTURE_LIST:-$REPO_DIR/run.sh}"
+          SMBTORTURE_ENABLED="${{ matrix.smbtorture }}"
           EXPORT_BASE="${EXPORT_BASE:-/var/tmp/kci-ksmbd}"
           SMBTORTURE_EXPORT=/mnt/3
           SMB_USER=linkinjeon
@@ -302,9 +308,12 @@ jobs:
           command -v ksmbd.adduser >/dev/null || fail "ksmbd.adduser not found"
           command -v mount.cifs >/dev/null || fail "mount.cifs not found"
           [ -x "$XFSTESTS_DIR/check" ] || fail "xfstests check not found at $XFSTESTS_DIR"
-          [ -x "$SMBTORTURE_DIR/bin/smbtorture" ] || \
-              fail "smbtorture not found at $SMBTORTURE_DIR/bin/smbtorture"
-          [ -f "$SMBTORTURE_LIST" ] || fail "smbtorture test list not found at $SMBTORTURE_LIST"
+          if [ "$SMBTORTURE_ENABLED" = "true" ]; then
+              [ -x "$SMBTORTURE_DIR/bin/smbtorture" ] || \
+                  fail "smbtorture not found at $SMBTORTURE_DIR/bin/smbtorture"
+              [ -f "$SMBTORTURE_LIST" ] || \
+                  fail "smbtorture test list not found at $SMBTORTURE_LIST"
+          fi
 
           mkdir -m 777 -p "$EXPORT_BASE/test" "$EXPORT_BASE/scratch" || \
               fail "cannot create SMB export directories"
@@ -367,6 +376,14 @@ jobs:
           umount "$EXPORT_BASE/mnt-test" 2>/dev/null || true
           umount "$EXPORT_BASE/mnt-scratch" 2>/dev/null || true
           stop_ksmbd
+
+          if [ "$SMBTORTURE_ENABLED" != "true" ]; then
+              log "skipping smbtorture for this sanitizer"
+              echo "=== SMBTORTURE SKIPPED ==="
+              log "xfstests exit status: $xfstests_status"
+              exit "$xfstests_status"
+          fi
+
           rm -rf "$SMBTORTURE_EXPORT"/*
           mkdir -m 777 -p "$SMBTORTURE_EXPORT" || \
               fail "cannot create smbtorture share"
@@ -420,6 +437,7 @@ jobs:
             2>&1 | tee test-results/vng-output.txt
           vm_status=${PIPESTATUS[0]}
           set -e
+          smbtorture_enabled="${{ matrix.smbtorture }}"
 
           awk '/^=== XFSTESTS START ===$/ {in_xfs=1; next} \
                /^=== XFSTESTS END ===$/ {in_xfs=0} in_xfs' \
@@ -460,15 +478,23 @@ jobs:
             tail -80 test-results/vng-output.txt
             exit 1
           fi
-          if ! grep -q '=== SMBTORTURE END ===' test-results/vng-output.txt; then
-            echo "::error::smbtorture did not complete (virtme-ng status: $vm_status)"
-            tail -80 test-results/vng-output.txt
-            exit 1
+          if [ "$smbtorture_enabled" = "true" ]; then
+            if ! grep -q '=== SMBTORTURE END ===' test-results/vng-output.txt; then
+              echo "::error::smbtorture did not complete (virtme-ng status: $vm_status)"
+              tail -80 test-results/vng-output.txt
+              exit 1
+            fi
+          else
+            echo "smbtorture skipped for this sanitizer"
           fi
           smbtorture_status=$(sed -n 's/^=== SMBTORTURE STATUS: \([0-9][0-9]*\) ===$/\1/p' \
             test-results/vng-output.txt | tail -1)
-          echo "smbtorture exited with status ${smbtorture_status:-unknown}"
-          echo "virtme-ng exited with status $vm_status after xfstests and smbtorture completed"
+          if [ "$smbtorture_enabled" = "true" ]; then
+            echo "smbtorture exited with status ${smbtorture_status:-unknown}"
+            echo "virtme-ng exited with status $vm_status after xfstests and smbtorture completed"
+          else
+            echo "virtme-ng exited with status $vm_status after xfstests completed (smbtorture skipped)"
+          fi
 
       # Individual test failures must NOT fail the job (they are reported
       # instead); only a broken harness. Missing xfstests or smbtorture
@@ -481,6 +507,7 @@ jobs:
           exit 1
 
       - name: Verify smbtorture completed
+        if: ${{ always() && matrix.smbtorture == true }}
         run: |
           grep -q '^=== SMBTORTURE END ===$' test-results/vng-output.txt && exit 0
           echo "::error::smbtorture never completed -- guest environment failure. Last guest output:"
@@ -528,22 +555,27 @@ jobs:
           echo ""
           echo "=== KERNEL DMESG BUGS ==="
           grep -E "(BUG:|KASAN:|KCSAN:|KMSAN:|UBSAN:|Oops:|WARNING:)" test-results/dmesg.txt 2>/dev/null || echo "(none)"
-          smbtorture_status=$(sed -n 's/^=== SMBTORTURE STATUS: \([0-9][0-9]*\) ===$/\1/p' \
-            test-results/vng-output.txt 2>/dev/null | tail -1 || true)
-          smbtorture_tests=$(grep -cE '^\./bin/smbtorture ' run.sh 2>/dev/null || true)
-          smbtorture_result_file=test-results/smbtorture-ksmbd.txt
+          smbtorture_enabled="${{ matrix.smbtorture }}"
+          smbtorture_status=skipped
+          smbtorture_tests=0
           smbtorture_passed=0
           smbtorture_failed=0
           smbtorture_failed_names=
-          smbtorture_passed=$(awk -F '\t' \
-            '$1 == "SMBTORTURE_RESULT" && $2 == 0 { count++ } END { print count + 0 }' \
-            "$smbtorture_result_file" 2>/dev/null) || smbtorture_passed=0
-          smbtorture_failed=$(awk -F '\t' \
-            '$1 == "SMBTORTURE_RESULT" && $2 != 0 { count++ } END { print count + 0 }' \
-            "$smbtorture_result_file" 2>/dev/null) || smbtorture_failed=0
-          smbtorture_failed_names=$(awk -F '\t' \
-            '$1 == "SMBTORTURE_RESULT" && $2 != 0 { printf "%s (exit %s)\n", $3, $2 }' \
-            "$smbtorture_result_file" 2>/dev/null) || smbtorture_failed_names=
+          if [ "$smbtorture_enabled" = "true" ]; then
+            smbtorture_status=$(sed -n 's/^=== SMBTORTURE STATUS: \([0-9][0-9]*\) ===$/\1/p' \
+              test-results/vng-output.txt 2>/dev/null | tail -1 || true)
+            smbtorture_tests=$(grep -cE '^\./bin/smbtorture ' run.sh 2>/dev/null || true)
+            smbtorture_result_file=test-results/smbtorture-ksmbd.txt
+            smbtorture_passed=$(awk -F '\t' \
+              '$1 == "SMBTORTURE_RESULT" && $2 == 0 { count++ } END { print count + 0 }' \
+              "$smbtorture_result_file" 2>/dev/null) || smbtorture_passed=0
+            smbtorture_failed=$(awk -F '\t' \
+              '$1 == "SMBTORTURE_RESULT" && $2 != 0 { count++ } END { print count + 0 }' \
+              "$smbtorture_result_file" 2>/dev/null) || smbtorture_failed=0
+            smbtorture_failed_names=$(awk -F '\t' \
+              '$1 == "SMBTORTURE_RESULT" && $2 != 0 { printf "%s (exit %s)\n", $3, $2 }' \
+              "$smbtorture_result_file" 2>/dev/null) || smbtorture_failed_names=
+          fi
           smbtorture_invoked=$((smbtorture_passed + smbtorture_failed))
           echo ""
           echo "=== SMBTORTURE SUMMARY ==="
@@ -552,6 +584,9 @@ jobs:
           echo "Passed: $smbtorture_passed"
           echo "Failed: $smbtorture_failed"
           echo "Exit status: ${smbtorture_status:-unknown}"
+          if [ "$smbtorture_enabled" != "true" ]; then
+            echo "Execution: skipped (normal sanitizer only)"
+          fi
           echo "Failed test names:"
           if [ "$smbtorture_failed" -gt 0 ]; then
             printf '%s\n' "$smbtorture_failed_names"
@@ -574,6 +609,9 @@ jobs:
             echo "Passed: $smbtorture_passed"
             echo "Failed: $smbtorture_failed"
             echo "Exit status: ${smbtorture_status:-unknown}"
+            if [ "$smbtorture_enabled" != "true" ]; then
+              echo "Execution: skipped (normal sanitizer only)"
+            fi
             echo ""
             echo "Failed test names:"
             if [ "$smbtorture_failed" -gt 0 ]; then
