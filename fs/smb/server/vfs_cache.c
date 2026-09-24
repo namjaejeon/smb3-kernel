@@ -37,6 +37,7 @@ static DEFINE_RWLOCK(inode_hash_lock);
 static struct ksmbd_file_table global_ft;
 static atomic_long_t fd_limit;
 static struct kmem_cache *filp_cache;
+DECLARE_WAIT_QUEUE_HEAD(ksmbd_lock_wait);
 
 static int ksmbd_mark_fp_closed(struct ksmbd_file *fp);
 
@@ -646,7 +647,10 @@ static void __ksmbd_close_fd(struct ksmbd_file_table *ft, struct ksmbd_file *fp)
 		}
 
 		list_del_init(&smb_lock->flist);
-		ksmbd_vfs_posix_lock_unblock(smb_lock->fl);
+		if (smb_lock->vfs_locked)
+			ksmbd_vfs_posix_lock_unblock(smb_lock->fl);
+		if (smb_lock->virtual_lock)
+			wake_up_all(&ksmbd_lock_wait);
 		locks_free_lock(smb_lock->fl);
 		kfree(smb_lock);
 	}

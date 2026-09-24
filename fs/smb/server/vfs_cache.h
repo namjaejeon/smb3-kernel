@@ -12,6 +12,7 @@
 #include <linux/rwsem.h>
 #include <linux/spinlock.h>
 #include <linux/idr.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include "vfs.h"
@@ -44,9 +45,14 @@ struct ksmbd_lock {
 	unsigned int flags;
 	int cmd;
 	int zero_len;
+	bool virtual_lock;
+	bool vfs_locked;
+	bool pending;
 	unsigned long long start;
 	unsigned long long end;
 };
+
+extern wait_queue_head_t ksmbd_lock_wait;
 
 struct stream {
 	char *name;
