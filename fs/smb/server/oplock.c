@@ -20,6 +20,11 @@
 
 static LIST_HEAD(lease_table_list);
 static DEFINE_RWLOCK(lease_list_lock);
+static DEFINE_MUTEX(lease_break_timer_lock);
+static unsigned long lease_break_timer_next;
+static bool lease_break_timer_pending;
+static void lease_break_timer(struct work_struct *work);
+static DECLARE_DELAYED_WORK(lease_break_timer_work, lease_break_timer);
 
 #define SMB2_LEASE_STATE_MASK_LE	(SMB2_LEASE_READ_CACHING_LE | \
 					 SMB2_LEASE_HANDLE_CACHING_LE | \
@@ -115,6 +120,100 @@ static void lease_put(struct lease *lease)
 		kfree(lease);
 }
 
+/* The caller holds lease->lock. */
+static void lease_break_to_none_locked(struct lease *lease)
+{
+	struct oplock_info *opinfo;
+	bool wake;
+
+	lease->state = SMB2_LEASE_NONE_LE;
+	lease->new_state = SMB2_LEASE_NONE_LE;
+	lease->breaking = false;
+	lease->break_timeout_set = false;
+	list_for_each_entry(opinfo, &lease->open_list, lease_entry) {
+		spin_lock(&opinfo->state_lock);
+		opinfo->level = SMB2_OPLOCK_LEVEL_NONE;
+		wake = opinfo->op_state == OPLOCK_ACK_WAIT;
+		if (wake) {
+			opinfo->op_state = OPLOCK_STATE_NONE;
+			opinfo->oplock_timed_out = true;
+			atomic_set(&opinfo->breaking_cnt, 0);
+		}
+		spin_unlock(&opinfo->state_lock);
+		if (wake) {
+			wake_up_interruptible_all(&opinfo->oplock_q);
+			wake_up_interruptible_all(&opinfo->oplock_brk);
+		}
+	}
+}
+
+static void lease_break_send_failed(struct lease *lease)
+{
+	struct oplock_info *opinfo;
+	bool waiting;
+
+	spin_lock(&lease->lock);
+	list_for_each_entry(opinfo, &lease->open_list, lease_entry) {
+		spin_lock(&opinfo->state_lock);
+		waiting = opinfo->op_state == OPLOCK_ACK_WAIT;
+		spin_unlock(&opinfo->state_lock);
+		if (waiting) {
+			lease_break_to_none_locked(lease);
+			break;
+		}
+	}
+	spin_unlock(&lease->lock);
+}
+
+static void lease_break_timer(struct work_struct *work)
+{
+	struct lease_table *lb;
+	struct lease *lease;
+	unsigned long next = 0, now;
+	bool pending = false;
+
+	mutex_lock(&lease_break_timer_lock);
+	now = jiffies;
+	read_lock(&lease_list_lock);
+	list_for_each_entry(lb, &lease_table_list, l_entry) {
+		list_for_each_entry(lease, &lb->lease_list, l_entry) {
+			spin_lock(&lease->lock);
+			if (lease->breaking && lease->break_timeout_set) {
+				if (time_after_eq(now, lease->break_timeout)) {
+					lease_break_to_none_locked(lease);
+				} else if (!pending ||
+					   time_before(lease->break_timeout, next)) {
+					next = lease->break_timeout;
+					pending = true;
+				}
+			}
+			spin_unlock(&lease->lock);
+		}
+	}
+	read_unlock(&lease_list_lock);
+
+	lease_break_timer_pending = pending;
+	if (pending) {
+		lease_break_timer_next = next;
+		mod_delayed_work(system_wq, &lease_break_timer_work,
+				 time_after_eq(jiffies, next) ? 0 : next - jiffies);
+	}
+	mutex_unlock(&lease_break_timer_lock);
+}
+
+static void schedule_lease_break_timer(unsigned long timeout)
+{
+	mutex_lock(&lease_break_timer_lock);
+	if (!lease_break_timer_pending ||
+	    time_before(timeout, lease_break_timer_next)) {
+		lease_break_timer_pending = true;
+		lease_break_timer_next = timeout;
+		mod_delayed_work(system_wq, &lease_break_timer_work,
+				 time_after_eq(jiffies, timeout) ? 0 : timeout - jiffies);
+	}
+	mutex_unlock(&lease_break_timer_lock);
+}
+
 static void lease_add_table(struct lease *lease, struct lease_table *lb)
 {
 	lease_get(lease);
@@ -189,6 +288,8 @@ static struct lease *alloc_lease(struct lease_ctx_info *lctx,
 	lease->epoch = lctx->version == 2 ? le16_to_cpu(lctx->epoch) + 1 : 0;
 	lease->ci = ci;
 	lease->reuse_epoch = false;
+	lease->breaking = false;
+	lease->break_timeout_set = false;
 	lease->l_lb = NULL;
 	INIT_LIST_HEAD(&lease->l_entry);
 	INIT_LIST_HEAD(&lease->open_list);
@@ -737,42 +838,16 @@ static struct oplock_info *same_client_has_lease(struct ksmbd_inode *ci,
 
 static bool wait_for_break_ack(struct oplock_info *opinfo)
 {
-	int rc = 0;
 	bool timed_out;
 
-	if (!opinfo->is_lease) {
-		wait_event(opinfo->oplock_q,
-			   opinfo->op_state == OPLOCK_STATE_NONE ||
-			   opinfo->op_state == OPLOCK_CLOSING);
-		spin_lock(&opinfo->state_lock);
-		timed_out = opinfo->oplock_timed_out;
-		spin_unlock(&opinfo->state_lock);
-		return timed_out;
-	}
+	wait_event(opinfo->oplock_q,
+		   opinfo->op_state == OPLOCK_STATE_NONE ||
+		   opinfo->op_state == OPLOCK_CLOSING);
+	spin_lock(&opinfo->state_lock);
+	timed_out = opinfo->oplock_timed_out;
+	spin_unlock(&opinfo->state_lock);
 
-	rc = wait_event_interruptible_timeout(opinfo->oplock_q,
-					      opinfo->op_state == OPLOCK_STATE_NONE ||
-					      opinfo->op_state == OPLOCK_CLOSING,
-					      OPLOCK_WAIT_TIME);
-
-	/* is this a timeout ? */
-	if (!rc) {
-		spin_lock(&opinfo->state_lock);
-		if (opinfo->op_state == OPLOCK_CLOSING) {
-			spin_unlock(&opinfo->state_lock);
-			return false;
-		}
-		if (opinfo->is_lease) {
-			opinfo->o_lease->state = SMB2_LEASE_NONE_LE;
-			lease_update_oplock_levels(opinfo->o_lease);
-		}
-		opinfo->level = SMB2_OPLOCK_LEVEL_NONE;
-		opinfo->op_state = OPLOCK_STATE_NONE;
-		spin_unlock(&opinfo->state_lock);
-		return true;
-	}
-
-	return false;
+	return timed_out;
 }
 
 static void wake_up_oplock_break(struct oplock_info *opinfo)
@@ -1083,11 +1158,20 @@ static void __smb2_lease_break_noti(struct work_struct *wk)
 	struct ksmbd_work *work = container_of(wk, struct ksmbd_work, work);
 	struct ksmbd_conn *conn = work->conn;
 	struct lease_break_info *br_info = work->request_buf;
+	struct lease *lease = br_info->lease;
 	struct smb2_hdr *rsp_hdr;
+	struct oplock_info *opinfo;
+	unsigned long timeout = 0;
+	bool start_timer = false;
+	bool ack_required;
+	bool waiting;
+
+	ack_required = br_info->curr_state &
+		(SMB2_LEASE_WRITE_CACHING_LE | SMB2_LEASE_HANDLE_CACHING_LE);
 
 	if (allocate_interim_rsp_buf(work)) {
 		ksmbd_debug(OPLOCK, "smb2_allocate_rsp_buf failed! ");
-		goto out;
+		goto send_failed;
 	}
 
 	rsp_hdr = smb_get_msg(work->response_buf);
@@ -1122,11 +1206,44 @@ static void __smb2_lease_break_noti(struct work_struct *wk)
 
 	if (ksmbd_iov_pin_rsp(work, (void *)rsp,
 			      sizeof(struct smb2_lease_break)))
-		goto out;
+		goto send_failed;
 
-	ksmbd_conn_write(work);
+	if (ksmbd_conn_write(work))
+		goto send_failed;
+
+	if (ack_required) {
+		read_lock(&lease_list_lock);
+		spin_lock(&lease->lock);
+		if (!lease->l_lb) {
+			lease_break_to_none_locked(lease);
+		} else if (!lease->breaking) {
+			list_for_each_entry(opinfo, &lease->open_list, lease_entry) {
+				spin_lock(&opinfo->state_lock);
+				waiting = opinfo->op_state == OPLOCK_ACK_WAIT;
+				spin_unlock(&opinfo->state_lock);
+				if (!waiting)
+					continue;
+				timeout = jiffies + OPLOCK_WAIT_TIME;
+				lease->break_timeout = timeout;
+				lease->break_timeout_set = true;
+				lease->breaking = true;
+				start_timer = true;
+				break;
+			}
+		}
+		spin_unlock(&lease->lock);
+		read_unlock(&lease_list_lock);
+		if (start_timer)
+			schedule_lease_break_timer(timeout);
+	}
+	goto out;
+
+send_failed:
+	if (ack_required)
+		lease_break_send_failed(lease);
 
 out:
+	lease_put(lease);
 	ksmbd_free_work_struct(work);
 	ksmbd_conn_r_count_dec(conn);
 	ksmbd_conn_put(conn);
@@ -1184,12 +1301,15 @@ static int smb2_lease_break_noti(struct oplock_info *opinfo, bool sync,
 	struct lease *lease = opinfo->o_lease;
 
 	conn = smb2_lease_break_conn_get(opinfo);
-	if (!conn)
+	if (!conn) {
+		lease_break_send_failed(lease);
 		return ksmbd_invalidate_durable_fd(opinfo->fid);
+	}
 
 	work = ksmbd_alloc_work_struct();
 	if (!work) {
 		ksmbd_conn_put(conn);
+		lease_break_send_failed(lease);
 		return -ENOMEM;
 	}
 
@@ -1197,6 +1317,7 @@ static int smb2_lease_break_noti(struct oplock_info *opinfo, bool sync,
 	if (!br_info) {
 		ksmbd_free_work_struct(work);
 		ksmbd_conn_put(conn);
+		lease_break_send_failed(lease);
 		return -ENOMEM;
 	}
 
@@ -1210,6 +1331,8 @@ static int smb2_lease_break_noti(struct oplock_info *opinfo, bool sync,
 		br_info->epoch = 0;
 	}
 	memcpy(br_info->lease_key, lease->lease_key, SMB2_LEASE_KEY_SIZE);
+	lease_get(lease);
+	br_info->lease = lease;
 
 	work->request_buf = (char *)br_info;
 	/* Transfer the reference acquired by smb2_lease_break_conn_get(). */
@@ -1222,7 +1345,8 @@ static int smb2_lease_break_noti(struct oplock_info *opinfo, bool sync,
 			__smb2_lease_break_noti(&work->work);
 		} else {
 			INIT_WORK(&work->work, __smb2_lease_break_noti);
-			ksmbd_queue_work(work);
+			if (!ksmbd_queue_work(work))
+				__smb2_lease_break_noti(&work->work);
 		}
 	} else {
 		__smb2_lease_break_noti(&work->work);
@@ -1442,6 +1566,9 @@ void destroy_lease_table(struct ksmbd_conn *conn)
 	struct lease_table *lb, *lbtmp;
 	struct lease *lease, *ltmp;
 
+	if (!conn)
+		cancel_delayed_work_sync(&lease_break_timer_work);
+
 	write_lock(&lease_list_lock);
 	if (list_empty(&lease_table_list)) {
 		write_unlock(&lease_list_lock);
@@ -1452,8 +1579,13 @@ void destroy_lease_table(struct ksmbd_conn *conn)
 		if (conn && memcmp(lb->client_guid, conn->ClientGUID,
 				   SMB2_CLIENT_GUID_SIZE))
 			continue;
-		list_for_each_entry_safe(lease, ltmp, &lb->lease_list, l_entry)
+		list_for_each_entry_safe(lease, ltmp, &lb->lease_list, l_entry) {
+			spin_lock(&lease->lock);
+			if (lease->breaking)
+				lease_break_to_none_locked(lease);
+			spin_unlock(&lease->lock);
 			lease_del_table(lease);
+		}
 		list_del(&lb->l_entry);
 		free_lease_table(lb);
 	}
@@ -2494,11 +2626,13 @@ found:
 	list_for_each_entry(lease, &lt->lease_list, l_entry) {
 		if (memcmp(lease->lease_key, lease_key, SMB2_LEASE_KEY_SIZE))
 			continue;
-		if (!(lease->state & (SMB2_LEASE_HANDLE_CACHING_LE |
-				      SMB2_LEASE_WRITE_CACHING_LE)))
-			break;
-
 		spin_lock(&lease->lock);
+		if (!(lease->state & (SMB2_LEASE_HANDLE_CACHING_LE |
+				      SMB2_LEASE_WRITE_CACHING_LE))) {
+			spin_unlock(&lease->lock);
+			break;
+		}
+
 		list_for_each_entry(opinfo, &lease->open_list, lease_entry) {
 			if (!opinfo->op_state ||
 			    opinfo->op_state == OPLOCK_CLOSING)
@@ -2506,6 +2640,7 @@ found:
 			if (!atomic_inc_not_zero(&opinfo->refcount))
 				continue;
 			ret_op = opinfo;
+			break;
 		}
 		spin_unlock(&lease->lock);
 		if (ret_op) {

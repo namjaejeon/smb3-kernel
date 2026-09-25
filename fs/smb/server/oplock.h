@@ -51,6 +51,9 @@ struct lease {
 	unsigned short		epoch;
 	bool			is_dir;
 	bool			reuse_epoch;
+	bool			breaking;
+	bool			break_timeout_set;
+	unsigned long		break_timeout;
 	struct ksmbd_inode	*ci;
 	struct lease_table	*l_lb;
 	struct list_head	l_entry;
@@ -90,6 +93,7 @@ struct lease_break_info {
 	__le32			new_state;
 	__le16			epoch;
 	char			lease_key[SMB2_LEASE_KEY_SIZE];
+	struct lease		*lease;
 };
 
 struct oplock_break_info {
