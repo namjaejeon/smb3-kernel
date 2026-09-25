@@ -556,6 +556,7 @@ void close_id_del_oplock(struct ksmbd_file *fp)
 	 * takes the same lock before it acquires pending_break or sets ACK_WAIT.
 	 */
 	opinfo->op_state = OPLOCK_CLOSING;
+	opinfo->oplock_timeout_set = false;
 	clear_bit_unlock(0, &opinfo->pending_break);
 	spin_unlock(&opinfo->state_lock);
 	wake_up_interruptible_all(&opinfo->oplock_q);
@@ -737,6 +738,17 @@ static struct oplock_info *same_client_has_lease(struct ksmbd_inode *ci,
 static bool wait_for_break_ack(struct oplock_info *opinfo)
 {
 	int rc = 0;
+	bool timed_out;
+
+	if (!opinfo->is_lease) {
+		wait_event(opinfo->oplock_q,
+			   opinfo->op_state == OPLOCK_STATE_NONE ||
+			   opinfo->op_state == OPLOCK_CLOSING);
+		spin_lock(&opinfo->state_lock);
+		timed_out = opinfo->oplock_timed_out;
+		spin_unlock(&opinfo->state_lock);
+		return timed_out;
+	}
 
 	rc = wait_event_interruptible_timeout(opinfo->oplock_q,
 					      opinfo->op_state == OPLOCK_STATE_NONE ||
@@ -778,6 +790,8 @@ static bool oplock_break_set_ack_wait(struct oplock_info *opinfo)
 	spin_lock(&opinfo->state_lock);
 	if (opinfo->op_state != OPLOCK_CLOSING) {
 		opinfo->op_state = OPLOCK_ACK_WAIT;
+		opinfo->oplock_timeout_set = false;
+		opinfo->oplock_timed_out = false;
 		ret = true;
 	}
 	spin_unlock(&opinfo->state_lock);
@@ -850,6 +864,23 @@ static bool lease_break_needed(struct oplock_info *opinfo, int req_op_level,
 	return opinfo->level > req_op_level;
 }
 
+static void oplock_break_send_failed(struct oplock_info *opinfo)
+{
+	bool wake = false;
+
+	spin_lock(&opinfo->state_lock);
+	if (opinfo->op_state == OPLOCK_ACK_WAIT) {
+		opinfo->level = SMB2_OPLOCK_LEVEL_NONE;
+		opinfo->op_state = OPLOCK_STATE_NONE;
+		opinfo->oplock_timeout_set = false;
+		opinfo->oplock_timed_out = true;
+		wake = true;
+	}
+	spin_unlock(&opinfo->state_lock);
+	if (wake)
+		wake_up_interruptible_all(&opinfo->oplock_q);
+}
+
 /**
  * __smb2_oplock_break_noti() - send smb2 oplock break cmd from conn
  * to client
@@ -868,15 +899,23 @@ static void __smb2_oplock_break_noti(struct work_struct *wk)
 	struct oplock_break_info *br_info = work->request_buf;
 	struct smb2_hdr *rsp_hdr;
 	struct ksmbd_file *fp;
+	struct oplock_info *opinfo;
+	unsigned long timeout = 0;
+	bool start_timer = false;
 
 	fp = ksmbd_lookup_global_fd(br_info->fid);
 	if (!fp)
 		goto out;
+	opinfo = opinfo_get(fp);
+	if (!opinfo) {
+		ksmbd_fd_put(work, fp);
+		goto out;
+	}
 
 	if (allocate_interim_rsp_buf(work)) {
 		pr_err("smb2_allocate_rsp_buf failed! ");
 		ksmbd_fd_put(work, fp);
-		goto out;
+		goto send_failed;
 	}
 
 	rsp_hdr = smb_get_msg(work->response_buf);
@@ -910,13 +949,32 @@ static void __smb2_oplock_break_noti(struct work_struct *wk)
 	ksmbd_fd_put(work, fp);
 	if (ksmbd_iov_pin_rsp(work, (void *)rsp,
 			      sizeof(struct smb2_oplock_break)))
-		goto out;
+		goto send_failed;
 
 	ksmbd_debug(OPLOCK,
 		    "sending oplock break v_id %llu p_id = %llu lock level = %d\n",
 		    rsp->VolatileFid, rsp->PersistentFid, rsp->OplockLevel);
 
-	ksmbd_conn_write(work);
+	if (ksmbd_conn_write(work))
+		goto send_failed;
+
+	spin_lock(&opinfo->state_lock);
+	if (opinfo->op_state == OPLOCK_ACK_WAIT) {
+		timeout = jiffies + OPLOCK_WAIT_TIME;
+		opinfo->oplock_timeout = timeout;
+		opinfo->oplock_timeout_set = true;
+		start_timer = true;
+	}
+	spin_unlock(&opinfo->state_lock);
+	if (start_timer)
+		ksmbd_schedule_oplock_break_timer(timeout);
+
+	opinfo_put(opinfo);
+	goto out;
+
+send_failed:
+	oplock_break_send_failed(opinfo);
+	opinfo_put(opinfo);
 
 out:
 	ksmbd_free_work_struct(work);

@@ -11886,6 +11886,7 @@ static void smb20_oplock_break_ack(struct ksmbd_work *work)
 		return;
 	}
 
+	spin_lock(&opinfo->state_lock);
 	if (opinfo->op_state != OPLOCK_ACK_WAIT) {
 		ksmbd_debug(SMB, "unexpected oplock state 0x%x\n",
 			    opinfo->op_state);
@@ -11897,6 +11898,7 @@ static void smb20_oplock_break_ack(struct ksmbd_work *work)
 			rsp->Reserved2 = 0;
 			rsp->VolatileFid = volatile_id;
 			rsp->PersistentFid = persistent_id;
+			spin_unlock(&opinfo->state_lock);
 			ret = ksmbd_iov_pin_rsp(work, rsp,
 						 sizeof(struct smb2_oplock_break));
 			if (ret)
@@ -11909,7 +11911,8 @@ static void smb20_oplock_break_ack(struct ksmbd_work *work)
 			status = STATUS_INVALID_OPLOCK_PROTOCOL;
 		else
 			status = STATUS_INVALID_DEVICE_STATE;
-		goto err_out;
+		spin_unlock(&opinfo->state_lock);
+		goto err_no_state_change;
 	}
 
 	if (req_oplevel == SMB2_OPLOCK_LEVEL_LEASE) {
@@ -11953,6 +11956,10 @@ static void smb20_oplock_break_ack(struct ksmbd_work *work)
 		rsp_oplevel = req_oplevel;
 
 	opinfo->level = rsp_oplevel;
+	opinfo->op_state = OPLOCK_STATE_NONE;
+	opinfo->oplock_timeout_set = false;
+	spin_unlock(&opinfo->state_lock);
+	wake_up_interruptible_all(&opinfo->oplock_q);
 
 	rsp->StructureSize = cpu_to_le16(24);
 	rsp->OplockLevel = rsp_oplevel;
@@ -11964,18 +11971,17 @@ static void smb20_oplock_break_ack(struct ksmbd_work *work)
 	if (ret)
 		ksmbd_debug(SMB, "failed to pin oplock break response: %d\n",
 			    ret);
-	goto out;
+	goto out_no_state_change;
 
 err_out:
-	rsp->hdr.Status = status;
-	smb2_set_err_rsp(work);
-
-out:
-	spin_lock(&opinfo->state_lock);
 	if (opinfo->op_state != OPLOCK_CLOSING)
 		opinfo->op_state = OPLOCK_STATE_NONE;
+	opinfo->oplock_timeout_set = false;
 	spin_unlock(&opinfo->state_lock);
 	wake_up_interruptible_all(&opinfo->oplock_q);
+err_no_state_change:
+	rsp->hdr.Status = status;
+	smb2_set_err_rsp(work);
 out_no_state_change:
 	opinfo_put(opinfo);
 	ksmbd_fd_put(work, fp);
