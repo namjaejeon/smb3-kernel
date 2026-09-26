@@ -225,6 +225,32 @@ struct file_sparse {
 #define FILE_NETWORK_OPEN_INFORMATION_SIZE    56
 #define FILE_ATTRIBUTE_TAG_INFORMATION_SIZE   8
 
+struct smb2_query_quota_info {
+	u8 ReturnSingle;
+	u8 RestartScan;
+	__le16 Reserved;
+	__le32 SidListLength;
+	__le32 StartSidLength;
+	__le32 StartSidOffset;
+	u8 SidBuffer[];
+} __packed;
+
+struct smb2_get_quota_info {
+	__le32 NextEntryOffset;
+	__le32 SidLength;
+	u8 Sid[];
+} __packed;
+
+struct smb2_file_quota_info {
+	__le32 NextEntryOffset;
+	__le32 SidLength;
+	__le64 ChangeTime;
+	__le64 QuotaUsed;
+	__le64 QuotaThreshold;
+	__le64 QuotaLimit;
+	u8 Sid[];
+} __packed;
+
 /* FS Info response  size */
 #define FS_DEVICE_INFORMATION_SIZE     8
 #define FS_ATTRIBUTE_INFORMATION_SIZE  16
