@@ -4663,6 +4663,9 @@ int smb2_open(struct ksmbd_work *work)
 					    &may_flags,
 					    req->CreateOptions,
 					    file_present ? d_inode(path.dentry)->i_mode : 0);
+	if (posix_ctxt && (req->DesiredAccess & FILE_APPEND_DATA_LE) &&
+	    !(req->DesiredAccess & FILE_WRITE_DATA_LE))
+		open_flags |= O_APPEND;
 
 	if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
 		if (open_flags & (O_CREAT | O_TRUNC)) {
@@ -4902,6 +4905,7 @@ int smb2_open(struct ksmbd_work *work)
 			FILE_WRITE_ATTRIBUTES_LE | FILE_SYNCHRONIZE_LE));
 
 	fp->is_posix_ctxt = posix_ctxt;
+	fp->posix_append = posix_ctxt && !!(open_flags & O_APPEND);
 
 	/* fp should be searchable through ksmbd_inode.m_fp_list
 	 * after daccess, saccess, attrib_only, and stream are
@@ -9911,6 +9915,7 @@ int smb2_write(struct ksmbd_work *work)
 	ssize_t nbytes;
 	char *data_buf;
 	bool writethrough = false, is_rdma_channel = false;
+	bool append_write;
 	bool async_interim = false;
 	bool chseq_err = false;
 	int err = 0;
@@ -9942,7 +9947,8 @@ int smb2_write(struct ksmbd_work *work)
 		return smb2_write_pipe(work);
 	}
 
-	offset = le64_to_cpu(req->Offset);
+	append_write = le64_to_cpu(req->Offset) == U64_MAX;
+	offset = append_write ? 0 : le64_to_cpu(req->Offset);
 	if (offset < 0) {
 		err = -EINVAL;
 		goto out;
@@ -10045,9 +10051,14 @@ int smb2_write(struct ksmbd_work *work)
 		goto out;
 	}
 
-	if (!(fp->daccess & (FILE_WRITE_DATA_LE | FILE_READ_ATTRIBUTES_LE))) {
+	if (!(fp->daccess & (FILE_WRITE_DATA_LE | FILE_APPEND_DATA_LE |
+			      FILE_READ_ATTRIBUTES_LE))) {
 		pr_err("Not permitted to write : 0x%x\n", fp->daccess);
 		err = -EACCES;
+		goto out;
+	}
+	if (append_write != fp->posix_append) {
+		err = -EINVAL;
 		goto out;
 	}
 

@@ -361,7 +361,7 @@ int ksmbd_vfs_read(struct ksmbd_work *work, struct ksmbd_file *fp, size_t count,
 	if (ksmbd_stream_fd(fp))
 		return ksmbd_vfs_stream_read(fp, rbuf, pos, count);
 
-	if (!work->tcon->posix_extensions) {
+	if (!fp->is_posix_ctxt) {
 		int ret;
 
 		ret = check_lock_range(filp, *pos, *pos + count - 1, READ);
@@ -469,7 +469,6 @@ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
 		    ssize_t *written)
 {
 	struct file *filp;
-	loff_t	offset = *pos;
 	int err = 0;
 
 	if (work->conn->connection_type) {
@@ -491,7 +490,7 @@ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
 		goto out;
 	}
 
-	if (!work->tcon->posix_extensions) {
+	if (!fp->is_posix_ctxt) {
 		err = check_lock_range(filp, *pos, *pos + count - 1, WRITE);
 		if (err) {
 			pr_err("unable to write due to lock\n");
@@ -516,7 +515,7 @@ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
 	*written = err;
 	err = 0;
 	if (sync) {
-		err = vfs_fsync_range(filp, offset, offset + *written, 0);
+		err = vfs_fsync_range(filp, *pos - *written, *pos, 0);
 		if (err < 0)
 			pr_err("fsync failed for filename = %pD, err = %d\n",
 			       fp->filp, err);
