@@ -3667,7 +3667,8 @@ static int smb2_create_sd_buffer(struct ksmbd_work *work,
 	    sizeof(struct create_sd_buf_req))
 		return -EINVAL;
 	return set_info_sec(work->conn, work->tcon, path, &sd_buf->ntsd,
-			    le32_to_cpu(sd_buf->ccontext.DataLength), true, false);
+			    le32_to_cpu(sd_buf->ccontext.DataLength), true, false,
+			    true, true);
 }
 
 static int ksmbd_acls_fattr(struct smb_fattr *fattr,
@@ -9241,7 +9242,9 @@ static int smb2_set_info_sec(struct ksmbd_file *fp, int addition_info,
 		return -EACCES;
 
 	return set_info_sec(fp->conn, fp->tcon, &fp->filp->f_path, pntsd,
-			buf_len, false, true);
+			buf_len, false, true,
+			fp->conn->dialect == SMB311_PROT_ID && fp->is_posix_ctxt,
+			addition_info & DACL_SECINFO);
 }
 
 static int smb2_set_info_quota(struct ksmbd_work *work, struct ksmbd_file *fp,
