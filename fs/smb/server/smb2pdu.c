@@ -1432,23 +1432,7 @@ static void build_posix_ctxt(struct smb2_posix_neg_context *pneg_ctxt)
 {
 	pneg_ctxt->ContextType = SMB2_POSIX_EXTENSIONS_AVAILABLE;
 	pneg_ctxt->DataLength = cpu_to_le16(POSIX_CTXT_DATA_LEN);
-	/* SMB2_CREATE_TAG_POSIX is "0x93AD25509CB411E7B42383DE968BCD7C" */
-	pneg_ctxt->Name[0] = 0x93;
-	pneg_ctxt->Name[1] = 0xAD;
-	pneg_ctxt->Name[2] = 0x25;
-	pneg_ctxt->Name[3] = 0x50;
-	pneg_ctxt->Name[4] = 0x9C;
-	pneg_ctxt->Name[5] = 0xB4;
-	pneg_ctxt->Name[6] = 0x11;
-	pneg_ctxt->Name[7] = 0xE7;
-	pneg_ctxt->Name[8] = 0xB4;
-	pneg_ctxt->Name[9] = 0x23;
-	pneg_ctxt->Name[10] = 0x83;
-	pneg_ctxt->Name[11] = 0xDE;
-	pneg_ctxt->Name[12] = 0x96;
-	pneg_ctxt->Name[13] = 0x8B;
-	pneg_ctxt->Name[14] = 0xCD;
-	pneg_ctxt->Name[15] = 0x7C;
+	memcpy(pneg_ctxt->Name, SMB2_CREATE_TAG_POSIX, POSIX_CTXT_DATA_LEN);
 }
 
 static unsigned int assemble_neg_contexts(struct ksmbd_conn *conn,
@@ -1754,6 +1738,7 @@ static __le32 deassemble_neg_contexts(struct ksmbd_conn *conn,
 	unsigned int neg_ctxt_cnt = le16_to_cpu(req->NegotiateContextCount);
 	__le32 status = STATUS_INVALID_PARAMETER;
 	int compress_ctxt_cnt = 0, rdma_transform_ctxt_cnt = 0;
+	bool posix_ctxt_seen = false;
 
 	ksmbd_debug(SMB, "decoding %d negotiate contexts\n", neg_ctxt_cnt);
 	if (len_of_smb <= offset) {
@@ -1826,7 +1811,14 @@ static __le32 deassemble_neg_contexts(struct ksmbd_conn *conn,
 		} else if (pctx->ContextType == SMB2_POSIX_EXTENSIONS_AVAILABLE) {
 			ksmbd_debug(SMB,
 				    "deassemble SMB2_POSIX_EXTENSIONS_AVAILABLE context\n");
-			conn->posix_ext_supported = true;
+			if (posix_ctxt_seen || clen != POSIX_CTXT_DATA_LEN) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			posix_ctxt_seen = true;
+			if (!memcmp((char *)pctx + sizeof(*pctx),
+				    SMB2_CREATE_TAG_POSIX, POSIX_CTXT_DATA_LEN))
+				conn->posix_ext_supported = true;
 		} else if (pctx->ContextType == SMB2_SIGNING_CAPABILITIES) {
 			ksmbd_debug(SMB,
 				    "deassemble SMB2_SIGNING_CAPABILITIES context\n");
@@ -4212,12 +4204,7 @@ int smb2_open(struct ksmbd_work *work)
 		return -EINVAL;
 	}
 
-	if (test_share_config_flag(share, KSMBD_SHARE_FLAG_PIPE)) {
-		ksmbd_debug(SMB, "IPC pipe create request\n");
-		return create_smb2_pipe(work);
-	}
-
-	if (req->CreateContextsOffset && tcon->posix_extensions) {
+	if (req->CreateContextsOffset) {
 		context = smb2_find_context_vals(req, SMB2_CREATE_TAG_POSIX, 16);
 		if (IS_ERR(context)) {
 			rc = PTR_ERR(context);
@@ -4225,6 +4212,19 @@ int smb2_open(struct ksmbd_work *work)
 		} else if (context) {
 			struct create_posix *posix = (struct create_posix *)context;
 
+			if (conn->dialect != SMB311_PROT_ID) {
+				rsp->hdr.Status = STATUS_INVALID_INFO_CLASS;
+				rc = -ENOTTY;
+				goto err_out2;
+			}
+			if (!tcon->posix_extensions) {
+				rc = -EOPNOTSUPP;
+				goto err_out2;
+			}
+			if (test_share_config_flag(share, KSMBD_SHARE_FLAG_PIPE)) {
+				rc = -EOPNOTSUPP;
+				goto err_out2;
+			}
 			if (le16_to_cpu(context->DataOffset) +
 				le32_to_cpu(context->DataLength) <
 			    sizeof(struct create_posix) - 4) {
@@ -4236,6 +4236,10 @@ int smb2_open(struct ksmbd_work *work)
 			posix_mode = le32_to_cpu(posix->Mode);
 			posix_ctxt = true;
 		}
+	}
+	if (test_share_config_flag(share, KSMBD_SHARE_FLAG_PIPE)) {
+		ksmbd_debug(SMB, "IPC pipe create request\n");
+		return create_smb2_pipe(work);
 	}
 
 	if (req->NameLength) {
