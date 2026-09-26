@@ -149,6 +149,8 @@ struct ksmbd_file {
 	/* if ls is happening on directory, below is valid*/
 	struct ksmbd_readdir_data	readdir_data;
 	struct mutex			readdir_lock;
+	struct mutex			quota_lock;
+	u32				current_quota_id;
 	int				dot_dotdot[2];
 	unsigned int			f_state;
 	bool				reserve_lease_break;
