@@ -1295,7 +1295,7 @@ void smb2_send_interim_resp(struct ksmbd_work *work, __le32 status)
 	ksmbd_free_work_struct(in_work);
 }
 
-static __le32 smb2_get_reparse_tag_special_file(umode_t mode)
+__le32 smb2_get_reparse_tag_special_file(umode_t mode)
 {
 	if (S_ISDIR(mode) || S_ISREG(mode))
 		return 0;
@@ -5769,6 +5769,7 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 
 		posix_info = (struct smb2_posix_info *)kstat;
 		posix_info->Ignored = 0;
+		posix_info->Zero = 0;
 		posix_info->CreationTime = cpu_to_le64(ksmbd_kstat->create_time);
 		time = ksmbd_UnixTimeToNT(ksmbd_kstat->kstat->ctime);
 		posix_info->ChangeTime = cpu_to_le64(time);
@@ -5778,9 +5779,11 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		posix_info->LastWriteTime = cpu_to_le64(time);
 		posix_info->EndOfFile = cpu_to_le64(ksmbd_kstat->kstat->size);
 		posix_info->AllocationSize = cpu_to_le64(ksmbd_kstat->kstat->blocks << 9);
-		posix_info->DeviceId = cpu_to_le32(ksmbd_kstat->kstat->rdev);
+		posix_info->DeviceId = cpu_to_le32(ksmbd_kstat->kstat->dev);
 		posix_info->HardLinks = cpu_to_le32(ksmbd_kstat->kstat->nlink);
-		posix_info->Mode = cpu_to_le32(ksmbd_kstat->kstat->mode & 0777);
+		posix_info->ReparseTag =
+			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
+		posix_info->Mode = cpu_to_le32(ksmbd_kstat->kstat->mode & 07777);
 		switch (ksmbd_kstat->kstat->mode & S_IFMT) {
 		case S_IFDIR:
 			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_DIR << POSIX_FILETYPE_SHIFT);
@@ -5805,6 +5808,8 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		posix_info->DosAttributes =
 			S_ISDIR(ksmbd_kstat->kstat->mode) ?
 				FILE_ATTRIBUTE_DIRECTORY_LE : FILE_ATTRIBUTE_ARCHIVE_LE;
+		if (posix_info->ReparseTag)
+			posix_info->DosAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		if (d_info->hide_dot_file && d_info->name[0] == '.')
 			posix_info->DosAttributes |= FILE_ATTRIBUTE_HIDDEN_LE;
 		/*
@@ -6152,6 +6157,12 @@ int smb2_query_dir(struct ksmbd_work *work)
 	dir_fp = ksmbd_lookup_fd_slow(work, id, pid);
 	if (!dir_fp) {
 		rc = -EBADF;
+		goto err_out2;
+	}
+	if (req->FileInformationClass == SMB_FIND_FILE_POSIX_INFO &&
+	    (conn->dialect != SMB311_PROT_ID ||
+	     !work->tcon->posix_extensions || !dir_fp->is_posix_ctxt)) {
+		rc = -EFAULT;
 		goto err_out2;
 	}
 
@@ -7147,8 +7158,10 @@ static int get_file_attribute_tag_info(struct smb2_query_info_rsp *rsp,
 	return 0;
 }
 
-static int find_file_posix_info(struct smb2_query_info_rsp *rsp,
-				struct ksmbd_file *fp, void *rsp_org)
+static int find_file_posix_info(struct ksmbd_work *work,
+				struct smb2_query_info_req *req,
+				struct smb2_query_info_rsp *rsp,
+				struct ksmbd_file *fp)
 {
 	struct smb311_posix_qinfo *file_info;
 	struct inode *inode = file_inode(fp->filp);
@@ -7156,9 +7169,13 @@ static int find_file_posix_info(struct smb2_query_info_rsp *rsp,
 	vfsuid_t vfsuid = i_uid_into_vfsuid(idmap, inode);
 	vfsgid_t vfsgid = i_gid_into_vfsgid(idmap, inode);
 	struct kstat stat;
+	char *filename;
+	__le16 *utf16_name;
+	__le32 *filename_len;
+	size_t name_bytes;
 	u64 time;
-	int out_buf_len = sizeof(struct smb311_posix_qinfo) + 32;
-	int ret;
+	int fixed_len = sizeof(struct smb311_posix_qinfo) + 32 + sizeof(__le32);
+	int max_len, conv_len, ret;
 
 	if (!(fp->daccess & FILE_READ_ATTRIBUTES_LE)) {
 		pr_err("no right to read the attributes : 0x%x\n",
@@ -7169,6 +7186,38 @@ static int find_file_posix_info(struct smb2_query_info_rsp *rsp,
 	ret = get_file_allocation_stat(fp, &stat);
 	if (ret)
 		return ret;
+	max_len = smb2_calc_max_out_buf_len(work,
+			offsetof(struct smb2_query_info_rsp, Buffer),
+			le32_to_cpu(req->OutputBufferLength));
+	if (max_len < fixed_len) {
+		rsp->hdr.Status = STATUS_INFO_LENGTH_MISMATCH;
+		return -EINVAL;
+	}
+	filename = convert_to_nt_pathname(work->tcon->share_conf,
+					   &fp->filp->f_path);
+	if (IS_ERR(filename))
+		return PTR_ERR(filename);
+	if (filename[0] == '\\')
+		memmove(filename, filename + 1, strlen(filename));
+	name_bytes = strlen(filename);
+	utf16_name = kmalloc_array(name_bytes + 1, sizeof(*utf16_name),
+				    KSMBD_DEFAULT_GFP);
+	if (!utf16_name) {
+		kfree(filename);
+		return -ENOMEM;
+	}
+	conv_len = smbConvertToUTF16(utf16_name, filename, name_bytes,
+				      work->conn->local_nls, 0);
+	kfree(filename);
+	if (conv_len < 0) {
+		kfree(utf16_name);
+		return conv_len;
+	}
+	if (conv_len > (max_len - fixed_len) / sizeof(*utf16_name)) {
+		kfree(utf16_name);
+		rsp->hdr.Status = STATUS_INFO_LENGTH_MISMATCH;
+		return -EINVAL;
+	}
 
 	file_info = (struct smb311_posix_qinfo *)rsp->Buffer;
 	file_info->CreationTime = cpu_to_le64(fp->create_time);
@@ -7189,7 +7238,7 @@ static int find_file_posix_info(struct smb2_query_info_rsp *rsp,
 		file_info->AllocationSize = cpu_to_le64((u64)seof);
 	}
 	file_info->HardLinks = cpu_to_le32(stat.nlink);
-	file_info->Mode = cpu_to_le32(stat.mode & 0777);
+	file_info->Mode = cpu_to_le32(stat.mode & 07777);
 	switch (stat.mode & S_IFMT) {
 	case S_IFDIR:
 		file_info->Mode |= cpu_to_le32(POSIX_TYPE_DIR << POSIX_FILETYPE_SHIFT);
@@ -7210,7 +7259,11 @@ static int find_file_posix_info(struct smb2_query_info_rsp *rsp,
 		file_info->Mode |= cpu_to_le32(POSIX_TYPE_SOCKET << POSIX_FILETYPE_SHIFT);
 	}
 
-	file_info->DeviceId = cpu_to_le32(stat.rdev);
+	file_info->DeviceId = cpu_to_le32(stat.dev);
+	file_info->Zero = 0;
+	file_info->ReparseTag = smb2_get_reparse_tag_special_file(stat.mode);
+	if (file_info->ReparseTag)
+		file_info->DosAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 
 	/*
 	 * Sids(32) contain two sids(Domain sid(16), UNIX group sid(16)).
@@ -7221,8 +7274,14 @@ static int find_file_posix_info(struct smb2_query_info_rsp *rsp,
 		  SIDUNIX_USER, (struct smb_sid *)&file_info->Sids[0]);
 	id_to_sid(from_kgid_munged(&init_user_ns, vfsgid_into_kgid(vfsgid)),
 		  SIDUNIX_GROUP, (struct smb_sid *)&file_info->Sids[16]);
+	filename_len = (__le32 *)&file_info->Sids[32];
+	memcpy(&file_info->Sids[36], utf16_name,
+	       conv_len * sizeof(*utf16_name));
+	kfree(utf16_name);
+	*filename_len = cpu_to_le32(conv_len * sizeof(__le16));
 
-	rsp->OutputBufferLength = cpu_to_le32(out_buf_len);
+	rsp->OutputBufferLength = cpu_to_le32(fixed_len +
+					       conv_len * sizeof(__le16));
 
 	return 0;
 }
@@ -7328,11 +7387,12 @@ static int smb2_get_info_file(struct ksmbd_work *work,
 		rc = get_file_attribute_tag_info(rsp, fp, work->response_buf);
 		break;
 	case SMB_FIND_FILE_POSIX_INFO:
-		if (!work->tcon->posix_extensions) {
-			pr_err("client doesn't negotiate with SMB3.1.1 POSIX Extensions\n");
+		if (work->conn->dialect != SMB311_PROT_ID ||
+		    !work->tcon->posix_extensions || !fp->is_posix_ctxt) {
+			rsp->hdr.Status = STATUS_INVALID_INFO_CLASS;
 			rc = -EOPNOTSUPP;
 		} else {
-			rc = find_file_posix_info(rsp, fp, work->response_buf);
+			rc = find_file_posix_info(work, req, rsp, fp);
 		}
 		break;
 	default:
@@ -7376,20 +7436,47 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
 {
 	struct ksmbd_conn *conn = work->conn;
 	struct ksmbd_share_config *share = work->tcon->share_conf;
+	struct ksmbd_file *fp;
 	int fsinfoclass = 0;
 	struct kstatfs stfs;
 	struct path path;
 	int rc = 0, len;
 	unsigned int fixed_len = 0;
+	u64 id, pid;
 
-	if (!share->path)
-		return -EIO;
+	if (req->FileInfoClass == FS_POSIX_INFORMATION) {
+		if (conn->dialect != SMB311_PROT_ID ||
+		    !work->tcon->posix_extensions) {
+			rsp->hdr.Status = STATUS_INVALID_INFO_CLASS;
+			return -EOPNOTSUPP;
+		}
+		id = req->VolatileFileId;
+		pid = req->PersistentFileId;
+		if (work->next_smb2_rcv_hdr_off && !has_file_id(id)) {
+			id = work->compound_fid;
+			pid = work->compound_pfid;
+		}
+		fp = ksmbd_lookup_fd_slow(work, id, pid);
+		if (!fp)
+			return -ENOENT;
+		if (!fp->is_posix_ctxt) {
+			ksmbd_fd_put(work, fp);
+			rsp->hdr.Status = STATUS_INVALID_INFO_CLASS;
+			return -EOPNOTSUPP;
+		}
+		path = fp->filp->f_path;
+		path_get(&path);
+		ksmbd_fd_put(work, fp);
+	} else {
+		if (!share->path)
+			return -EIO;
 
-	scoped_with_init_fs()
-		rc = kern_path(share->path, LOOKUP_NO_SYMLINKS, &path);
-	if (rc) {
-		pr_err("cannot create vfs path\n");
-		return -EIO;
+		scoped_with_init_fs()
+			rc = kern_path(share->path, LOOKUP_NO_SYMLINKS, &path);
+		if (rc) {
+			pr_err("cannot create vfs path\n");
+			return -EIO;
+		}
 	}
 
 	rc = vfs_statfs(&path, &stfs);
@@ -7602,25 +7689,19 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
 	{
 		FILE_SYSTEM_POSIX_INFO *info;
 
-		if (!work->tcon->posix_extensions) {
-			pr_err("client doesn't negotiate with SMB3.1.1 POSIX Extensions\n");
-			path_put(&path);
-			return -EOPNOTSUPP;
-		} else {
-			info = (FILE_SYSTEM_POSIX_INFO *)(rsp->Buffer);
-			info->OptimalTransferSize = cpu_to_le32(stfs.f_bsize);
-			info->BlockSize = cpu_to_le32(stfs.f_bsize);
-			info->TotalBlocks = cpu_to_le64(stfs.f_blocks);
-			info->BlocksAvail = cpu_to_le64(stfs.f_bfree);
-			info->UserBlocksAvail = cpu_to_le64(stfs.f_bavail);
-			info->TotalFileNodes = cpu_to_le64(stfs.f_files);
-			info->FreeFileNodes = cpu_to_le64(stfs.f_ffree);
-			info->FileSysIdentifier =
-				cpu_to_le64((u64)(u32)stfs.f_fsid.val[1] << 32 |
-					    (u32)stfs.f_fsid.val[0]);
-			rsp->OutputBufferLength = cpu_to_le32(56);
-			fixed_len = 56;
-		}
+		info = (FILE_SYSTEM_POSIX_INFO *)(rsp->Buffer);
+		info->OptimalTransferSize = cpu_to_le32(stfs.f_bsize);
+		info->BlockSize = cpu_to_le32(stfs.f_frsize ?: stfs.f_bsize);
+		info->TotalBlocks = cpu_to_le64(stfs.f_blocks);
+		info->BlocksAvail = cpu_to_le64(stfs.f_bfree);
+		info->UserBlocksAvail = cpu_to_le64(stfs.f_bavail);
+		info->TotalFileNodes = cpu_to_le64(stfs.f_files);
+		info->FreeFileNodes = cpu_to_le64(stfs.f_ffree);
+		info->FileSysIdentifier =
+			cpu_to_le64((u64)(u32)stfs.f_fsid.val[1] << 32 |
+				    (u32)stfs.f_fsid.val[0]);
+		rsp->OutputBufferLength = cpu_to_le32(sizeof(*info));
+		fixed_len = sizeof(*info);
 		break;
 	}
 	default:
