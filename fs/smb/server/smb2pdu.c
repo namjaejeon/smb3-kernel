@@ -4679,7 +4679,7 @@ int smb2_open(struct ksmbd_work *work)
 	/*create file if not present */
 	if (!file_present) {
 		rc = smb2_creat(work, &path, name, open_flags,
-				posix_mode,
+				posix_ctxt ? posix_mode : (umode_t)-1,
 				req->CreateOptions & FILE_DIRECTORY_FILE_LE);
 		if (rc) {
 			if (rc == -ENOENT) {
