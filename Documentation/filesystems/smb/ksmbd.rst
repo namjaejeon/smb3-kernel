@@ -104,6 +104,8 @@ Persistent handle              Under development.
 Resilient handle               Planned for future.
 SMB2 notify                    Under development.
 Sparse file support            Supported.
+SMB2 user quotas               Supported through ksmbd.mountd for native user
+                               quotas and configured Btrfs qgroups.
 DCE/RPC support                Partially Supported. a few calls(NetShareEnumAll,
                                NetServerGetInfo, SAMR, LSARPC) that are needed
                                for file server handled via netlink interface
@@ -163,6 +165,42 @@ How to run
 	$ sudo ksmbd.mountd
 
 6. Access share from Windows or Linux using SMB3 client (cifs.ko or smbclient of samba)
+
+SMB2 user quotas
+================
+
+SMB2 quota queries and updates are handled by ksmbd.mountd through netlink.
+Use kernel and ksmbd-tools versions that both support the quota IPC interface.
+Older daemons do not provide quota operations.
+
+For filesystems with native user quotas, ksmbd.mountd uses quotactl_fd().
+Configure user quota accounting and enforcement locally before accessing
+quotas through SMB. This includes enabling the filesystem's quota support
+and CONFIG_QUOTACTL; CONFIG_QUOTA is not required for the Btrfs backend.
+The daemon must have permission to administer quotas and see the same paths
+and mounts as ksmbd.
+
+Btrfs uses a share-specific mapping from Linux UIDs to existing qgroups::
+
+    [QuotaHomes]
+        path = /srv/storage/homes
+        read only = no
+        btrfs quota map = 1000:0/256 1001:0/257
+
+Replace the example IDs with the users' UIDs and qgroups on the share's
+Btrfs filesystem. Enable Btrfs quotas and create the subvolumes and qgroups
+locally. The mapping does not move files or change their ownership.
+Btrfs exposes referenced-space usage and a hard limit; its SMB warning
+threshold must be -1. An unlimited hard limit is -1.
+
+Authenticated users can query their own quota. Enumerating quotas and setting
+limits require an SMB session mapped to Linux UID 0; updates also require a
+writable tree connection. SMB operations do not enable quota accounting or
+set filesystem-wide default limits.
+
+See the `ksmbd-tools quota usage guide
+<https://github.com/cifsd-team/ksmbd-tools/blob/master/README.md#smb-user-quotas>`_
+for filesystem preparation and smbcquotas examples.
 
 Shutdown KSMBD
 ==============

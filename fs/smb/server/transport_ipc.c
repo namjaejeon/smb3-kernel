@@ -14,6 +14,8 @@
 #include <linux/socket.h>
 #include <linux/workqueue.h>
 #include <linux/overflow.h>
+#include <linux/statfs.h>
+#include <linux/kdev_t.h>
 
 #include "vfs_cache.h"
 #include "transport_ipc.h"
@@ -39,6 +41,8 @@ static DEFINE_MUTEX(startup_lock);
 static DEFINE_IDA(ipc_ida);
 
 static unsigned int ksmbd_tools_pid;
+static unsigned int ksmbd_tools_features;
+static atomic64_t quota_cookie = ATOMIC64_INIT(0);
 
 static bool ksmbd_ipc_validate_version(struct genl_info *m)
 {
@@ -62,6 +66,7 @@ struct ksmbd_ipc_msg {
 struct ipc_msg_table_entry {
 	unsigned int		handle;
 	unsigned int		type;
+	u64			quota_cookie;
 	wait_queue_head_t	wait;
 	struct hlist_node	ipc_table_hlist;
 
@@ -126,6 +131,12 @@ static const struct nla_policy ksmbd_nl_policy[KSMBD_EVENT_MAX + 1] = {
 	},
 	[KSMBD_EVENT_LOGIN_RESPONSE_EXT] = {
 		.len = sizeof(struct ksmbd_login_response_ext),
+	},
+	[KSMBD_EVENT_QUOTA_REQUEST] = {
+		.len = sizeof(struct ksmbd_quota_request),
+	},
+	[KSMBD_EVENT_QUOTA_RESPONSE] = {
+		.len = sizeof(struct ksmbd_quota_response),
 	},
 };
 
@@ -202,6 +213,14 @@ static struct genl_ops ksmbd_genl_ops[] = {
 		.cmd	= KSMBD_EVENT_LOGIN_RESPONSE_EXT,
 		.doit	= handle_generic_event,
 	},
+	{
+		.cmd	= KSMBD_EVENT_QUOTA_REQUEST,
+		.doit	= handle_unsupported_event,
+	},
+	{
+		.cmd	= KSMBD_EVENT_QUOTA_RESPONSE,
+		.doit	= handle_generic_event,
+	},
 };
 
 static struct genl_family ksmbd_genl_family = {
@@ -274,12 +293,11 @@ static int handle_response(int type, void *payload, size_t sz)
 	handle = *(unsigned int *)payload;
 
 	ipc_update_last_active();
-	down_read(&ipc_msg_table_lock);
+	down_write(&ipc_msg_table_lock);
 	hash_for_each_possible(ipc_msg_table, entry, ipc_table_hlist, handle) {
 		if (handle != entry->handle)
 			continue;
 
-		entry->response = NULL;
 		/*
 		 * Response message type value should be equal to
 		 * request message type + 1.
@@ -288,6 +306,24 @@ static int handle_response(int type, void *payload, size_t sz)
 			pr_err("Waiting for IPC type %d, got %d. Ignore.\n",
 			       entry->type + 1, type);
 			continue;
+		}
+
+		if (entry->type == KSMBD_EVENT_QUOTA_REQUEST) {
+			struct ksmbd_quota_response resp;
+
+			if (sz != sizeof(resp)) {
+				ret = -EINVAL;
+				break;
+			}
+			memcpy(&resp, payload, sizeof(resp));
+			if (resp.cookie != entry->quota_cookie) {
+				ret = -EINVAL;
+				break;
+			}
+		}
+		if (entry->response) {
+			ret = -EALREADY;
+			break;
 		}
 
 		entry->response = kvzalloc(sz, KSMBD_DEFAULT_GFP);
@@ -302,7 +338,7 @@ static int handle_response(int type, void *payload, size_t sz)
 		ret = 0;
 		break;
 	}
-	up_read(&ipc_msg_table_lock);
+	up_write(&ipc_msg_table_lock);
 
 	return ret;
 }
@@ -422,6 +458,8 @@ static int handle_startup_event(struct sk_buff *skb, struct genl_info *info)
 		server_queue_ctrl_init_work();
 	}
 
+	WRITE_ONCE(ksmbd_tools_features, ((struct ksmbd_startup_request *)
+		   nla_data(info->attrs[KSMBD_EVENT_STARTING_UP]))->reserved[0]);
 	ksmbd_tools_pid = info->snd_portid;
 	ipc_update_last_active();
 
@@ -454,6 +492,9 @@ static int handle_generic_event(struct sk_buff *skb, struct genl_info *info)
 
 	if (!ksmbd_ipc_validate_version(info))
 		return -EINVAL;
+	if (type == KSMBD_EVENT_QUOTA_RESPONSE &&
+	    info->snd_portid != READ_ONCE(ksmbd_tools_pid))
+		return -EPERM;
 
 	if (!info->attrs[type])
 		return -EINVAL;
@@ -572,16 +613,22 @@ static int ipc_validate_msg(struct ipc_msg_table_entry *entry)
 	return entry->msg_sz != msg_sz ? -EINVAL : 0;
 }
 
-static void *ipc_msg_send_request(struct ksmbd_ipc_msg *msg, unsigned int handle)
+static void *ipc_msg_send_request_timeout(struct ksmbd_ipc_msg *msg,
+					  unsigned int handle, long timeout,
+					  int *error)
 {
-	struct ipc_msg_table_entry entry;
+	struct ipc_msg_table_entry entry = {};
 	int ret;
 
-	if ((int)handle < 0)
+	if ((int)handle < 0) {
+		*error = -EINVAL;
 		return NULL;
+	}
 
 	entry.type = msg->type;
-	entry.response = NULL;
+	if (entry.type == KSMBD_EVENT_QUOTA_REQUEST)
+		entry.quota_cookie =
+			((struct ksmbd_quota_request *)msg->payload)->cookie;
 	init_waitqueue_head(&entry.wait);
 
 	down_write(&ipc_msg_table_lock);
@@ -596,9 +643,7 @@ static void *ipc_msg_send_request(struct ksmbd_ipc_msg *msg, unsigned int handle
 	}
 
 	ret = wait_event_interruptible_timeout(entry.wait,
-					       entry.response != NULL,
-					       IPC_WAIT_TIMEOUT);
-
+					       READ_ONCE(entry.response), timeout);
 	down_write(&ipc_msg_table_lock);
 	if (entry.response) {
 		ret = ipc_validate_msg(&entry);
@@ -606,11 +651,120 @@ static void *ipc_msg_send_request(struct ksmbd_ipc_msg *msg, unsigned int handle
 			kvfree(entry.response);
 			entry.response = NULL;
 		}
+	} else if (!ret) {
+		ret = -ETIMEDOUT;
 	}
 out:
 	hash_del(&entry.ipc_table_hlist);
 	up_write(&ipc_msg_table_lock);
+	*error = ret;
 	return entry.response;
+}
+
+static void *ipc_msg_send_request(struct ksmbd_ipc_msg *msg, unsigned int handle)
+{
+	int error;
+
+	return ipc_msg_send_request_timeout(msg, handle, IPC_WAIT_TIMEOUT, &error);
+}
+
+struct ksmbd_quota_request *
+ksmbd_ipc_quota_alloc(struct ksmbd_work *work, const struct path *target)
+{
+	struct ksmbd_quota_request *req;
+	struct kstatfs fsstat;
+	struct kstat stat;
+	char *buf, *path;
+	size_t path_len;
+	int ret;
+
+	if (!(READ_ONCE(ksmbd_tools_features) & KSMBD_IPC_FEATURE_QUOTA))
+		return ERR_PTR(-EOPNOTSUPP);
+	ret = vfs_getattr(target, &stat, STATX_BASIC_STATS,
+			  AT_STATX_SYNC_AS_STAT);
+	if (ret)
+		return ERR_PTR(ret);
+	ret = vfs_statfs(target, &fsstat);
+	if (ret)
+		return ERR_PTR(ret);
+	buf = kmalloc(KSMBD_QUOTA_MAX_PATH, KSMBD_DEFAULT_GFP);
+	if (!buf)
+		return ERR_PTR(-ENOMEM);
+	path = d_path(target, buf, KSMBD_QUOTA_MAX_PATH);
+	if (IS_ERR(path)) {
+		req = ERR_CAST(path);
+		goto out;
+	}
+	path_len = strlen(path) + 1;
+	req = kzalloc(sizeof(*req) + path_len, KSMBD_DEFAULT_GFP);
+	if (!req) {
+		req = ERR_PTR(-ENOMEM);
+		goto out;
+	}
+	req->session_id = work->sess->id;
+	req->connect_id = work->tcon->id;
+	req->ino = stat.ino;
+	req->dev_major = MAJOR(stat.dev);
+	req->dev_minor = MINOR(stat.dev);
+	req->fsid[0] = fsstat.f_fsid.val[0];
+	req->fsid[1] = fsstat.f_fsid.val[1];
+	req->path_len = path_len;
+	memcpy(req->path, path, path_len);
+out:
+	kfree(buf);
+	return req;
+}
+
+static bool quota_response_valid(const struct ksmbd_quota_request *req,
+				 const struct ksmbd_quota_response *resp)
+{
+	if (resp->status > 0 || resp->status < -MAX_ERRNO)
+		return false;
+	if (resp->status)
+		return true;
+	if (resp->used > S64_MAX || resp->threshold < -1 || resp->limit < -1)
+		return false;
+	if (req->command == KSMBD_QUOTA_GET_NEXT)
+		return resp->uid >= req->uid && resp->uid != U32_MAX;
+	return resp->uid == req->uid;
+}
+
+int ksmbd_ipc_quota_request(struct ksmbd_quota_request *req,
+			    struct ksmbd_quota_response *resp)
+{
+	struct ksmbd_quota_response *reply;
+	struct ksmbd_ipc_msg *msg;
+	int handle, ret;
+
+	if (!(READ_ONCE(ksmbd_tools_features) & KSMBD_IPC_FEATURE_QUOTA))
+		return -EOPNOTSUPP;
+	handle = ksmbd_ipc_id_alloc();
+	if (handle < 0)
+		return handle;
+	msg = ipc_msg_alloc(sizeof(*req) + req->path_len);
+	if (!msg) {
+		ret = -ENOMEM;
+		goto out_handle;
+	}
+	req->handle = handle;
+	req->cookie = atomic64_inc_return(&quota_cookie);
+	msg->type = KSMBD_EVENT_QUOTA_REQUEST;
+	memcpy(msg->payload, req, msg->sz);
+	/* Quota updates can wait for filesystem transactions or a thaw. */
+	reply = ipc_msg_send_request_timeout(msg, handle, 30 * HZ, &ret);
+	if (reply) {
+		if (!quota_response_valid(req, reply)) {
+			ret = -EIO;
+		} else {
+			*resp = *reply;
+			ret = reply->status;
+		}
+		kvfree(reply);
+	}
+	ipc_msg_free(msg);
+out_handle:
+	ipc_msg_handle_free(handle);
+	return ret;
 }
 
 static int ksmbd_ipc_heartbeat_request(void)
@@ -980,6 +1134,7 @@ static int __ipc_heartbeat(void)
 	WRITE_ONCE(server_conf.state, SERVER_STATE_RESETTING);
 	server_conf.ipc_last_active = 0;
 	ksmbd_tools_pid = 0;
+	WRITE_ONCE(ksmbd_tools_features, 0);
 	pr_err("No IPC daemon response for %lus\n", delta / HZ);
 	mutex_unlock(&startup_lock);
 	return -EINVAL;
@@ -1011,6 +1166,7 @@ void ksmbd_ipc_soft_reset(void)
 {
 	mutex_lock(&startup_lock);
 	ksmbd_tools_pid = 0;
+	WRITE_ONCE(ksmbd_tools_features, 0);
 	cancel_delayed_work_sync(&ipc_timer_work);
 	mutex_unlock(&startup_lock);
 }

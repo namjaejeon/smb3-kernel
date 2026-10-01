@@ -20,7 +20,6 @@
 #include <linux/mutex.h>
 #include <linux/timekeeping.h>
 #include <linux/unaligned.h>
-#include <linux/quota.h>
 
 #include "glob.h"
 #include "../common/smbfsctl.h"
@@ -4149,6 +4148,107 @@ static int smb2_handle_app_instance_id(struct smb2_create_rsp *rsp,
 	return ksmbd_close_fd_app_instance_id(dh_info->AppInstanceId);
 }
 
+static int smb2_open_quota(struct ksmbd_work *work)
+{
+	struct smb2_create_req *req;
+	struct smb2_create_rsp *rsp;
+	struct ksmbd_quota_request *ipc_req;
+	struct ksmbd_quota_response ipc_rsp;
+	struct ksmbd_file *fp = NULL;
+	struct file *filp;
+	int rc;
+
+	WORK_BUFFERS(work, req, rsp);
+
+	if (user_guest(work->sess->user) ||
+	    test_tree_conn_flag(work->tcon, KSMBD_TREE_CONN_FLAG_GUEST_ACCOUNT)) {
+		rc = -EACCES;
+		goto out;
+	}
+	if (le32_to_cpu(req->ImpersonationLevel) > le32_to_cpu(IL_DELEGATE) ||
+	    !req->DesiredAccess || (req->DesiredAccess & ~DESIRED_ACCESS_MASK) ||
+	    (req->ShareAccess & ~(FILE_SHARE_READ_LE | FILE_SHARE_WRITE_LE |
+				 FILE_SHARE_DELETE_LE))) {
+		rc = -EINVAL;
+		goto out;
+	}
+	if (req->CreateDisposition != FILE_OPEN_LE ||
+	    (req->CreateOptions & ~FILE_NON_DIRECTORY_FILE_LE) ||
+	    (req->FileAttributes & ~FILE_ATTRIBUTE_NORMAL_LE) ||
+	    req->RequestedOplockLevel != SMB2_OPLOCK_LEVEL_NONE ||
+	    req->CreateContextsOffset || req->CreateContextsLength) {
+		rc = -EOPNOTSUPP;
+		goto out;
+	}
+
+	/* Use the directory only to identify the quota filesystem. */
+	filp = dentry_open(&work->tcon->share_conf->vfs_path, O_PATH,
+			  current_cred());
+	if (IS_ERR(filp)) {
+		rc = PTR_ERR(filp);
+		goto out;
+	}
+	ipc_req = ksmbd_ipc_quota_alloc(work, &filp->f_path);
+	if (IS_ERR(ipc_req)) {
+		rc = PTR_ERR(ipc_req);
+	} else {
+		ipc_req->command = KSMBD_QUOTA_PROBE;
+		rc = ksmbd_ipc_quota_request(ipc_req, &ipc_rsp);
+		kfree(ipc_req);
+	}
+	if (rc) {
+		fput(filp);
+		goto out;
+	}
+
+	fp = ksmbd_open_quota_fd(work, filp);
+	if (IS_ERR(fp)) {
+		rc = PTR_ERR(fp);
+		fp = NULL;
+		fput(filp);
+		goto out;
+	}
+	ksmbd_open_durable_fd(fp);
+	if (!has_file_id(fp->persistent_id)) {
+		rc = -ENOMEM;
+		goto out;
+	}
+	fp->daccess = smb_map_generic_desired_access(req->DesiredAccess);
+	fp->saccess = req->ShareAccess;
+	fp->cdoption = FILE_OPEN_LE;
+	fp->coption = req->CreateOptions;
+	fp->f_ci->m_fattr = FILE_ATTRIBUTE_NORMAL_LE;
+
+	memset((char *)rsp + sizeof(rsp->hdr), 0,
+	       offsetof(struct smb2_create_rsp, Buffer) - sizeof(rsp->hdr));
+	rsp->StructureSize = cpu_to_le16(89);
+	rsp->CreateAction = cpu_to_le32(FILE_OPENED);
+	rsp->FileAttributes = FILE_ATTRIBUTE_NORMAL_LE;
+	rsp->PersistentFileId = fp->persistent_id;
+	rsp->VolatileFileId = fp->volatile_id;
+	rc = ksmbd_update_fstate(&work->sess->file_table, fp, FP_INITED);
+	if (!rc)
+		rc = smb2_set_request_open(work, fp, &req->hdr, false, false);
+	if (!rc)
+		rc = ksmbd_iov_pin_rsp(work, rsp,
+				       offsetof(struct smb2_create_rsp, Buffer));
+out:
+	if (rc) {
+		if (fp)
+			ksmbd_fd_put(work, fp);
+		if (rc == -EACCES || rc == -EPERM)
+			rsp->hdr.Status = STATUS_ACCESS_DENIED;
+		else if (rc == -EINVAL)
+			rsp->hdr.Status = STATUS_INVALID_PARAMETER;
+		else if (rc == -ENOMEM || rc == -EMFILE)
+			rsp->hdr.Status = STATUS_INSUFFICIENT_RESOURCES;
+		else
+			rsp->hdr.Status = STATUS_NOT_SUPPORTED;
+		smb2_set_err_rsp(work);
+	}
+	return rc;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -4254,6 +4354,13 @@ int smb2_open(struct ksmbd_work *work)
 		}
 
 		ksmbd_debug(SMB, "converted name = %s\n", name);
+
+		if (!posix_ctxt &&
+		    !strcasecmp(name, "$Extend/$Quota:$Q:$INDEX_ALLOCATION")) {
+			rc = smb2_open_quota(work);
+			kfree(name);
+			return rc;
+		}
 
 		if (posix_ctxt == false) {
 			if (strchr(name, ':')) {
@@ -7509,6 +7616,8 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
 	case FS_ATTRIBUTE_INFORMATION:
 	{
 		FILE_SYSTEM_ATTRIBUTE_INFO *info;
+		struct ksmbd_quota_request *quota_req;
+		struct ksmbd_quota_response quota_resp;
 		struct file_kattr fa = {};
 		size_t sz;
 		u32 attrs;
@@ -7537,6 +7646,13 @@ static int smb2_get_info_filesystem(struct ksmbd_work *work,
 		if (!(fa.fsx_xflags & FS_XFLAG_CASENONPRESERVING))
 			attrs |= FILE_CASE_PRESERVED_NAMES;
 
+		quota_req = ksmbd_ipc_quota_alloc(work, &path);
+		if (!IS_ERR(quota_req)) {
+			quota_req->command = KSMBD_QUOTA_PROBE;
+			if (!ksmbd_ipc_quota_request(quota_req, &quota_resp))
+				attrs |= FILE_VOLUME_QUOTAS;
+			kfree(quota_req);
+		}
 		info->Attributes = cpu_to_le32(attrs);
 		info->Attributes |= cpu_to_le32(server_conf.share_fake_fscaps);
 
@@ -7942,6 +8058,9 @@ static void smb2_quota_set_status(struct smb2_hdr *hdr, int rc)
 	case -EROFS:
 		hdr->Status = STATUS_MEDIA_WRITE_PROTECTED;
 		break;
+	case -ETIMEDOUT:
+		hdr->Status = STATUS_IO_TIMEOUT;
+		break;
 	default:
 		hdr->Status = STATUS_UNEXPECTED_IO_ERROR;
 	}
@@ -7950,7 +8069,7 @@ static void smb2_quota_set_status(struct smb2_hdr *hdr, int rc)
 static int smb2_quota_append(struct smb2_query_info_rsp *rsp, u32 max_len,
 			     u32 *used, struct smb2_file_quota_info **last,
 			     const u8 *sid, u32 sid_len,
-			     const struct qc_dqblk *dq)
+			     const struct ksmbd_quota_response *dq)
 {
 	struct smb2_file_quota_info *entry;
 	u32 pos = *used;
@@ -7969,11 +8088,9 @@ static int smb2_quota_append(struct smb2_query_info_rsp *rsp, u32 max_len,
 	memset(entry, 0, sizeof(*entry));
 	entry->SidLength = cpu_to_le32(sid_len);
 	if (dq) {
-		entry->QuotaUsed = cpu_to_le64(dq->d_space);
-		entry->QuotaThreshold = cpu_to_le64(dq->d_spc_softlimit ?
-						 dq->d_spc_softlimit : U64_MAX);
-		entry->QuotaLimit = cpu_to_le64(dq->d_spc_hardlimit ?
-						 dq->d_spc_hardlimit : U64_MAX);
+		entry->QuotaUsed = cpu_to_le64(dq->used);
+		entry->QuotaThreshold = cpu_to_le64(dq->threshold);
+		entry->QuotaLimit = cpu_to_le64(dq->limit);
 	}
 	memcpy(entry->Sid, sid, sid_len);
 	*used = pos + sizeof(*entry) + sid_len;
@@ -7988,10 +8105,9 @@ static int smb2_get_info_quota(struct ksmbd_work *work,
 	struct ksmbd_file *fp;
 	struct smb2_query_quota_info *query;
 	struct smb2_file_quota_info *last = NULL;
-	struct super_block *sb;
-	struct qc_dqblk dq;
+	struct ksmbd_quota_request *ipc_req = NULL;
+	struct ksmbd_quota_response dq;
 	struct smb_sid sid;
-	struct kqid qid;
 	const u8 *list;
 	u32 in_len = le32_to_cpu(req->InputBufferLength);
 	u32 list_len, start_len, start_off, used = 0, pos = 0, next_id = 0;
@@ -8053,9 +8169,10 @@ static int smb2_get_info_quota(struct ksmbd_work *work,
 		rsp->hdr.Status = STATUS_FILE_CLOSED;
 		goto out_status;
 	}
-	sb = file_inode(fp->filp)->i_sb;
-	if (!sb->s_qcop || !sb->s_qcop->get_nextdqblk) {
-		rc = -EOPNOTSUPP;
+	ipc_req = ksmbd_ipc_quota_alloc(work, &fp->filp->f_path);
+	if (IS_ERR(ipc_req)) {
+		rc = PTR_ERR(ipc_req);
+		ipc_req = NULL;
 		goto out_fd;
 	}
 	explicit_list = list_len != 0;
@@ -8106,14 +8223,15 @@ static int smb2_get_info_quota(struct ksmbd_work *work,
 				break;
 			}
 			if (!rc) {
-				qid = make_kqid(&init_user_ns, USRQUOTA, uid);
-				rc = sb->s_qcop->get_nextdqblk(sb, &qid, &dq);
+				ipc_req->command = KSMBD_QUOTA_GET;
+				ipc_req->uid = uid;
+				rc = ksmbd_ipc_quota_request(ipc_req, &dq);
 				if (rc == -ENOENT)
 					rc = 0;
 				else if (rc)
 					goto out_scan;
 				else
-					found = from_kqid(&init_user_ns, qid) == uid;
+					found = dq.uid == uid;
 			} else if (rc == -ENOENT) {
 				rc = 0;
 			}
@@ -8131,15 +8249,16 @@ static int smb2_get_info_quota(struct ksmbd_work *work,
 			if (ALIGN(used, 8) + sizeof(struct smb2_file_quota_info) +
 			    sid_len > max_len)
 				break;
-			qid = make_kqid(&init_user_ns, USRQUOTA, next_id);
-			rc = sb->s_qcop->get_nextdqblk(sb, &qid, &dq);
+			ipc_req->command = KSMBD_QUOTA_GET_NEXT;
+			ipc_req->uid = next_id;
+			rc = ksmbd_ipc_quota_request(ipc_req, &dq);
 			if (rc == -ENOENT) {
 				rc = 0;
 				break;
 			}
 			if (rc)
 				goto out_scan;
-			uid = from_kqid(&init_user_ns, qid);
+			uid = dq.uid;
 			if (uid < next_id) {
 				rc = -EIO;
 				goto out_scan;
@@ -8173,6 +8292,7 @@ no_more:
 	rc = ksmbd_iov_pin_rsp(work, rsp,
 			   offsetof(struct smb2_query_info_rsp, Buffer) + used);
 out_fd:
+	kfree(ipc_req);
 	ksmbd_fd_put(work, fp);
 out_status:
 	if (rc && !rsp->hdr.Status)
@@ -9019,14 +9139,13 @@ static int smb2_set_info_sec(struct ksmbd_file *fp, int addition_info,
 static int smb2_set_info_quota(struct ksmbd_work *work, struct ksmbd_file *fp,
 			       struct smb2_set_info_req *req)
 {
-	struct super_block *sb = file_inode(fp->filp)->i_sb;
+	struct ksmbd_quota_request *ipc_req;
+	struct ksmbd_quota_response resp;
 	const u8 *buf;
 	u32 len = le32_to_cpu(req->BufferLength);
 	u32 pos = 0, uid, next;
 	int rc;
 
-	if (!sb->s_qcop || !sb->s_qcop->set_dqblk)
-		return -EOPNOTSUPP;
 	/* The SMB session must have the volume's quota administrator right. */
 	if (user_uid(work->sess->user) != 0)
 		return -EACCES;
@@ -9052,8 +9171,8 @@ static int smb2_set_info_quota(struct ksmbd_work *work, struct ksmbd_file *fp,
 					le32_to_cpu(item->SidLength), &uid);
 		if (rc)
 			return rc == -ENOENT ? -EOPNOTSUPP : rc;
-		/* Linux quotas have no delete operation or explicit zero limit. */
-		if (soft < -1 || hard < -1 || !soft || !hard)
+		/* Deleting a quota entry is not supported by these backends. */
+		if (soft < -1 || hard < -1)
 			return -EOPNOTSUPP;
 		next = le32_to_cpu(item->NextEntryOffset);
 		if (!next)
@@ -9061,33 +9180,36 @@ static int smb2_set_info_quota(struct ksmbd_work *work, struct ksmbd_file *fp,
 		pos += next;
 	}
 
+	ipc_req = ksmbd_ipc_quota_alloc(work, &fp->filp->f_path);
+	if (IS_ERR(ipc_req))
+		return PTR_ERR(ipc_req);
+	ipc_req->command = KSMBD_QUOTA_SET;
 	pos = 0;
 	while (true) {
 		const struct smb2_file_quota_info *item =
 			(const void *)(buf + pos);
-		struct qc_dqblk dq = {
-			.d_fieldmask = QC_SPC_SOFT | QC_SPC_HARD,
-		};
-		struct kqid qid;
 		s64 soft = (s64)le64_to_cpu(item->QuotaThreshold);
 		s64 hard = (s64)le64_to_cpu(item->QuotaLimit);
 
 		rc = smb2_quota_sid_to_uid(item->Sid,
 					le32_to_cpu(item->SidLength), &uid);
+		if (rc) {
+			rc = rc == -ENOENT ? -EOPNOTSUPP : rc;
+			break;
+		}
+		ipc_req->uid = uid;
+		ipc_req->threshold = soft;
+		ipc_req->limit = hard;
+		rc = ksmbd_ipc_quota_request(ipc_req, &resp);
 		if (rc)
-			return rc == -ENOENT ? -EOPNOTSUPP : rc;
-		qid = make_kqid(&init_user_ns, USRQUOTA, uid);
-		dq.d_spc_softlimit = soft == -1 ? 0 : soft;
-		dq.d_spc_hardlimit = hard == -1 ? 0 : hard;
-		rc = sb->s_qcop->set_dqblk(sb, qid, &dq);
-		if (rc)
-			return rc;
+			break;
 		next = le32_to_cpu(item->NextEntryOffset);
 		if (!next)
 			break;
 		pos += next;
 	}
-	return 0;
+	kfree(ipc_req);
+	return rc;
 }
 
 /**

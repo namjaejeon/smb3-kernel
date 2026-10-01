@@ -494,6 +494,7 @@ static int ksmbd_inode_init(struct ksmbd_inode *ci, struct ksmbd_file *fp)
 	atomic_set(&ci->sop_count, 0);
 	ci->m_flags = 0;
 	ci->m_fattr = 0;
+	INIT_HLIST_NODE(&ci->m_hash);
 	INIT_LIST_HEAD(&ci->m_fp_list);
 	INIT_LIST_HEAD(&ci->m_op_list);
 	init_rwsem(&ci->m_lock);
@@ -506,11 +507,13 @@ static struct ksmbd_inode *ksmbd_inode_get(struct ksmbd_file *fp)
 	struct ksmbd_inode *ci, *tmpci;
 	int rc;
 
-	read_lock(&inode_hash_lock);
-	ci = ksmbd_inode_lookup(fp);
-	read_unlock(&inode_hash_lock);
-	if (ci)
-		return ci;
+	if (!fp->is_quota) {
+		read_lock(&inode_hash_lock);
+		ci = ksmbd_inode_lookup(fp);
+		read_unlock(&inode_hash_lock);
+		if (ci)
+			return ci;
+	}
 
 	ci = kmalloc_obj(struct ksmbd_inode, KSMBD_DEFAULT_GFP);
 	if (!ci)
@@ -522,6 +525,10 @@ static struct ksmbd_inode *ksmbd_inode_get(struct ksmbd_file *fp)
 		kfree(ci);
 		return NULL;
 	}
+
+	/* Quota handles do not share delete or oplock state with the directory. */
+	if (fp->is_quota)
+		return ci;
 
 	write_lock(&inode_hash_lock);
 	tmpci = ksmbd_inode_lookup(fp);
@@ -936,25 +943,54 @@ void ksmbd_fd_put(struct ksmbd_work *work, struct ksmbd_file *fp)
 	__put_fd_final(work, fp);
 }
 
-static bool __sanity_check(struct ksmbd_tree_connect *tcon, struct ksmbd_file *fp)
+static bool __sanity_check(struct ksmbd_work *work, struct ksmbd_file *fp)
 {
+	struct smb2_hdr *hdr;
+
 	if (!fp)
 		return false;
-	if (fp->tcon != tcon)
+	if (fp->tcon != work->tcon)
 		return false;
-	return true;
+	if (!fp->is_quota)
+		return true;
+
+	hdr = work->next_smb2_rcv_hdr_off ? ksmbd_req_buf_next(work) :
+		smb_get_msg(work->request_buf);
+	switch (hdr->Command) {
+	case SMB2_CLOSE:
+		return true;
+	case SMB2_QUERY_INFO: {
+		struct smb2_query_info_req *req = (void *)hdr;
+
+		return req->InfoType == SMB2_O_INFO_QUOTA ||
+		       req->InfoType == SMB2_O_INFO_FILESYSTEM;
+	}
+	case SMB2_SET_INFO: {
+		struct smb2_set_info_req *req = (void *)hdr;
+
+		return req->InfoType == SMB2_O_INFO_QUOTA;
+	}
+	default:
+		return false;
+	}
 }
 
 struct ksmbd_file *ksmbd_lookup_foreign_fd(struct ksmbd_work *work, u64 id)
 {
-	return __ksmbd_lookup_fd(&work->sess->file_table, id);
+	struct ksmbd_file *fp = __ksmbd_lookup_fd(&work->sess->file_table, id);
+
+	if (fp && fp->is_quota) {
+		ksmbd_fd_put(work, fp);
+		return NULL;
+	}
+	return fp;
 }
 
 struct ksmbd_file *ksmbd_lookup_fd_fast(struct ksmbd_work *work, u64 id)
 {
 	struct ksmbd_file *fp = __ksmbd_lookup_fd(&work->sess->file_table, id);
 
-	if (__sanity_check(work->tcon, fp))
+	if (__sanity_check(work, fp))
 		return fp;
 
 	ksmbd_fd_put(work, fp);
@@ -972,7 +1008,7 @@ struct ksmbd_file *ksmbd_lookup_fd_slow(struct ksmbd_work *work, u64 id,
 	}
 
 	fp = __ksmbd_lookup_fd(&work->sess->file_table, id);
-	if (!__sanity_check(work->tcon, fp)) {
+	if (!__sanity_check(work, fp)) {
 		ksmbd_fd_put(work, fp);
 		return NULL;
 	}
@@ -1278,7 +1314,8 @@ unsigned int ksmbd_open_durable_fd(struct ksmbd_file *fp)
 	return fp->persistent_id;
 }
 
-struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp)
+static struct ksmbd_file *__ksmbd_open_fd(struct ksmbd_work *work,
+					struct file *filp, bool quota)
 {
 	struct ksmbd_file *fp;
 	int ret;
@@ -1310,6 +1347,7 @@ struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp)
 	fp->volatile_id		= KSMBD_NO_FID;
 	fp->persistent_id	= KSMBD_NO_FID;
 	fp->f_state		= FP_NEW;
+	fp->is_quota		= quota;
 	fp->f_ci		= ksmbd_inode_get(fp);
 
 	if (!fp->f_ci) {
@@ -1331,6 +1369,16 @@ err_out:
 	ksmbd_conn_put(fp->conn);
 	kmem_cache_free(filp_cache, fp);
 	return ERR_PTR(ret);
+}
+
+struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp)
+{
+	return __ksmbd_open_fd(work, filp, false);
+}
+
+struct ksmbd_file *ksmbd_open_quota_fd(struct ksmbd_work *work, struct file *filp)
+{
+	return __ksmbd_open_fd(work, filp, true);
 }
 
 /**
