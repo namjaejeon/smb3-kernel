@@ -2142,10 +2142,15 @@ static int ntfs_sync_fs(struct super_block *sb, int wait)
  * in use. This means we return an underestimate on errors which is better than
  * an overestimate.
  */
-s64 get_nr_free_clusters(struct ntfs_volume *vol)
+static s64 get_nr_free_clusters(struct ntfs_volume *vol)
 {
 	s64 nr_free = vol->nr_clusters;
 	u32 nr_used;
+	struct ntfs_free_space free_space = {
+		.by_start = RB_ROOT,
+		.by_length = RB_ROOT,
+		.complete = true,
+	};
 	struct address_space *mapping = vol->lcnbmp_ino->i_mapping;
 	struct folio *folio;
 	pgoff_t index, max_index;
@@ -2153,17 +2158,13 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 	unsigned int memalloc_flags;
 
 	ntfs_debug("Entering.");
-	/* Serialize accesses to the cluster bitmap. */
-
-	if (NVolFreeClusterKnown(vol))
-		return atomic64_read(&vol->free_clusters);
 	memalloc_flags = memalloc_nofs_save();
-	down_write(&vol->lcnbmp_lock);
-	if (NVolFreeClusterKnown(vol)) {
-		nr_free = atomic64_read(&vol->free_clusters);
-		goto unlock;
-	}
-	vol->free_space.complete = true;
+	/*
+	 * Only precalc_work runs this initial scan. Cluster allocation and
+	 * freeing wait for FreeClusterKnown before changing the bitmap, so
+	 * build a private cache without holding lcnbmp_lock over readahead.
+	 * Publish it with the free count once the scan is complete.
+	 */
 
 	file_ra_state_init(&ra, mapping);
 
@@ -2191,7 +2192,7 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 			ntfs_debug("Skipping page (index 0x%lx).", index);
 			nr_free -= PAGE_SIZE * 8;
 			vol->lcn_empty_bits_per_page[index] = 0;
-			vol->free_space.complete = false;
+			free_space.complete = false;
 			continue;
 		}
 
@@ -2206,7 +2207,7 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 		nr_used = bitmap_weight(kaddr, PAGE_SIZE * BITS_PER_BYTE);
 		nr_free -= nr_used;
 		vol->lcn_empty_bits_per_page[index] = PAGE_SIZE * BITS_PER_BYTE - nr_used;
-		ntfs_free_space_add_bitmap(&vol->free_space, kaddr,
+		ntfs_free_space_add_bitmap(&free_space, kaddr,
 				(s64)index << (PAGE_SHIFT + 3),
 				min_t(s64, PAGE_SIZE * BITS_PER_BYTE,
 				      vol->nr_clusters -
@@ -2226,11 +2227,11 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 	/* If errors occurred we may well have gone below zero, fix this. */
 	if (nr_free < 0)
 		nr_free = 0;
-	else
-		atomic64_set(&vol->free_clusters, nr_free);
 
+	down_write(&vol->lcnbmp_lock);
+	vol->free_space = free_space;
+	atomic64_set(&vol->free_clusters, nr_free);
 	NVolSetFreeClusterKnown(vol);
-unlock:
 	up_write(&vol->lcnbmp_lock);
 	memalloc_nofs_restore(memalloc_flags);
 	wake_up_all(&vol->free_waitq);

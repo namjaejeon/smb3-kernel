@@ -310,5 +310,4 @@ static __always_inline void ntfs_release_dirty_clusters(struct ntfs_volume *vol,
 }
 
 s64 ntfs_available_clusters_count(struct ntfs_volume *vol, s64 nr_clusters);
-s64 get_nr_free_clusters(struct ntfs_volume *vol);
 #endif /* _LINUX_NTFS_VOLUME_H */
