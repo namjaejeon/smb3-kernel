@@ -12,73 +12,36 @@
 #include "ntfs.h"
 #include "iomap.h"
 
-static void ntfs_iomap_put_folio_non_resident(struct inode *inode, loff_t pos,
-					      unsigned int len, struct folio *folio)
+static bool ntfs_iomap_valid_initialized_size(struct inode *inode,
+		const struct iomap *iomap)
 {
-	struct ntfs_inode *ni = NTFS_I(inode);
-	unsigned long sector_size = 1UL << inode->i_blkbits;
-	loff_t start_down, end_up, init;
-
-	start_down = round_down(pos, sector_size);
-	end_up = (pos + len - 1) | (sector_size - 1);
-	init = ni->initialized_size;
-
-	if (init >= start_down && init <= end_up) {
-		if (init < pos) {
-			loff_t offset = offset_in_folio(folio, pos + len);
-
-			if (offset == 0)
-				offset = folio_size(folio);
-			folio_zero_segments(folio,
-					    offset_in_folio(folio, init),
-					    offset_in_folio(folio, pos),
-					    offset,
-					    folio_size(folio));
-
-		} else  {
-			loff_t offset = max_t(loff_t, pos + len, init);
-
-			offset = offset_in_folio(folio, offset);
-			if (offset == 0)
-				offset = folio_size(folio);
-			folio_zero_segment(folio,
-					   offset,
-					   folio_size(folio));
-		}
-	} else if (init <= pos) {
-		loff_t offset = 0, offset2 = offset_in_folio(folio, pos + len);
-
-		if ((init >> folio_shift(folio)) == (pos >> folio_shift(folio)))
-			offset = offset_in_folio(folio, init);
-		if (offset2 == 0)
-			offset2 = folio_size(folio);
-		folio_zero_segments(folio,
-				    offset,
-				    offset_in_folio(folio, pos),
-				    offset2,
-				    folio_size(folio));
-	}
-	folio_unlock(folio);
-	folio_put(folio);
-}
-
-/*
- * iomap_zero_range is called for an area beyond the initialized size,
- * garbage values can be read, so zeroing out is needed.
- */
-static void ntfs_iomap_put_folio(struct inode *inode, loff_t pos,
-		unsigned int len, struct folio *folio)
-{
-	if (NInoNonResident(NTFS_I(inode)))
-		return ntfs_iomap_put_folio_non_resident(inode, pos,
-							 len, folio);
-	folio_unlock(folio);
-	folio_put(folio);
+	return iomap->type == IOMAP_INLINE ||
+		iomap->validity_cookie == READ_ONCE(NTFS_I(inode)->initialized_size);
 }
 
 const struct iomap_write_ops ntfs_iomap_folio_ops = {
-	.put_folio = ntfs_iomap_put_folio,
+	.iomap_valid = ntfs_iomap_valid_initialized_size,
 };
+
+static const struct iomap_ops ntfs_zero_tail_iomap_ops;
+
+/*
+ * IOMAP_F_ZERO_TAIL zeros from the end of the write. If the write ends
+ * before initialized_size in the same block, preserve the initialized
+ * bytes by explicitly zeroing only the tail beyond initialized_size.
+ */
+static int ntfs_zero_initialized_tail(struct inode *inode, loff_t end)
+{
+	struct ntfs_inode *ni = NTFS_I(inode);
+	loff_t init = READ_ONCE(ni->initialized_size);
+
+	if (!NInoNonResident(ni) || end >= init ||
+	    round_up(end, i_blocksize(inode)) <= init)
+		return 0;
+
+	return iomap_truncate_page(inode, init, NULL, &ntfs_zero_tail_iomap_ops,
+				   &ntfs_iomap_folio_ops, NULL);
+}
 
 static int ntfs_read_iomap_begin_resident(struct inode *inode, loff_t offset, loff_t length,
 		unsigned int flags, struct iomap *iomap, bool keep_mrec_lock)
@@ -202,6 +165,7 @@ static int ntfs_read_iomap_begin_non_resident(struct inode *inode, loff_t offset
 	struct ntfs_volume *vol = ni->vol;
 	loff_t vcn_ofs;
 	loff_t rl_length;
+	loff_t init;
 
 	vcn = ntfs_bytes_to_cluster(vol, offset);
 	vcn_ofs = ntfs_bytes_to_cluster_off(vol, offset);
@@ -255,6 +219,22 @@ static int ntfs_read_iomap_begin_non_resident(struct inode *inode, loff_t offset
 	else
 		iomap->length = length;
 	up_write(&ni->runlist.lock);
+
+	if (flags & IOMAP_ZERO) {
+		int err;
+
+		init = READ_ONCE(ni->initialized_size);
+		iomap->validity_cookie = init;
+		if (iomap->type == IOMAP_MAPPED &&
+		    iomap->offset + iomap->length >= init)
+			iomap->flags |= IOMAP_F_ZERO_TAIL;
+		else if (iomap->type == IOMAP_MAPPED) {
+			err = ntfs_zero_initialized_tail(inode,
+					iomap->offset + iomap->length);
+			if (err)
+				return err;
+		}
+	}
 
 	if (!(flags & IOMAP_ZERO) &&
 			iomap->type == IOMAP_MAPPED &&
@@ -332,7 +312,6 @@ static bool ntfs_iomap_valid(struct inode *inode, const struct iomap *iomap)
 }
 
 static const struct iomap_write_ops ntfs_zero_iomap_folio_ops = {
-	.put_folio = ntfs_iomap_put_folio,
 	.iomap_valid = ntfs_iomap_valid,
 };
 
@@ -362,6 +341,34 @@ static DEFINE_IOMAP_ITER_NEXT(ntfs_seek_iomap_next, ntfs_seek_iomap_begin);
 
 const struct iomap_ops ntfs_seek_iomap_ops = {
 	.iomap_next = ntfs_seek_iomap_next,
+};
+
+static int ntfs_zero_tail_iomap_begin(struct inode *inode, loff_t offset,
+		loff_t length, unsigned int flags, struct iomap *iomap,
+		struct iomap *srcmap)
+{
+	loff_t init = READ_ONCE(NTFS_I(inode)->initialized_size);
+	int err;
+
+	/* Skip bytes initialized after the tail range was selected. */
+	if (offset < init) {
+		iomap->type = IOMAP_HOLE;
+		iomap->addr = IOMAP_NULL_ADDR;
+		iomap->offset = offset;
+		iomap->length = min(length, init - offset);
+		return 0;
+	}
+
+	err = ntfs_seek_iomap_begin(inode, offset, length, flags, iomap, srcmap);
+	iomap->validity_cookie = init;
+	return err;
+}
+
+static DEFINE_IOMAP_ITER_NEXT(ntfs_zero_tail_iomap_next,
+		ntfs_zero_tail_iomap_begin);
+
+static const struct iomap_ops ntfs_zero_tail_iomap_ops = {
+	.iomap_next = ntfs_zero_tail_iomap_next,
 };
 
 int ntfs_dio_zero_range(struct inode *inode, loff_t offset, loff_t length)
@@ -571,6 +578,17 @@ remap_rl:
 			iomap->length = rl_length - vcn_ofs;
 		else
 			iomap->length = length;
+	}
+
+	/* Revalidate the initialized boundary after locking each folio. */
+	iomap->validity_cookie = READ_ONCE(ni->initialized_size);
+	if (iomap->type == IOMAP_MAPPED) {
+		loff_t end = iomap->offset + iomap->length;
+
+		if (end >= iomap->validity_cookie)
+			iomap->flags |= IOMAP_F_ZERO_TAIL;
+		else
+			return ntfs_zero_initialized_tail(inode, end);
 	}
 
 	return 0;
