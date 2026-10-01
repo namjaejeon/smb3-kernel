@@ -223,21 +223,6 @@ void ntfs_free_space_add_bitmap(struct ntfs_free_space *space,
 	}
 }
 
-static unsigned int ntfs_get_allocation_ranges(struct ntfs_volume *vol, int zone,
-		struct ntfs_cluster_range *ranges)
-{
-	if (zone == MFT_ZONE) {
-		ranges[0].start = vol->mft_zone_start;
-		ranges[0].end = vol->mft_zone_end;
-		return 1;
-	}
-	ranges[0].start = vol->mft_zone_end;
-	ranges[0].end = vol->nr_clusters;
-	ranges[1].start = 0;
-	ranges[1].end = vol->mft_zone_start;
-	return 2;
-}
-
 static void ntfs_select_free_extent(s64 start, s64 end,
 		const struct ntfs_cluster_range *range, s64 *best_start,
 		s64 *best_length)
@@ -313,34 +298,78 @@ static int ntfs_free_space_scan(struct ntfs_volume *vol,
 	return 0;
 }
 
-int ntfs_free_space_find(struct ntfs_volume *vol, int zone, s64 hint,
-		s64 count, s64 *start, s64 *length)
+/* Find only the free run starting at @hint; do not change allocation zones. */
+int ntfs_free_space_find_at(struct ntfs_volume *vol, s64 hint, s64 end,
+		s64 count, s64 *length)
 {
 	struct ntfs_free_space *space = &vol->free_space;
-	struct ntfs_cluster_range ranges[2];
+	struct address_space *mapping = vol->lcnbmp_ino->i_mapping;
 	struct rb_node *node;
-	unsigned int i, nr_ranges = ntfs_get_allocation_ranges(vol, zone, ranges);
-	int err;
+	s64 pos = hint;
 
 	lockdep_assert_held_write(&vol->lcnbmp_lock);
 	*length = 0;
+	if (hint < 0 || hint >= end)
+		return 0;
 	node = ntfs_free_extent_before(space, hint);
 	if (node) {
 		struct ntfs_free_extent *extent;
 
 		extent = rb_entry(node, struct ntfs_free_extent, start_node);
-		for (i = 0; i < nr_ranges; i++) {
-			if (hint < ranges[i].start || hint >= ranges[i].end)
-				continue;
-			if (extent->start + extent->length <= hint)
-				break;
-			*start = hint;
-			*length = min(extent->start + extent->length,
-				      ranges[i].end) - hint;
+		if (extent->start + extent->length > hint) {
+			*length = min(extent->start + extent->length, end) - hint;
 			*length = min(*length, count);
 			return 0;
 		}
 	}
+	if (space->complete)
+		return 0;
+
+	/* A missing cached extent may still contain a valid adjacency hint. */
+	end = hint + min(count, end - hint);
+	while (pos < end) {
+		pgoff_t index = pos >> (PAGE_SHIFT + 3);
+		s64 page_start = (s64)index << (PAGE_SHIFT + 3);
+		unsigned int bit = pos - page_start;
+		unsigned int bits = min_t(s64, end - page_start,
+					 PAGE_SIZE * BITS_PER_BYTE);
+		struct folio *folio;
+		unsigned long *bitmap;
+		unsigned int used_bit;
+
+		if (!vol->lcn_empty_bits_per_page[index])
+			break;
+		folio = read_mapping_folio(mapping, index, NULL);
+		if (IS_ERR(folio))
+			return PTR_ERR(folio);
+		folio_lock(folio);
+		bitmap = kmap_local_folio(folio, 0);
+		used_bit = find_next_bit_le(bitmap, bits, bit);
+		ntfs_free_space_add(space, pos, used_bit - bit);
+		kunmap_local(bitmap);
+		folio_unlock(folio);
+		folio_put(folio);
+		*length += used_bit - bit;
+		if (used_bit < bits)
+			break;
+		pos = page_start + bits;
+	}
+	return 0;
+}
+
+/* The allocator supplies one zone pass; the cache only selects an extent. */
+int ntfs_free_space_find(struct ntfs_volume *vol, s64 begin, s64 end,
+		s64 count, s64 *start, s64 *length)
+{
+	struct ntfs_free_space *space = &vol->free_space;
+	struct ntfs_cluster_range range = { .start = begin, .end = end };
+	struct rb_node *node;
+	int err;
+
+	lockdep_assert_held_write(&vol->lcnbmp_lock);
+	*length = 0;
+	if (begin >= end)
+		return 0;
 
 	for (node = rb_first(&space->by_length); node; node = rb_next(node)) {
 		struct ntfs_free_extent *extent;
@@ -348,23 +377,18 @@ int ntfs_free_space_find(struct ntfs_volume *vol, int zone, s64 hint,
 		extent = rb_entry(node, struct ntfs_free_extent, length_node);
 		if (extent->length <= *length)
 			break;
-		for (i = 0; i < nr_ranges; i++)
-			ntfs_select_free_extent(extent->start,
-					extent->start + extent->length, &ranges[i],
-					start, length);
+		ntfs_select_free_extent(extent->start,
+				extent->start + extent->length, &range,
+				start, length);
 	}
 	if (*length >= count || space->complete) {
 		*length = min(*length, count);
 		return 0;
 	}
 
-	for (i = 0; i < nr_ranges; i++) {
-		err = ntfs_free_space_scan(vol, &ranges[i], count, start, length);
-		if (err)
-			return err;
-		if (*length >= count)
-			break;
-	}
+	err = ntfs_free_space_scan(vol, &range, count, start, length);
+	if (err)
+		return err;
 	*length = min(*length, count);
 	return 0;
 }

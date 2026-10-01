@@ -63,19 +63,70 @@ int ntfs_cluster_free_from_rl_nolock(struct ntfs_volume *vol,
 	return ret;
 }
 
-static void ntfs_update_cluster_hint(struct ntfs_volume *vol, s64 start,
-		s64 length)
-{
-	s64 end = start + length;
+enum ntfs_cluster_zone {
+	NTFS_ZONE_MFT = 1,
+	NTFS_ZONE_DATA1 = 2,
+	NTFS_ZONE_DATA2 = 4,
+};
 
-	if (start >= vol->mft_zone_start && start < vol->mft_zone_end) {
-		vol->mft_zone_pos = end < vol->mft_zone_end ? end :
-				   vol->mft_zone_start;
-	} else if (start >= vol->mft_zone_end) {
-		vol->data1_zone_pos = end < vol->nr_clusters ? end :
-				     vol->mft_zone_end;
-	} else {
-		vol->data2_zone_pos = end < vol->mft_zone_start ? end : 0;
+static int ntfs_cluster_zone_at(struct ntfs_volume *vol, s64 lcn)
+{
+	if (lcn < vol->mft_zone_start)
+		return NTFS_ZONE_DATA2;
+	if (lcn < vol->mft_zone_end)
+		return NTFS_ZONE_MFT;
+	return NTFS_ZONE_DATA1;
+}
+
+static void ntfs_get_cluster_zone(struct ntfs_volume *vol, int zone,
+		s64 *begin, s64 *end, s64 *hint)
+{
+	switch (zone) {
+	case NTFS_ZONE_MFT:
+		*begin = vol->mft_zone_start;
+		*end = vol->mft_zone_end;
+		*hint = vol->mft_zone_pos;
+		break;
+	case NTFS_ZONE_DATA1:
+		*begin = vol->mft_zone_end;
+		*end = vol->nr_clusters;
+		*hint = vol->data1_zone_pos;
+		break;
+	case NTFS_ZONE_DATA2:
+		*begin = 0;
+		*end = vol->mft_zone_start;
+		*hint = vol->data2_zone_pos;
+		break;
+	default:
+		WARN_ON(1);
+	}
+}
+
+static void ntfs_update_cluster_hint(struct ntfs_volume *vol, int zone,
+		s64 initial_pos, s64 end)
+{
+	switch (zone) {
+	case NTFS_ZONE_MFT:
+		if (end >= vol->mft_zone_end)
+			vol->mft_zone_pos = vol->mft_zone_end ? vol->mft_lcn : 0;
+		else if ((initial_pos >= vol->mft_zone_pos ||
+			  end > vol->mft_zone_pos) && end >= vol->mft_lcn)
+			vol->mft_zone_pos = end;
+		break;
+	case NTFS_ZONE_DATA1:
+		if (end >= vol->nr_clusters)
+			vol->data1_zone_pos = vol->mft_zone_end;
+		else if ((initial_pos >= vol->data1_zone_pos ||
+			  end > vol->data1_zone_pos) && end >= vol->mft_zone_end)
+			vol->data1_zone_pos = end;
+		break;
+	case NTFS_ZONE_DATA2:
+		if (end >= vol->mft_zone_start)
+			vol->data2_zone_pos = 0;
+		else if (initial_pos >= vol->data2_zone_pos ||
+			 end > vol->data2_zone_pos)
+			vol->data2_zone_pos = end;
+		break;
 	}
 }
 
@@ -83,17 +134,16 @@ static bool ntfs_shrink_mft_zone(struct ntfs_volume *vol)
 {
 	s64 length = vol->mft_zone_end - vol->mft_zone_start;
 
-	if (!length)
+	if (length <= 0)
 		return false;
 	length >>= 1;
-	if (length) {
+	if (length)
 		vol->mft_zone_end = vol->mft_zone_start + length;
-		if (vol->mft_zone_pos >= vol->mft_zone_end)
-			vol->mft_zone_pos = vol->mft_zone_start;
-	} else {
-		vol->mft_zone_start = vol->mft_zone_end = 0;
-		vol->mft_zone_pos = vol->data2_zone_pos = 0;
-	}
+	else
+		vol->mft_zone_start = vol->mft_zone_end =
+			vol->data2_zone_pos = 0;
+	if (vol->mft_zone_pos >= vol->mft_zone_end)
+		vol->mft_zone_pos = vol->mft_zone_end ? vol->mft_lcn : 0;
 	vol->data1_zone_pos = vol->mft_zone_end;
 	return true;
 }
@@ -110,10 +160,16 @@ static bool ntfs_shrink_mft_zone(struct ntfs_volume *vol)
  * @is_contig: return only one contiguous run, which may be shorter than @count
  * @is_dealloc: consume delayed-allocation reservations
  *
- * Search the free extent cache before scanning the bitmap. MFT allocations
- * prefer the reserved zone and may fall back to data space. Data allocations
- * use the reserved zone only after exhausting data space and shrinking the
- * reservation. Mark bitmap ranges and update counters once per extent.
+ * Keep the MFT, DATA1 (after the reservation), and DATA2 (before it) search
+ * order. A caller-supplied LCN selects the initial zone, including when the
+ * MFT or its bitmap has grown outside its usual zone. If that hint cannot
+ * satisfy the request, resume at the zone's cursor, wrap within that zone,
+ * then switch zones. Without a hint inside the MFT zone, DATA allocations use
+ * the reservation only after exhausting both data zones and halving it.
+ *
+ * Search the free extent cache before scanning the bitmap, choosing large
+ * extents within each zone pass. Mark bitmap ranges and update counters once
+ * per extent. Successful explicit hints do not move the volume's cursors.
  *
  * Return: allocated runlist, or an error pointer. All committed extents are
  * rolled back on failure. The caller must not hold lcnbmp_lock.
@@ -125,9 +181,11 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 {
 	struct runlist_element *rl = NULL;
 	s64 allocated = 0, free_clusters, hint = start_lcn;
+	s64 zone_begin, zone_start, zone_end, initial_pos, zone_hint;
 	size_t nr_runs = 0, capacity = 0;
 	unsigned int memalloc_flags;
-	int err = 0;
+	int search_zone, done_zones, pass, err = 0;
+	bool used_zone_pos = start_lcn < 0;
 
 	if (start_vcn < 0 || count <= 0 || count > S64_MAX - start_vcn ||
 	    start_lcn < LCN_HOLE ||
@@ -148,24 +206,71 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 	if (hint < 0)
 		hint = zone == MFT_ZONE ? vol->mft_zone_pos : vol->data1_zone_pos;
 
-	while (allocated < count) {
-		s64 start, length;
+	search_zone = ntfs_cluster_zone_at(vol, hint);
+	done_zones = search_zone == NTFS_ZONE_MFT ? 0 : NTFS_ZONE_MFT;
+	ntfs_get_cluster_zone(vol, search_zone, &zone_begin, &zone_end,
+			      &zone_hint);
+	zone_start = initial_pos = hint;
+	pass = hint == zone_begin ? 2 : 1;
 
-		err = ntfs_free_space_find(vol, zone, hint, count - allocated,
-					   &start, &length);
+	while (allocated < count) {
+		s64 start = hint, length;
+
+		err = ntfs_free_space_find_at(vol, hint, zone_end,
+					      count - allocated, &length);
 		if (err)
 			goto rollback;
-		if (!length && zone == MFT_ZONE) {
-			err = ntfs_free_space_find(vol, DATA_ZONE, hint,
+		if (!length && !used_zone_pos) {
+			/* The caller's adjacency hint ended; use the zone cursor. */
+			used_zone_pos = true;
+			zone_start = hint = zone_hint;
+			pass = hint == zone_begin ? 2 : 1;
+			continue;
+		}
+		if (!length) {
+			err = ntfs_free_space_find(vol, zone_start, zone_end,
 						   count - allocated, &start, &length);
 			if (err)
 				goto rollback;
 		}
 		if (!length) {
-			if (zone == DATA_ZONE && ntfs_shrink_mft_zone(vol))
+			if (pass == 1) {
+				/* Wrap to the part before this zone's starting cursor. */
+				pass = 2;
+				zone_end = min(zone_start, zone_end);
+				zone_start = hint = zone_begin;
 				continue;
-			err = -ENOSPC;
-			goto rollback;
+			}
+			if (nr_runs && used_zone_pos)
+				ntfs_update_cluster_hint(vol, search_zone, initial_pos,
+						rl[nr_runs - 1].lcn +
+						rl[nr_runs - 1].length);
+			done_zones |= search_zone;
+			if (done_zones != (NTFS_ZONE_MFT | NTFS_ZONE_DATA1 |
+					   NTFS_ZONE_DATA2)) {
+				search_zone = search_zone == NTFS_ZONE_DATA1 ?
+					NTFS_ZONE_DATA2 : NTFS_ZONE_DATA1;
+				ntfs_get_cluster_zone(vol, search_zone, &zone_begin,
+						      &zone_end, &zone_hint);
+				if (zone_hint >= zone_end)
+					zone_hint = zone_begin;
+				zone_start = initial_pos = hint = zone_hint;
+				pass = hint == zone_begin ? 2 : 1;
+				continue;
+			}
+
+			/* DATA may reclaim only the newly released MFT tail. */
+			zone_end = vol->mft_zone_end;
+			if (zone == MFT_ZONE || !ntfs_shrink_mft_zone(vol)) {
+				err = -ENOSPC;
+				goto rollback;
+			}
+			search_zone = NTFS_ZONE_DATA1;
+			zone_begin = zone_start = initial_pos = hint =
+				zone_hint = vol->data1_zone_pos;
+			pass = 2;
+			done_zones &= ~NTFS_ZONE_DATA1;
+			continue;
 		}
 
 		/* Reserve space for a new run and its terminator before marking. */
@@ -207,11 +312,12 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 		rl[nr_runs].vcn = start_vcn + allocated;
 		rl[nr_runs].lcn = is_extension ? LCN_ENOENT : LCN_RL_NOT_MAPPED;
 		rl[nr_runs].length = 0;
-		ntfs_update_cluster_hint(vol, start, length);
 		hint = start + length;
 		if (is_contig)
 			break;
 	}
+	if (used_zone_pos)
+		ntfs_update_cluster_hint(vol, search_zone, initial_pos, hint);
 	if (is_dealloc)
 		ntfs_release_dirty_clusters(vol, allocated);
 	goto out;
