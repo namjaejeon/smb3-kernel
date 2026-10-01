@@ -4249,6 +4249,1028 @@ out:
 	return rc;
 }
 
+/* CREATE context state shared by the open and response helpers. */
+struct smb2_create_contexts {
+	struct durable_info dh_info;
+	struct lease_ctx_info *lc;
+	struct create_ea_buf_req *ea_buf;
+	__le32 maximal_access;
+	u64 alloc_size;
+	u64 aapl_req_bitmap;
+	u64 aapl_client_caps;
+	umode_t posix_mode;
+	int req_op_level;
+	bool maximal_access_ctxt;
+	bool query_disk_id;
+	bool posix_ctxt;
+	bool aapl_ctxt;
+};
+
+static int smb2_parse_posix_context(struct ksmbd_work *work,
+				    struct smb2_create_req *req,
+				    struct smb2_create_rsp *rsp,
+				    struct smb2_create_contexts *ctx)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_tree_connect *tcon = work->tcon;
+	struct ksmbd_share_config *share = tcon->share_conf;
+	struct create_context *context;
+	struct create_posix *posix;
+
+	if (!req->CreateContextsOffset)
+		return 0;
+
+	context = smb2_find_context_vals(req, SMB2_CREATE_TAG_POSIX, 16);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (!context)
+		return 0;
+
+	if (conn->dialect != SMB311_PROT_ID) {
+		rsp->hdr.Status = STATUS_INVALID_INFO_CLASS;
+		return -ENOTTY;
+	}
+	if (!tcon->posix_extensions ||
+	    test_share_config_flag(share, KSMBD_SHARE_FLAG_PIPE))
+		return -EOPNOTSUPP;
+	if (le16_to_cpu(context->DataOffset) +
+	    le32_to_cpu(context->DataLength) < sizeof(struct create_posix) - 4)
+		return -EINVAL;
+
+	ksmbd_debug(SMB, "get posix context\n");
+	posix = (struct create_posix *)context;
+	ctx->posix_mode = le32_to_cpu(posix->Mode);
+	ctx->posix_ctxt = true;
+	return 0;
+}
+
+static int smb2_parse_lease_context(struct ksmbd_work *work,
+				    struct smb2_create_req *req,
+				    struct smb2_create_contexts *ctx)
+{
+	struct ksmbd_conn *conn = work->conn;
+	int rc;
+
+	ctx->lc = parse_lease_state(req);
+	if (IS_ERR(ctx->lc)) {
+		rc = PTR_ERR(ctx->lc);
+		ctx->lc = NULL;
+		return rc;
+	}
+	if (ctx->lc && ctx->lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
+		kfree(ctx->lc);
+		ctx->lc = NULL;
+		if (ctx->req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
+			ctx->req_op_level = SMB2_OPLOCK_LEVEL_NONE;
+	}
+
+	return 0;
+}
+
+static int smb2_check_create_request(struct smb2_create_req *req,
+				     struct smb2_create_rsp *rsp)
+{
+	if (le32_to_cpu(req->ImpersonationLevel) > le32_to_cpu(IL_DELEGATE)) {
+		pr_err("Invalid impersonationlevel : 0x%x\n",
+		       le32_to_cpu(req->ImpersonationLevel));
+		rsp->hdr.Status = STATUS_BAD_IMPERSONATION_LEVEL;
+		return -EIO;
+	}
+
+	if (req->CreateOptions && !(req->CreateOptions & CREATE_OPTIONS_MASK_LE)) {
+		pr_err("Invalid create options : 0x%x\n",
+		       le32_to_cpu(req->CreateOptions));
+		return -EINVAL;
+	}
+
+	if (req->CreateOptions & FILE_SEQUENTIAL_ONLY_LE &&
+	    req->CreateOptions & FILE_RANDOM_ACCESS_LE)
+		req->CreateOptions &= ~FILE_SEQUENTIAL_ONLY_LE;
+
+	if (req->CreateOptions &
+	    (FILE_OPEN_BY_FILE_ID_LE | CREATE_TREE_CONNECTION |
+	     FILE_RESERVE_OPFILTER_LE))
+		return -EOPNOTSUPP;
+
+	if (req->CreateOptions & FILE_DIRECTORY_FILE_LE &&
+	    req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE)
+		return -EINVAL;
+
+	if (le32_to_cpu(req->CreateDisposition) >
+	    le32_to_cpu(FILE_OVERWRITE_IF_LE)) {
+		pr_err("Invalid create disposition : 0x%x\n",
+		       le32_to_cpu(req->CreateDisposition));
+		return -EINVAL;
+	}
+
+	if (!(req->DesiredAccess & DESIRED_ACCESS_MASK)) {
+		pr_err("Invalid desired access : 0x%x\n",
+		       le32_to_cpu(req->DesiredAccess));
+		return -EACCES;
+	}
+
+	if (req->DesiredAccess == FILE_SYNCHRONIZE_LE &&
+	    req->CreateDisposition == FILE_OPEN_IF_LE &&
+	    !req->FileAttributes)
+		return -EACCES;
+
+	if (req->FileAttributes &&
+	    (req->FileAttributes & ~cpu_to_le32(SMB2_CREATE_FILE_ATTRIBUTE_MASK))) {
+		pr_err("Invalid file attribute : 0x%x\n",
+		       le32_to_cpu(req->FileAttributes));
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int smb2_parse_create_contexts(struct smb2_create_req *req,
+				      struct smb2_create_rsp *rsp,
+				      struct smb2_create_contexts *ctx)
+{
+	struct create_context *context;
+
+	if (!req->CreateContextsOffset)
+		return 0;
+
+	context = smb2_find_context_vals(req, SMB2_CREATE_EA_BUFFER, 4);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (context) {
+		ctx->ea_buf = (struct create_ea_buf_req *)context;
+		if (le16_to_cpu(context->DataOffset) +
+		    le32_to_cpu(context->DataLength) < sizeof(struct create_ea_buf_req))
+			return -EINVAL;
+		if (req->CreateOptions & FILE_NO_EA_KNOWLEDGE_LE) {
+			rsp->hdr.Status = STATUS_ACCESS_DENIED;
+			return -EACCES;
+		}
+	}
+
+	context = smb2_find_context_vals(req,
+					 SMB2_CREATE_QUERY_MAXIMAL_ACCESS_REQUEST, 4);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (context) {
+		ksmbd_debug(SMB, "get query maximal access context\n");
+		ctx->maximal_access_ctxt = true;
+	}
+
+	context = smb2_find_context_vals(req, SMB2_CREATE_TIMEWARP_REQUEST, 4);
+	if (IS_ERR(context))
+		return PTR_ERR(context);
+	if (context) {
+		ksmbd_debug(SMB, "get timewarp context\n");
+		return -EBADF;
+	}
+
+	return 0;
+}
+
+static int smb2_lookup_create_path(struct ksmbd_work *work,
+				   struct smb2_create_req *req,
+				   struct smb2_create_rsp *rsp,
+				   char *name, struct path *path,
+				   bool *file_present)
+{
+	struct ksmbd_tree_connect *tcon = work->tcon;
+	int rc;
+
+	rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
+				 path, 1);
+
+	/*
+	 * A durable handle opened with delete-on-close is preserved across a
+	 * disconnect so it can be reclaimed by a durable reconnect.  When a new
+	 * delete-on-close open for the same name arrives instead, the
+	 * disconnected handle must give way: close it so its delete-on-close
+	 * removes the file, then re-resolve so this open can create a fresh one.
+	 */
+	if (!rc && (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) &&
+	    (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
+	     req->CreateDisposition == FILE_OPEN_IF_LE) &&
+	    ksmbd_close_disconnected_durable_delete_on_close(path->dentry)) {
+		path_put(path);
+		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
+					 path, 1);
+	}
+
+	if (!rc) {
+		*file_present = true;
+
+		if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
+			struct xattr_dos_attrib da;
+
+			/*
+			 * If file exists with under flags, return access
+			 * denied error.
+			 */
+			if (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
+			    req->CreateDisposition == FILE_OPEN_IF_LE) {
+				return -EACCES;
+			}
+
+			if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
+				ksmbd_debug(SMB,
+					    "User does not have write permission\n");
+				return -EACCES;
+			}
+
+			if (test_share_config_flag(tcon->share_conf,
+						   KSMBD_SHARE_FLAG_STORE_DOS_ATTRS) &&
+			    ksmbd_vfs_get_dos_attrib_xattr(mnt_idmap(path->mnt),
+							   path->dentry, &da) > 0 &&
+			    da.attr & FILE_ATTRIBUTE_READONLY) {
+				rsp->hdr.Status = STATUS_CANNOT_DELETE;
+				return -EACCES;
+			}
+		} else if (d_is_symlink(path->dentry)) {
+			return -EACCES;
+		}
+	} else {
+		if (rc != -ENOENT)
+			return rc;
+		ksmbd_debug(SMB, "can not get linux path for %s, rc = %d\n",
+			    name, rc);
+	}
+
+	return 0;
+}
+
+static int smb2_check_create_path(struct smb2_create_req *req,
+				  struct smb2_create_rsp *rsp,
+				  const struct path *path, const char *name,
+				  const char *stream_name, int s_type,
+				  bool file_present)
+{
+	int rc = 0;
+
+	if (!file_present && req->CreateOptions & FILE_DELETE_ON_CLOSE_LE &&
+	    req->FileAttributes & FILE_ATTRIBUTE_READONLY_LE) {
+		rsp->hdr.Status = STATUS_CANNOT_DELETE;
+		return -EACCES;
+	}
+
+	/*
+	 * An explicit ::$DATA suffix names the unnamed data stream and is
+	 * canonicalized to a NULL stream name (base file), but the request
+	 * still has to be validated against the data-stream type, e.g. opening
+	 * <dir>::$DATA with FILE_DIRECTORY_FILE must fail with
+	 * STATUS_NOT_A_DIRECTORY.
+	 */
+	if (stream_name || s_type == DATA_STREAM) {
+		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
+			if (s_type == DATA_STREAM) {
+				rc = -EIO;
+				rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
+			}
+		} else {
+			if (file_present && S_ISDIR(d_inode(path->dentry)->i_mode) &&
+			    !stream_name && s_type == DATA_STREAM) {
+				rc = -EIO;
+				rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
+			}
+		}
+
+		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE &&
+		    req->FileAttributes & FILE_ATTRIBUTE_NORMAL_LE) {
+			rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
+			rc = -EIO;
+		}
+
+		if (rc < 0)
+			return rc;
+	}
+
+	if (file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
+	    S_ISDIR(d_inode(path->dentry)->i_mode) &&
+	    !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
+		ksmbd_debug(SMB, "open() argument is a directory: %s, %x\n",
+			    name, req->CreateOptions);
+		rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
+		return -EIO;
+	}
+
+	if (file_present && (req->CreateOptions & FILE_DIRECTORY_FILE_LE) &&
+	    !(req->CreateDisposition == FILE_CREATE_LE) &&
+	    !S_ISDIR(d_inode(path->dentry)->i_mode)) {
+		rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
+		return -EIO;
+	}
+
+	if (!stream_name && file_present &&
+	    req->CreateDisposition == FILE_CREATE_LE)
+		return -EEXIST;
+
+	return 0;
+}
+
+static int smb2_check_create_access(struct ksmbd_work *work,
+				    struct smb2_create_req *req,
+				    const struct path *path,
+				    struct smb2_create_contexts *ctx,
+				    bool file_present, __le32 *daccess,
+				    bool *already_permitted)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_session *sess = work->sess;
+	struct mnt_idmap *idmap = file_present ? mnt_idmap(path->mnt) : NULL;
+	int rc;
+
+	*daccess = smb_map_generic_desired_access(req->DesiredAccess);
+
+	if (file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
+		rc = smb_check_perm_dacl(conn, path, daccess,
+					 req->DesiredAccess,
+					 sess->user->uid, false);
+		if (rc)
+			return rc;
+
+		if (ctx->maximal_access_ctxt) {
+			ctx->maximal_access = FILE_MAXIMAL_ACCESS_LE;
+			rc = smb_check_perm_dacl(conn, path, &ctx->maximal_access,
+						 0, sess->user->uid, false);
+			if (rc)
+				return rc;
+
+			/*
+			 * smb_check_perm_dacl() returns success without
+			 * touching *pdaccess when the object has no stored
+			 * NT ACL, leaving maximal_access as the
+			 * FILE_MAXIMAL_ACCESS_LE request sentinel instead of
+			 * a real access mask.
+			 */
+			if (ctx->maximal_access == FILE_MAXIMAL_ACCESS_LE)
+				ksmbd_vfs_query_maximal_access(idmap, path->dentry,
+							       &ctx->maximal_access);
+		}
+	}
+
+	if (*daccess & FILE_MAXIMAL_ACCESS_LE) {
+		if (!file_present) {
+			*daccess = cpu_to_le32(GENERIC_ALL_FLAGS);
+		} else {
+			ksmbd_vfs_query_maximal_access(idmap, path->dentry, daccess);
+			*already_permitted = true;
+		}
+		ctx->maximal_access = *daccess;
+	}
+
+	return 0;
+}
+
+static int smb2_init_open_file(struct ksmbd_work *work,
+			       struct smb2_create_req *req, struct ksmbd_file *fp,
+			       const struct smb2_create_contexts *ctx, __le32 daccess)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_session *sess = work->sess;
+	int rc;
+
+	/*
+	 * Publish the client and create GUID before an oplock/lease break can
+	 * make this CREATE pending.  A replay of that in-flight CREATE must find
+	 * this FP_NEW handle and fail with STATUS_FILE_NOT_AVAILABLE instead of
+	 * waiting on the same break again.
+	 */
+	memcpy(fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
+	if (ctx->dh_info.app_instance_id) {
+		memcpy(fp->app_instance_id, ctx->dh_info.AppInstanceId,
+		       SMB2_CREATE_GUID_SIZE);
+		fp->has_app_instance_id = true;
+	}
+	if (ctx->dh_info.app_instance_version_valid) {
+		fp->app_instance_version_high =
+			ctx->dh_info.app_instance_version_high;
+		fp->app_instance_version_low = ctx->dh_info.app_instance_version_low;
+		fp->app_instance_version_valid = true;
+	}
+	if (ctx->dh_info.CreateGuid) {
+		memcpy(fp->create_guid, ctx->dh_info.CreateGuid, SMB2_CREATE_GUID_SIZE);
+		fp->durable_replay_consumed = ctx->dh_info.replay_consumed;
+		rc = ksmbd_vfs_set_durable_owner(fp, sess->user);
+		if (rc)
+			return rc;
+	}
+
+	fp->cdoption = req->CreateDisposition;
+	fp->create_file_attributes = req->FileAttributes;
+	fp->daccess = daccess;
+	fp->saccess = req->ShareAccess;
+	fp->coption = req->CreateOptions;
+
+	return 0;
+}
+
+static int smb2_create_file_acl(struct ksmbd_work *work,
+				struct smb2_create_req *req,
+				const struct path *path)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_session *sess = work->sess;
+	struct mnt_idmap *idmap = mnt_idmap(path->mnt);
+	struct inode *inode = d_inode(path->dentry);
+	int posix_acl_rc, rc;
+
+	posix_acl_rc = ksmbd_vfs_inherit_posix_acl(idmap,
+						   path,
+						   d_inode(path->dentry->d_parent));
+	if (posix_acl_rc)
+		ksmbd_debug(SMB, "inherit posix acl failed : %d\n", posix_acl_rc);
+
+	rc = smb2_create_sd_buffer(work, req, path);
+	if (rc && rc != -ENOENT)
+		return rc;
+
+	if (rc == -ENOENT) {
+		if (test_share_config_flag(work->tcon->share_conf,
+					   KSMBD_SHARE_FLAG_ACL_XATTR)) {
+			rc = smb_inherit_dacl(conn, path, sess->user->uid,
+					      sess->user->gid);
+		}
+		if (rc) {
+			if (posix_acl_rc)
+				ksmbd_vfs_set_init_posix_acl(idmap,
+							     path);
+
+			if (test_share_config_flag(work->tcon->share_conf,
+						   KSMBD_SHARE_FLAG_ACL_XATTR)) {
+				struct smb_fattr fattr;
+				struct smb_ntsd *pntsd;
+				int pntsd_size;
+				size_t scratch_len;
+
+				rc = ksmbd_acls_fattr(&fattr, idmap, inode);
+				if (rc)
+					return rc;
+
+				scratch_len = smb_acl_sec_desc_scratch_len(&fattr,
+									   NULL, 0,
+									   OWNER_SECINFO |
+									   GROUP_SECINFO |
+									   DACL_SECINFO);
+				if (!scratch_len || scratch_len == SIZE_MAX) {
+					rc = -EFBIG;
+					posix_acl_release(fattr.cf_acls);
+					posix_acl_release(fattr.cf_dacls);
+					return rc;
+				}
+
+				pntsd = kvzalloc(scratch_len, KSMBD_DEFAULT_GFP);
+				if (!pntsd) {
+					rc = -ENOMEM;
+					posix_acl_release(fattr.cf_acls);
+					posix_acl_release(fattr.cf_dacls);
+					return rc;
+				}
+
+				rc = build_sec_desc(idmap,
+						    pntsd, NULL, 0,
+						    OWNER_SECINFO |
+						    GROUP_SECINFO |
+						    DACL_SECINFO,
+						    &pntsd_size, &fattr);
+				posix_acl_release(fattr.cf_acls);
+				posix_acl_release(fattr.cf_dacls);
+				if (rc) {
+					kvfree(pntsd);
+					return rc;
+				}
+
+				rc = ksmbd_vfs_set_sd_xattr(conn,
+							    idmap,
+							    path,
+							    pntsd,
+							    pntsd_size,
+							    false);
+				kvfree(pntsd);
+				if (rc)
+					pr_err("failed to store ntacl in xattr : %d\n",
+					       rc);
+			}
+		}
+	}
+	return 0;
+}
+
+static int smb2_open_oplock(struct ksmbd_work *work,
+			    struct smb2_create_req *req, struct ksmbd_file *fp,
+			    struct smb2_create_contexts *ctx, int open_flags,
+			    bool created, const char *name)
+{
+	struct ksmbd_conn *conn = work->conn;
+	int share_ret, rc = 0;
+
+	share_ret = ksmbd_smb_check_shared_mode(fp->filp, fp);
+	if (!test_share_config_flag(work->tcon->share_conf, KSMBD_SHARE_FLAG_OPLOCKS) ||
+	    (ctx->req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
+	     !(conn->vals->req_capabilities & SMB2_GLOBAL_CAP_LEASING))) {
+		if (share_ret < 0 && !S_ISDIR(file_inode(fp->filp)->i_mode))
+			return share_ret;
+	} else {
+		if (created && !ctx->lc)
+			smb_send_parent_lease_break_noti(fp, NULL);
+
+		if (ctx->req_op_level == SMB2_OPLOCK_LEVEL_LEASE && ctx->lc) {
+			if (S_ISDIR(file_inode(fp->filp)->i_mode)) {
+				ctx->lc->req_state &= ~SMB2_LEASE_WRITE_CACHING_LE;
+				ctx->lc->is_dir = true;
+			}
+
+			/*
+			 * Compare parent lease using parent key. If there is no
+			 * a lease that has same parent key, Send lease break
+			 * notification.
+			 */
+			smb_send_parent_lease_break_noti(fp, ctx->lc);
+
+			ctx->req_op_level = smb2_map_lease_to_oplock(ctx->lc->req_state);
+			ksmbd_debug(SMB,
+				    "lease req for(%s) req oplock state 0x%x, lease state 0x%x\n",
+				    name, ctx->req_op_level, ctx->lc->req_state);
+			rc = find_same_lease_key(conn, fp->f_ci, ctx->lc);
+			if (rc)
+				return rc;
+		} else if (open_flags == O_RDONLY &&
+			   (ctx->req_op_level == SMB2_OPLOCK_LEVEL_BATCH ||
+			    ctx->req_op_level == SMB2_OPLOCK_LEVEL_EXCLUSIVE))
+			ctx->req_op_level = SMB2_OPLOCK_LEVEL_II;
+
+		rc = smb_grant_oplock(work, ctx->req_op_level,
+				      fp->persistent_id, fp,
+				      le32_to_cpu(req->hdr.Id.SyncId.TreeId),
+				      ctx->lc, share_ret,
+				      smb3_hdr_replay(&req->hdr));
+		if (rc < 0)
+			return rc;
+	}
+
+	return rc;
+}
+
+static int smb2_apply_create_contexts(struct ksmbd_work *work,
+				      struct smb2_create_req *req,
+				      struct ksmbd_file *fp,
+				      struct smb2_create_contexts *ctx)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_share_config *share = work->tcon->share_conf;
+	struct create_context *context;
+
+	if (req->CreateContextsOffset) {
+		struct create_alloc_size_req *az_req;
+
+		az_req = (struct create_alloc_size_req *)smb2_find_context_vals(req,
+					SMB2_CREATE_ALLOCATION_SIZE, 4);
+		if (IS_ERR(az_req)) {
+			return PTR_ERR(az_req);
+		} else if (az_req) {
+			int err;
+
+			if (le16_to_cpu(az_req->ccontext.DataOffset) +
+			    le32_to_cpu(az_req->ccontext.DataLength) <
+			    sizeof(struct create_alloc_size_req)) {
+				return -EINVAL;
+			}
+			ctx->alloc_size = le64_to_cpu(az_req->AllocationSize);
+			fp->allocation_size_set = true;
+			ksmbd_debug(SMB,
+				    "request smb2 create allocate size : %llu\n",
+				    ctx->alloc_size);
+			/*
+			 * fp->filp is the base file's data fork for a stream
+			 * handle (streams are xattr-backed on the same
+			 * underlying file) -- fallocate has no meaning for a
+			 * stream and would otherwise pre-allocate storage on
+			 * the base file's data instead.
+			 */
+			if (!ksmbd_stream_fd(fp)) {
+				smb_break_all_levII_oplock(work, fp, 1);
+				err = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0,
+						    ctx->alloc_size);
+				if (err < 0)
+					ksmbd_debug(SMB,
+						    "vfs_fallocate is failed : %d\n",
+						    err);
+			}
+		}
+
+		context = smb2_find_context_vals(req, SMB2_CREATE_QUERY_ON_DISK_ID, 4);
+		if (IS_ERR(context)) {
+			return PTR_ERR(context);
+		} else if (context) {
+			ksmbd_debug(SMB, "get query on disk id context\n");
+			ctx->query_disk_id = 1;
+		}
+
+		if (test_share_config_flag(share, KSMBD_SHARE_FLAG_TIME_MACHINE)) {
+			context = smb2_find_context_vals(req, SMB2_CREATE_AAPL, 4);
+			if (IS_ERR(context)) {
+				return PTR_ERR(context);
+			} else if (context) {
+				struct aapl_server_query_req *aapl_req;
+
+				if (le32_to_cpu(context->DataLength) <
+				    sizeof(struct aapl_server_query_req)) {
+					return -EINVAL;
+				}
+
+				aapl_req = (struct aapl_server_query_req *)
+					((char *)context +
+					 le16_to_cpu(context->DataOffset));
+				if (le32_to_cpu(aapl_req->cmd) ==
+				    SMB2_CRTCTX_AAPL_SERVER_QUERY) {
+					conn->is_aapl = true;
+					ctx->aapl_ctxt = true;
+					ctx->aapl_req_bitmap = le64_to_cpu(aapl_req->req_bitmap);
+					ctx->aapl_client_caps = le64_to_cpu(aapl_req->client_caps);
+				}
+			}
+		} else if (conn->is_aapl == false) {
+			context = smb2_find_context_vals(req, SMB2_CREATE_AAPL, 4);
+			if (IS_ERR(context)) {
+				return PTR_ERR(context);
+			} else if (context)
+				conn->is_aapl = true;
+		}
+	}
+
+	return 0;
+}
+
+static int smb2_init_file_attributes(struct ksmbd_work *work,
+				     struct smb2_create_req *req,
+				     struct ksmbd_file *fp, struct kstat *stat,
+				     const struct smb2_create_contexts *ctx,
+				     bool created, bool need_truncate)
+{
+	struct ksmbd_tree_connect *tcon = work->tcon;
+	const struct path *path = &fp->filp->f_path;
+	u32 dos_attr;
+	int rc;
+
+	rc = ksmbd_vfs_getattr(path, stat);
+	if (rc)
+		return rc;
+
+	if (stat->result_mask & STATX_BTIME)
+		fp->create_time = ksmbd_UnixTimeToNT(stat->btime);
+	else
+		fp->create_time = ksmbd_UnixTimeToNT(stat->ctime);
+	fp->change_time = ksmbd_UnixTimeToNT(stat->ctime);
+	fp->allocation_size = S_ISDIR(stat->mode) ? 0 :
+		(ctx->alloc_size ?: stat->blocks << 9);
+	if (created || fp->f_ci->m_fattr == 0)
+		fp->f_ci->m_fattr =
+			cpu_to_le32(smb2_get_dos_mode(stat, le32_to_cpu(req->FileAttributes)));
+
+	if (!created)
+		smb2_update_xattrs(tcon, path, fp);
+	if (need_truncate && req->FileAttributes) {
+		dos_attr = le32_to_cpu(req->FileAttributes);
+		fp->f_ci->m_fattr =
+			cpu_to_le32(smb2_get_dos_mode(stat, dos_attr));
+		smb2_new_xattrs(tcon, path, fp);
+	}
+
+	ksmbd_vfs_update_compressed_fattr(path->dentry, &fp->f_ci->m_fattr);
+
+	if (created) {
+		if (fp->coption & FILE_NO_COMPRESSION_LE) {
+			rc = ksmbd_vfs_set_compression_create(work, fp,
+							      COMPRESSION_FORMAT_NONE);
+			if (rc)
+				fp->f_ci->m_fattr &= ~FILE_ATTRIBUTE_COMPRESSED_LE;
+		} else if (smb2_parent_compressed(tcon, path)) {
+			rc = ksmbd_vfs_set_compression_create(work, fp,
+							      COMPRESSION_FORMAT_LZNT1);
+			if (rc)
+				fp->f_ci->m_fattr |= FILE_ATTRIBUTE_COMPRESSED_LE;
+		}
+	}
+
+	if (created)
+		smb2_new_xattrs(tcon, path, fp);
+
+	return 0;
+}
+
+static void smb2_set_durable_handle(struct ksmbd_work *work,
+				    struct ksmbd_file *fp,
+				    const struct durable_info *dh_info)
+{
+	struct ksmbd_conn *conn = work->conn;
+
+	if (dh_info->type == DURABLE_REQ_V2 || dh_info->type == DURABLE_REQ) {
+		if (dh_info->type == DURABLE_REQ_V2 && dh_info->persistent &&
+		    test_share_config_flag(work->tcon->share_conf,
+					   KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY) &&
+		    (conn->vals->req_capabilities &
+			     SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)) {
+			/* MS-SMB2 3.3.5.9.10: a persistent open is durable too. */
+			fp->is_durable = true;
+			fp->is_persistent = true;
+		} else {
+			fp->is_durable = true;
+		}
+		if (dh_info->type == DURABLE_REQ_V2) {
+			if (dh_info->app_instance_id)
+				memcpy(fp->app_instance_id,
+				       dh_info->AppInstanceId,
+				       SMB2_CREATE_GUID_SIZE);
+			if (dh_info->timeout)
+				fp->durable_timeout =
+					min_t(unsigned int, dh_info->timeout,
+					      DURABLE_HANDLE_MAX_TIMEOUT);
+			else
+				fp->durable_timeout = 60000;
+		}
+	}
+}
+
+static void smb2_fill_create_rsp(struct smb2_create_rsp *rsp,
+				 struct ksmbd_file *fp, const struct kstat *stat,
+				 int file_info)
+{
+	u64 time;
+
+	rsp->Flags = 0;
+	rsp->CreateAction = cpu_to_le32(file_info);
+	rsp->CreationTime = cpu_to_le64(fp->create_time);
+	time = ksmbd_UnixTimeToNT(stat->atime);
+	rsp->LastAccessTime = cpu_to_le64(time);
+	time = ksmbd_UnixTimeToNT(stat->mtime);
+	fp->open_mtime = time;
+	rsp->LastWriteTime = cpu_to_le64(time);
+	rsp->ChangeTime = cpu_to_le64(fp->change_time);
+	/*
+	 * The cached allocation size hides filesystem rounding for the
+	 * requested allocation, but it can go stale when the file grows past
+	 * it via writes (e.g. across a durable reconnect). Refresh it once the
+	 * file exceeds the cached value, rounding the end of file up to the
+	 * volume allocation unit (the filesystem block size, matching the
+	 * SectorsPerAllocationUnit/BytesPerSector ksmbd advertises) rather than
+	 * using the raw on-disk block count, which can include filesystem
+	 * preallocation and metadata rounding.
+	 */
+	if (ksmbd_stream_fd(fp)) {
+		loff_t seof = ksmbd_stream_eof(fp);
+
+		rsp->AllocationSize = cpu_to_le64((u64)seof);
+		rsp->EndofFile = cpu_to_le64((u64)seof);
+	} else {
+		if (!S_ISDIR(stat->mode) && stat->size > fp->allocation_size)
+			fp->allocation_size = round_up(stat->size, stat->blksize);
+		rsp->AllocationSize = cpu_to_le64(fp->allocation_size);
+		rsp->EndofFile = S_ISDIR(stat->mode) ? 0 : cpu_to_le64(stat->size);
+	}
+	rsp->FileAttributes = fp->f_ci->m_fattr;
+
+	rsp->Reserved2 = 0;
+
+	rsp->PersistentFileId = fp->persistent_id;
+	rsp->VolatileFileId = fp->volatile_id;
+
+	rsp->CreateContextsOffset = 0;
+	rsp->CreateContextsLength = 0;
+}
+
+static int smb2_build_create_rsp(struct ksmbd_work *work,
+				 struct smb2_create_rsp *rsp,
+				 struct ksmbd_file *fp, const struct kstat *stat,
+				 const struct smb2_create_contexts *ctx,
+				 int file_info, const char *name)
+{
+	struct ksmbd_conn *conn = work->conn;
+	struct ksmbd_tree_connect *tcon = work->tcon;
+	const struct path *path = &fp->filp->f_path;
+	struct mnt_idmap *idmap = mnt_idmap(path->mnt);
+	struct oplock_info *opinfo;
+	__le32 *next_ptr = NULL;
+	__le32 maximal_access = ctx->maximal_access;
+	bool durable_rsp = true;
+	int contxt_cnt = 0, next_off = 0;
+	int iov_len;
+
+	if (ctx->dh_info.replay)
+		file_info = le32_to_cpu(fp->create_action);
+	rsp->StructureSize = cpu_to_le16(89);
+	opinfo = opinfo_get(fp);
+	rsp->OplockLevel = opinfo ? opinfo->level : 0;
+	/*
+	 * A durable CREATE replay does not modify the existing open. When
+	 * replayed without an oplock, however, its response reflects that
+	 * request and cannot include a new durable-handle response context.
+	 */
+	if (ctx->dh_info.replay && !ctx->lc &&
+	    ctx->req_op_level == SMB2_OPLOCK_LEVEL_NONE) {
+		rsp->OplockLevel = SMB2_OPLOCK_LEVEL_NONE;
+		durable_rsp = false;
+	}
+	smb2_fill_create_rsp(rsp, fp, stat, file_info);
+	iov_len = offsetof(struct smb2_create_rsp, Buffer);
+
+	/* If lease is request send lease context response */
+	if (opinfo && opinfo->is_lease) {
+		struct create_context *lease_ccontext;
+
+		ksmbd_debug(SMB, "lease granted on(%s) lease state 0x%x\n",
+			    name, opinfo->o_lease->state);
+		rsp->OplockLevel = SMB2_OPLOCK_LEVEL_LEASE;
+
+		lease_ccontext = (struct create_context *)rsp->Buffer;
+		contxt_cnt++;
+		create_lease_buf(rsp->Buffer, opinfo->o_lease);
+		le32_add_cpu(&rsp->CreateContextsLength,
+			     conn->vals->create_lease_size);
+		iov_len += conn->vals->create_lease_size;
+		next_ptr = &lease_ccontext->Next;
+		next_off = conn->vals->create_lease_size;
+	}
+	opinfo_put(opinfo);
+
+	if (ctx->maximal_access_ctxt) {
+		struct create_context *mxac_ccontext;
+
+		if (maximal_access == 0)
+			ksmbd_vfs_query_maximal_access(idmap,
+						       path->dentry,
+						       &maximal_access);
+		mxac_ccontext = (struct create_context *)(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength));
+		contxt_cnt++;
+		create_mxac_rsp_buf(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength),
+				le32_to_cpu(maximal_access));
+		le32_add_cpu(&rsp->CreateContextsLength,
+			     conn->vals->create_mxac_size);
+		iov_len += conn->vals->create_mxac_size;
+		if (next_ptr)
+			*next_ptr = cpu_to_le32(next_off);
+		next_ptr = &mxac_ccontext->Next;
+		next_off = conn->vals->create_mxac_size;
+	}
+
+	if (ctx->query_disk_id) {
+		struct create_context *disk_id_ccontext;
+
+		disk_id_ccontext = (struct create_context *)(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength));
+		contxt_cnt++;
+		create_disk_id_rsp_buf(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength),
+				stat->ino, tcon->id);
+		le32_add_cpu(&rsp->CreateContextsLength,
+			     conn->vals->create_disk_id_size);
+		iov_len += conn->vals->create_disk_id_size;
+		if (next_ptr)
+			*next_ptr = cpu_to_le32(next_off);
+		next_ptr = &disk_id_ccontext->Next;
+		next_off = conn->vals->create_disk_id_size;
+	}
+
+	if (durable_rsp &&
+	    (ctx->dh_info.type == DURABLE_REQ || ctx->dh_info.type == DURABLE_REQ_V2)) {
+		struct create_context *durable_ccontext;
+
+		durable_ccontext = (struct create_context *)(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength));
+		contxt_cnt++;
+		if (ctx->dh_info.type == DURABLE_REQ) {
+			create_durable_rsp_buf(rsp->Buffer +
+					le32_to_cpu(rsp->CreateContextsLength));
+			le32_add_cpu(&rsp->CreateContextsLength,
+				     conn->vals->create_durable_size);
+			iov_len += conn->vals->create_durable_size;
+		} else {
+			create_durable_v2_rsp_buf(rsp->Buffer +
+					le32_to_cpu(rsp->CreateContextsLength),
+					fp);
+			le32_add_cpu(&rsp->CreateContextsLength,
+				     conn->vals->create_durable_v2_size);
+			iov_len += conn->vals->create_durable_v2_size;
+		}
+
+		if (next_ptr)
+			*next_ptr = cpu_to_le32(next_off);
+		next_ptr = &durable_ccontext->Next;
+		next_off = ctx->dh_info.type == DURABLE_REQ ?
+			conn->vals->create_durable_size :
+			conn->vals->create_durable_v2_size;
+	}
+
+	if (ctx->posix_ctxt) {
+		struct create_context *posix_ccontext;
+
+		posix_ccontext = (struct create_context *)(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength));
+		contxt_cnt++;
+		create_posix_rsp_buf(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength),
+				fp);
+		le32_add_cpu(&rsp->CreateContextsLength,
+			     conn->vals->create_posix_size);
+		iov_len += conn->vals->create_posix_size;
+		if (next_ptr)
+			*next_ptr = cpu_to_le32(next_off);
+		next_ptr = &posix_ccontext->Next;
+		next_off = conn->vals->create_posix_size;
+	}
+
+	/*
+	 * AAPL create context response: see smb2pdu.h for the capability
+	 * rationale. Scoped to TIME_MACHINE shares only.
+	 */
+	if (ctx->aapl_ctxt) {
+		if (ctx->aapl_client_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR)
+			conn->aapl_readdir_attr = true;
+		/*
+		 * V2 extends the same inline-FinderInfo mechanism (see
+		 * smb2pdu.h), so a V2-requesting client also gets
+		 * aapl_readdir_attr treatment -- the reply just advertises
+		 * the V2 bit instead of the V1 one (create_aapl_rsp_buf).
+		 */
+		if (ctx->aapl_client_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2) {
+			conn->aapl_readdir_attr = true;
+			conn->aapl_readdir_attr_v2 = true;
+		}
+
+		contxt_cnt++;
+		create_aapl_rsp_buf(rsp->Buffer +
+				le32_to_cpu(rsp->CreateContextsLength),
+				SMB2_CRTCTX_AAPL_FULL_SYNC,
+				ctx->aapl_req_bitmap,
+				conn->aapl_readdir_attr_v2);
+		le32_add_cpu(&rsp->CreateContextsLength,
+			     conn->vals->create_aapl_size);
+		iov_len += conn->vals->create_aapl_size;
+		if (next_ptr)
+			*next_ptr = cpu_to_le32(next_off);
+		/* AAPL is last; next_ptr need not be updated */
+	}
+
+	if (contxt_cnt > 0) {
+		rsp->CreateContextsOffset =
+			cpu_to_le32(offsetof(struct smb2_create_rsp, Buffer));
+	}
+
+	return iov_len;
+}
+
+static void smb2_create_error_status(struct smb2_create_req *req,
+				     struct smb2_create_rsp *rsp, int rc)
+{
+	switch (rc) {
+	case -EINVAL:
+		rsp->hdr.Status = STATUS_INVALID_PARAMETER;
+		break;
+	case -EOPNOTSUPP:
+		rsp->hdr.Status = STATUS_NOT_SUPPORTED;
+		break;
+	case -EACCES:
+	case -ESTALE:
+	case -EXDEV:
+		if (!rsp->hdr.Status) {
+			if (req->DesiredAccess & FILE_ACCESS_SYSTEM_SECURITY_LE)
+				rsp->hdr.Status = STATUS_PRIVILEGE_NOT_HELD;
+			else
+				rsp->hdr.Status = STATUS_ACCESS_DENIED;
+		}
+		break;
+	case -ENOENT:
+		rsp->hdr.Status = STATUS_OBJECT_NAME_INVALID;
+		break;
+	case -EPERM:
+		rsp->hdr.Status = STATUS_SHARING_VIOLATION;
+		break;
+	case -EBUSY:
+		rsp->hdr.Status = STATUS_DELETE_PENDING;
+		break;
+	case -EBADF:
+		rsp->hdr.Status = STATUS_OBJECT_NAME_NOT_FOUND;
+		break;
+	case -ENOEXEC:
+		rsp->hdr.Status = STATUS_DUPLICATE_OBJECTID;
+		break;
+	case -ENXIO:
+		rsp->hdr.Status = STATUS_NO_SUCH_DEVICE;
+		break;
+	case -EEXIST:
+		rsp->hdr.Status = STATUS_OBJECT_NAME_COLLISION;
+		break;
+	case -EMFILE:
+		rsp->hdr.Status = STATUS_INSUFFICIENT_RESOURCES;
+		break;
+	case -EINPROGRESS:
+	case -EAGAIN:
+		rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
+		break;
+	}
+
+	if (!rsp->hdr.Status)
+		rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
+}
+
 /**
  * smb2_open() - handler for smb file open request
  * @work:	smb work containing request buffer
@@ -4268,29 +5290,15 @@ int smb2_open(struct ksmbd_work *work)
 	struct file *filp = NULL;
 	struct mnt_idmap *idmap = NULL;
 	struct kstat stat;
-	struct create_context *context;
-	struct lease_ctx_info *lc = NULL;
-	struct create_ea_buf_req *ea_buf = NULL;
-	struct oplock_info *opinfo;
-	struct durable_info dh_info = {0};
-	__le32 *next_ptr = NULL;
-	int req_op_level = 0, open_flags = 0, may_flags = 0, file_info = 0;
+	struct smb2_create_contexts ctx = {0};
+	int open_flags = 0, may_flags = 0, file_info = 0;
 	int rc = 0;
-	int contxt_cnt = 0, query_disk_id = 0;
-	bool maximal_access_ctxt = false, posix_ctxt = false;
-	bool aapl_ctxt = false;
-	bool durable_rsp = true;
-	__u64 aapl_req_bitmap = 0, aapl_client_caps = 0;
 	int s_type = 0;
-	int next_off = 0;
 	char *name = NULL;
 	char *stream_name = NULL;
 	bool file_present = false, created = false, already_permitted = false;
-	int share_ret, need_truncate = 0;
-	u64 time, alloc_size = 0;
-	umode_t posix_mode = 0;
-	__le32 daccess, maximal_access = 0;
-	u32 dos_attr;
+	int need_truncate = 0;
+	__le32 daccess;
 	int iov_len = 0;
 
 	ksmbd_debug(SMB, "Received smb2 create request\n");
@@ -4305,39 +5313,10 @@ int smb2_open(struct ksmbd_work *work)
 		return -EINVAL;
 	}
 
-	if (req->CreateContextsOffset) {
-		context = smb2_find_context_vals(req, SMB2_CREATE_TAG_POSIX, 16);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out2;
-		} else if (context) {
-			struct create_posix *posix = (struct create_posix *)context;
+	rc = smb2_parse_posix_context(work, req, rsp, &ctx);
+	if (rc)
+		goto err_out2;
 
-			if (conn->dialect != SMB311_PROT_ID) {
-				rsp->hdr.Status = STATUS_INVALID_INFO_CLASS;
-				rc = -ENOTTY;
-				goto err_out2;
-			}
-			if (!tcon->posix_extensions) {
-				rc = -EOPNOTSUPP;
-				goto err_out2;
-			}
-			if (test_share_config_flag(share, KSMBD_SHARE_FLAG_PIPE)) {
-				rc = -EOPNOTSUPP;
-				goto err_out2;
-			}
-			if (le16_to_cpu(context->DataOffset) +
-				le32_to_cpu(context->DataLength) <
-			    sizeof(struct create_posix) - 4) {
-				rc = -EINVAL;
-				goto err_out2;
-			}
-			ksmbd_debug(SMB, "get posix context\n");
-
-			posix_mode = le32_to_cpu(posix->Mode);
-			posix_ctxt = true;
-		}
-	}
 	if (test_share_config_flag(share, KSMBD_SHARE_FLAG_PIPE)) {
 		ksmbd_debug(SMB, "IPC pipe create request\n");
 		return create_smb2_pipe(work);
@@ -4355,17 +5334,17 @@ int smb2_open(struct ksmbd_work *work)
 
 		ksmbd_debug(SMB, "converted name = %s\n", name);
 
-		if (!posix_ctxt &&
+		if (!ctx.posix_ctxt &&
 		    !strcasecmp(name, "$Extend/$Quota:$Q:$INDEX_ALLOCATION")) {
 			rc = smb2_open_quota(work);
 			kfree(name);
 			return rc;
 		}
 
-		if (posix_ctxt == false) {
+		if (!ctx.posix_ctxt) {
 			if (strchr(name, ':')) {
 				if (!test_share_config_flag(work->tcon->share_conf,
-							KSMBD_SHARE_FLAG_STREAMS)) {
+							    KSMBD_SHARE_FLAG_STREAMS)) {
 					rc = -EBADF;
 					goto err_out2;
 				}
@@ -4393,39 +5372,30 @@ int smb2_open(struct ksmbd_work *work)
 		}
 	}
 
-	req_op_level = req->RequestedOplockLevel;
+	ctx.req_op_level = req->RequestedOplockLevel;
 
 	if (req->CreateContextsOffset) {
-		rc = parse_app_instance_id(req, &dh_info);
+		rc = parse_app_instance_id(req, &ctx.dh_info);
 		if (rc)
 			goto err_out2;
-		rc = parse_app_instance_version(req, &dh_info);
+		rc = parse_app_instance_version(req, &ctx.dh_info);
 		if (rc)
 			goto err_out2;
 	}
 
 	if (server_conf.flags & KSMBD_GLOBAL_FLAG_DURABLE_HANDLE &&
 	    req->CreateContextsOffset) {
-		lc = parse_lease_state(req);
-		if (IS_ERR(lc)) {
-			rc = PTR_ERR(lc);
-			lc = NULL;
+		rc = smb2_parse_lease_context(work, req, &ctx);
+		if (rc)
 			goto err_out2;
-		}
-		if (lc && lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
-			kfree(lc);
-			lc = NULL;
-			if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE)
-				req_op_level = SMB2_OPLOCK_LEVEL_NONE;
-		}
-		rc = parse_durable_handle_context(work, req, lc, &dh_info);
+		rc = parse_durable_handle_context(work, req, ctx.lc, &ctx.dh_info);
 		if (rc) {
 			ksmbd_debug(SMB, "error parsing durable handle context\n");
 			goto err_out2;
 		}
 
-		if (dh_info.replay == true) {
-			fp = dh_info.fp;
+		if (ctx.dh_info.replay) {
+			fp = ctx.dh_info.fp;
 			if (ksmbd_override_fsids(work)) {
 				rc = -ENOMEM;
 				goto err_out2;
@@ -4439,17 +5409,17 @@ int smb2_open(struct ksmbd_work *work)
 			goto reconnected_fp;
 		}
 
-		if (dh_info.reconnected == true) {
-			rc = smb2_check_durable_oplock(conn, share, dh_info.fp,
-					lc, sess->user, name);
+		if (ctx.dh_info.reconnected) {
+			rc = smb2_check_durable_oplock(conn, share, ctx.dh_info.fp,
+						       ctx.lc, sess->user, name);
 			if (rc)
 				goto err_out2;
 
-			rc = ksmbd_reopen_durable_fd(work, dh_info.fp);
+			rc = ksmbd_reopen_durable_fd(work, ctx.dh_info.fp);
 			if (rc)
 				goto err_out2;
 
-			fp = dh_info.fp;
+			fp = ctx.dh_info.fp;
 
 			if (ksmbd_override_fsids(work)) {
 				rc = -ENOMEM;
@@ -4465,313 +5435,54 @@ int smb2_open(struct ksmbd_work *work)
 			goto reconnected_fp;
 		}
 
-	} else if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE) {
-		lc = parse_lease_state(req);
-		if (IS_ERR(lc)) {
-			rc = PTR_ERR(lc);
-			lc = NULL;
-			goto err_out2;
-		}
-		if (lc && lc->version == 2 && conn->dialect < SMB30_PROT_ID) {
-			kfree(lc);
-			lc = NULL;
-			req_op_level = SMB2_OPLOCK_LEVEL_NONE;
-		}
-	}
-
-	if (dh_info.app_instance_id && !dh_info.reconnected &&
-	    !dh_info.replay) {
-		rc = smb2_handle_app_instance_id(rsp, &dh_info);
+	} else if (ctx.req_op_level == SMB2_OPLOCK_LEVEL_LEASE) {
+		rc = smb2_parse_lease_context(work, req, &ctx);
 		if (rc)
 			goto err_out2;
 	}
 
-	if (le32_to_cpu(req->ImpersonationLevel) > le32_to_cpu(IL_DELEGATE)) {
-		pr_err("Invalid impersonationlevel : 0x%x\n",
-		       le32_to_cpu(req->ImpersonationLevel));
-		rc = -EIO;
-		rsp->hdr.Status = STATUS_BAD_IMPERSONATION_LEVEL;
-		goto err_out2;
-	}
-
-	if (req->CreateOptions && !(req->CreateOptions & CREATE_OPTIONS_MASK_LE)) {
-		pr_err("Invalid create options : 0x%x\n",
-		       le32_to_cpu(req->CreateOptions));
-		rc = -EINVAL;
-		goto err_out2;
-	} else {
-		if (req->CreateOptions & FILE_SEQUENTIAL_ONLY_LE &&
-		    req->CreateOptions & FILE_RANDOM_ACCESS_LE)
-			req->CreateOptions &= ~FILE_SEQUENTIAL_ONLY_LE;
-
-		if (req->CreateOptions &
-		    (FILE_OPEN_BY_FILE_ID_LE | CREATE_TREE_CONNECTION |
-		     FILE_RESERVE_OPFILTER_LE)) {
-			rc = -EOPNOTSUPP;
+	if (ctx.dh_info.app_instance_id && !ctx.dh_info.reconnected &&
+	    !ctx.dh_info.replay) {
+		rc = smb2_handle_app_instance_id(rsp, &ctx.dh_info);
+		if (rc)
 			goto err_out2;
-		}
-
-		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
-			if (req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE) {
-				rc = -EINVAL;
-				goto err_out2;
-			}
-		}
 	}
 
-	if (le32_to_cpu(req->CreateDisposition) >
-	    le32_to_cpu(FILE_OVERWRITE_IF_LE)) {
-		pr_err("Invalid create disposition : 0x%x\n",
-		       le32_to_cpu(req->CreateDisposition));
-		rc = -EINVAL;
+	rc = smb2_check_create_request(req, rsp);
+	if (rc)
 		goto err_out2;
-	}
 
-	if (!(req->DesiredAccess & DESIRED_ACCESS_MASK)) {
-		pr_err("Invalid desired access : 0x%x\n",
-		       le32_to_cpu(req->DesiredAccess));
-		rc = -EACCES;
+	rc = smb2_parse_create_contexts(req, rsp, &ctx);
+	if (rc)
 		goto err_out2;
-	}
-
-	if (req->DesiredAccess == FILE_SYNCHRONIZE_LE &&
-	    req->CreateDisposition == FILE_OPEN_IF_LE &&
-	    !req->FileAttributes) {
-		rc = -EACCES;
-		goto err_out2;
-	}
-
-	if (req->FileAttributes &&
-	    (req->FileAttributes & ~cpu_to_le32(SMB2_CREATE_FILE_ATTRIBUTE_MASK))) {
-		pr_err("Invalid file attribute : 0x%x\n",
-		       le32_to_cpu(req->FileAttributes));
-		rc = -EINVAL;
-		goto err_out2;
-	}
-
-	if (req->CreateContextsOffset) {
-		/* Parse non-durable handle create contexts */
-		context = smb2_find_context_vals(req, SMB2_CREATE_EA_BUFFER, 4);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out2;
-		} else if (context) {
-			ea_buf = (struct create_ea_buf_req *)context;
-			if (le16_to_cpu(context->DataOffset) +
-			    le32_to_cpu(context->DataLength) <
-			    sizeof(struct create_ea_buf_req)) {
-				rc = -EINVAL;
-				goto err_out2;
-			}
-			if (req->CreateOptions & FILE_NO_EA_KNOWLEDGE_LE) {
-				rsp->hdr.Status = STATUS_ACCESS_DENIED;
-				rc = -EACCES;
-				goto err_out2;
-			}
-		}
-
-		context = smb2_find_context_vals(req,
-						 SMB2_CREATE_QUERY_MAXIMAL_ACCESS_REQUEST, 4);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out2;
-		} else if (context) {
-			ksmbd_debug(SMB,
-				    "get query maximal access context\n");
-			maximal_access_ctxt = 1;
-		}
-
-		context = smb2_find_context_vals(req,
-						 SMB2_CREATE_TIMEWARP_REQUEST, 4);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out2;
-		} else if (context) {
-			ksmbd_debug(SMB, "get timewarp context\n");
-			rc = -EBADF;
-			goto err_out2;
-		}
-	}
 
 	if (ksmbd_override_fsids(work)) {
 		rc = -ENOMEM;
 		goto err_out2;
 	}
 
-	rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
-				 &path, 1);
-
-	/*
-	 * A durable handle opened with delete-on-close is preserved across a
-	 * disconnect so it can be reclaimed by a durable reconnect.  When a new
-	 * delete-on-close open for the same name arrives instead, the
-	 * disconnected handle must give way: close it so its delete-on-close
-	 * removes the file, then re-resolve so this open can create a fresh one.
-	 */
-	if (!rc && (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) &&
-	    (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
-	     req->CreateDisposition == FILE_OPEN_IF_LE) &&
-	    ksmbd_close_disconnected_durable_delete_on_close(path.dentry)) {
-		path_put(&path);
-		rc = ksmbd_vfs_kern_path(work, name, LOOKUP_NO_SYMLINKS,
-					 &path, 1);
-	}
-
-	if (!rc) {
-		file_present = true;
-
-		if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
-			struct xattr_dos_attrib da;
-
-			/*
-			 * If file exists with under flags, return access
-			 * denied error.
-			 */
-			if (req->CreateDisposition == FILE_OVERWRITE_IF_LE ||
-			    req->CreateDisposition == FILE_OPEN_IF_LE) {
-				rc = -EACCES;
-				goto err_out;
-			}
-
-			if (!test_tree_conn_flag(tcon, KSMBD_TREE_CONN_FLAG_WRITABLE)) {
-				ksmbd_debug(SMB,
-					    "User does not have write permission\n");
-					rc = -EACCES;
-					goto err_out;
-				}
-
-			if (test_share_config_flag(tcon->share_conf,
-						   KSMBD_SHARE_FLAG_STORE_DOS_ATTRS) &&
-			    ksmbd_vfs_get_dos_attrib_xattr(mnt_idmap(path.mnt),
-							 path.dentry, &da) > 0 &&
-			    da.attr & FILE_ATTRIBUTE_READONLY) {
-				rsp->hdr.Status = STATUS_CANNOT_DELETE;
-				rc = -EACCES;
-				goto err_out;
-			}
-		} else if (d_is_symlink(path.dentry)) {
-			rc = -EACCES;
-			goto err_out;
-		}
-
+	rc = smb2_lookup_create_path(work, req, rsp, name, &path, &file_present);
+	if (rc)
+		goto err_out;
+	if (file_present)
 		idmap = mnt_idmap(path.mnt);
-	} else {
-		if (rc != -ENOENT)
-			goto err_out;
-		ksmbd_debug(SMB, "can not get linux path for %s, rc = %d\n",
-			    name, rc);
-		rc = 0;
-	}
 
-	if (!file_present && req->CreateOptions & FILE_DELETE_ON_CLOSE_LE &&
-	    req->FileAttributes & FILE_ATTRIBUTE_READONLY_LE) {
-		rsp->hdr.Status = STATUS_CANNOT_DELETE;
-		rc = -EACCES;
+	rc = smb2_check_create_path(req, rsp, &path, name, stream_name,
+				    s_type, file_present);
+	if (rc)
 		goto err_out;
-	}
 
-	/*
-	 * An explicit ::$DATA suffix names the unnamed data stream and is
-	 * canonicalized to a NULL stream name (base file), but the request
-	 * still has to be validated against the data-stream type, e.g. opening
-	 * <dir>::$DATA with FILE_DIRECTORY_FILE must fail with
-	 * STATUS_NOT_A_DIRECTORY.
-	 */
-	if (stream_name || s_type == DATA_STREAM) {
-		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE) {
-			if (s_type == DATA_STREAM) {
-				rc = -EIO;
-				rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
-			}
-		} else {
-			if (file_present && S_ISDIR(d_inode(path.dentry)->i_mode) &&
-			    !stream_name && s_type == DATA_STREAM) {
-				rc = -EIO;
-				rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
-			}
-		}
-
-		if (req->CreateOptions & FILE_DIRECTORY_FILE_LE &&
-		    req->FileAttributes & FILE_ATTRIBUTE_NORMAL_LE) {
-			rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
-			rc = -EIO;
-		}
-
-		if (rc < 0)
-			goto err_out;
-	}
-
-	if (file_present && req->CreateOptions & FILE_NON_DIRECTORY_FILE_LE &&
-	    S_ISDIR(d_inode(path.dentry)->i_mode) &&
-	    !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-		ksmbd_debug(SMB, "open() argument is a directory: %s, %x\n",
-			    name, req->CreateOptions);
-		rsp->hdr.Status = STATUS_FILE_IS_A_DIRECTORY;
-		rc = -EIO;
+	rc = smb2_check_create_access(work, req, &path, &ctx, file_present,
+				      &daccess, &already_permitted);
+	if (rc)
 		goto err_out;
-	}
-
-	if (file_present && (req->CreateOptions & FILE_DIRECTORY_FILE_LE) &&
-	    !(req->CreateDisposition == FILE_CREATE_LE) &&
-	    !S_ISDIR(d_inode(path.dentry)->i_mode)) {
-		rsp->hdr.Status = STATUS_NOT_A_DIRECTORY;
-		rc = -EIO;
-		goto err_out;
-	}
-
-	if (!stream_name && file_present &&
-	    req->CreateDisposition == FILE_CREATE_LE) {
-		rc = -EEXIST;
-		goto err_out;
-	}
-
-	daccess = smb_map_generic_desired_access(req->DesiredAccess);
-
-	if (file_present && !(req->CreateOptions & FILE_DELETE_ON_CLOSE_LE)) {
-		rc = smb_check_perm_dacl(conn, &path, &daccess,
-					 req->DesiredAccess,
-					 sess->user->uid, false);
-		if (rc)
-			goto err_out;
-
-		if (maximal_access_ctxt) {
-			maximal_access = FILE_MAXIMAL_ACCESS_LE;
-			rc = smb_check_perm_dacl(conn, &path, &maximal_access,
-						 0, sess->user->uid, false);
-			if (rc)
-				goto err_out;
-
-			/*
-			 * smb_check_perm_dacl() returns success without
-			 * touching *pdaccess when the object has no stored
-			 * NT ACL, leaving maximal_access as the
-			 * FILE_MAXIMAL_ACCESS_LE request sentinel instead of
-			 * a real access mask.
-			 */
-			if (maximal_access == FILE_MAXIMAL_ACCESS_LE)
-				ksmbd_vfs_query_maximal_access(idmap, path.dentry,
-							       &maximal_access);
-		}
-	}
-
-	if (daccess & FILE_MAXIMAL_ACCESS_LE) {
-		if (!file_present) {
-			daccess = cpu_to_le32(GENERIC_ALL_FLAGS);
-		} else {
-			ksmbd_vfs_query_maximal_access(idmap,
-							    path.dentry,
-							    &daccess);
-			already_permitted = true;
-		}
-		maximal_access = daccess;
-	}
 
 	open_flags = smb2_create_open_flags(file_present, daccess,
 					    req->CreateDisposition,
 					    &may_flags,
 					    req->CreateOptions,
 					    file_present ? d_inode(path.dentry)->i_mode : 0);
-	if (posix_ctxt && (req->DesiredAccess & FILE_APPEND_DATA_LE) &&
+	if (ctx.posix_ctxt && (req->DesiredAccess & FILE_APPEND_DATA_LE) &&
 	    !(req->DesiredAccess & FILE_WRITE_DATA_LE))
 		open_flags |= O_APPEND;
 
@@ -4787,7 +5498,7 @@ int smb2_open(struct ksmbd_work *work)
 	/*create file if not present */
 	if (!file_present) {
 		rc = smb2_creat(work, &path, name, open_flags,
-				posix_ctxt ? posix_mode : (umode_t)-1,
+				ctx.posix_ctxt ? ctx.posix_mode : (umode_t)-1,
 				req->CreateOptions & FILE_DIRECTORY_FILE_LE);
 		if (rc) {
 			if (rc == -ENOENT) {
@@ -4799,15 +5510,15 @@ int smb2_open(struct ksmbd_work *work)
 
 		created = true;
 		idmap = mnt_idmap(path.mnt);
-		if (ea_buf) {
-			if (le32_to_cpu(ea_buf->ccontext.DataLength) <
+		if (ctx.ea_buf) {
+			if (le32_to_cpu(ctx.ea_buf->ccontext.DataLength) <
 			    sizeof(struct smb2_ea_info)) {
 				rc = -EINVAL;
 				goto err_out;
 			}
 
-			rc = smb2_set_ea(&ea_buf->ea,
-					 le32_to_cpu(ea_buf->ccontext.DataLength),
+			rc = smb2_set_ea(&ctx.ea_buf->ea,
+					 le32_to_cpu(ctx.ea_buf->ccontext.DataLength),
 					 &path, false);
 			if (rc == -EOPNOTSUPP)
 				rc = 0;
@@ -4882,121 +5593,14 @@ int smb2_open(struct ksmbd_work *work)
 		goto err_out;
 	}
 
-	/*
-	 * Publish the client and create GUID before an oplock/lease break can
-	 * make this CREATE pending.  A replay of that in-flight CREATE must find
-	 * this FP_NEW handle and fail with STATUS_FILE_NOT_AVAILABLE instead of
-	 * waiting on the same break again.
-	 */
-	memcpy(fp->client_guid, conn->ClientGUID, SMB2_CLIENT_GUID_SIZE);
-	if (dh_info.app_instance_id) {
-		memcpy(fp->app_instance_id, dh_info.AppInstanceId,
-		       SMB2_CREATE_GUID_SIZE);
-		fp->has_app_instance_id = true;
-	}
-	if (dh_info.app_instance_version_valid) {
-		fp->app_instance_version_high =
-			dh_info.app_instance_version_high;
-		fp->app_instance_version_low = dh_info.app_instance_version_low;
-		fp->app_instance_version_valid = true;
-	}
-	if (dh_info.CreateGuid) {
-		memcpy(fp->create_guid, dh_info.CreateGuid, SMB2_CREATE_GUID_SIZE);
-		fp->durable_replay_consumed = dh_info.replay_consumed;
-		rc = ksmbd_vfs_set_durable_owner(fp, sess->user);
+	rc = smb2_init_open_file(work, req, fp, &ctx, daccess);
+	if (rc)
+		goto err_out;
+
+	if (created) {
+		rc = smb2_create_file_acl(work, req, &path);
 		if (rc)
 			goto err_out;
-	}
-
-	fp->cdoption = req->CreateDisposition;
-	fp->create_file_attributes = req->FileAttributes;
-	fp->daccess = daccess;
-	fp->saccess = req->ShareAccess;
-	fp->coption = req->CreateOptions;
-
-	/* Set default windows and posix acls if creating new file */
-	if (created) {
-		int posix_acl_rc;
-		struct inode *inode = d_inode(path.dentry);
-
-		posix_acl_rc = ksmbd_vfs_inherit_posix_acl(idmap,
-							   &path,
-							   d_inode(path.dentry->d_parent));
-		if (posix_acl_rc)
-			ksmbd_debug(SMB, "inherit posix acl failed : %d\n", posix_acl_rc);
-
-		rc = smb2_create_sd_buffer(work, req, &path);
-		if (rc && rc != -ENOENT)
-			goto err_out;
-
-		if (rc == -ENOENT) {
-			if (test_share_config_flag(work->tcon->share_conf,
-						   KSMBD_SHARE_FLAG_ACL_XATTR)) {
-				rc = smb_inherit_dacl(conn, &path, sess->user->uid,
-						      sess->user->gid);
-			}
-			if (rc) {
-				if (posix_acl_rc)
-					ksmbd_vfs_set_init_posix_acl(idmap,
-								     &path);
-
-				if (test_share_config_flag(work->tcon->share_conf,
-							   KSMBD_SHARE_FLAG_ACL_XATTR)) {
-					struct smb_fattr fattr;
-					struct smb_ntsd *pntsd;
-					int pntsd_size;
-					size_t scratch_len;
-
-					rc = ksmbd_acls_fattr(&fattr, idmap, inode);
-					if (rc)
-						goto err_out;
-
-					scratch_len = smb_acl_sec_desc_scratch_len(&fattr,
-							NULL, 0,
-							OWNER_SECINFO | GROUP_SECINFO |
-							DACL_SECINFO);
-					if (!scratch_len || scratch_len == SIZE_MAX) {
-						rc = -EFBIG;
-						posix_acl_release(fattr.cf_acls);
-						posix_acl_release(fattr.cf_dacls);
-						goto err_out;
-					}
-
-					pntsd = kvzalloc(scratch_len, KSMBD_DEFAULT_GFP);
-					if (!pntsd) {
-						rc = -ENOMEM;
-						posix_acl_release(fattr.cf_acls);
-						posix_acl_release(fattr.cf_dacls);
-						goto err_out;
-					}
-
-					rc = build_sec_desc(idmap,
-							    pntsd, NULL, 0,
-							    OWNER_SECINFO |
-							    GROUP_SECINFO |
-							    DACL_SECINFO,
-							    &pntsd_size, &fattr);
-					posix_acl_release(fattr.cf_acls);
-					posix_acl_release(fattr.cf_dacls);
-					if (rc) {
-						kvfree(pntsd);
-						goto err_out;
-					}
-
-					rc = ksmbd_vfs_set_sd_xattr(conn,
-								    idmap,
-								    &path,
-								    pntsd,
-								    pntsd_size,
-								    false);
-					kvfree(pntsd);
-					if (rc)
-						pr_err("failed to store ntacl in xattr : %d\n",
-						       rc);
-				}
-			}
-		}
-		rc = 0;
 	}
 
 	if (stream_name) {
@@ -5012,8 +5616,8 @@ int smb2_open(struct ksmbd_work *work)
 	fp->attrib_only = !(req->DesiredAccess & ~(FILE_READ_ATTRIBUTES_LE |
 			FILE_WRITE_ATTRIBUTES_LE | FILE_SYNCHRONIZE_LE));
 
-	fp->is_posix_ctxt = posix_ctxt;
-	fp->posix_append = posix_ctxt && !!(open_flags & O_APPEND);
+	fp->is_posix_ctxt = ctx.posix_ctxt;
+	fp->posix_append = ctx.posix_ctxt && !!(open_flags & O_APPEND);
 
 	/* fp should be searchable through ksmbd_inode.m_fp_list
 	 * after daccess, saccess, attrib_only, and stream are
@@ -5044,51 +5648,9 @@ int smb2_open(struct ksmbd_work *work)
 		need_truncate = 1;
 	}
 
-	share_ret = ksmbd_smb_check_shared_mode(fp->filp, fp);
-	if (!test_share_config_flag(work->tcon->share_conf, KSMBD_SHARE_FLAG_OPLOCKS) ||
-	    (req_op_level == SMB2_OPLOCK_LEVEL_LEASE &&
-	     !(conn->vals->req_capabilities & SMB2_GLOBAL_CAP_LEASING))) {
-		if (share_ret < 0 && !S_ISDIR(file_inode(fp->filp)->i_mode)) {
-			rc = share_ret;
-			goto err_out1;
-		}
-	} else {
-		if (created && !lc)
-			smb_send_parent_lease_break_noti(fp, NULL);
-
-		if (req_op_level == SMB2_OPLOCK_LEVEL_LEASE && lc) {
-			if (S_ISDIR(file_inode(filp)->i_mode)) {
-				lc->req_state &= ~SMB2_LEASE_WRITE_CACHING_LE;
-				lc->is_dir = true;
-			}
-
-			/*
-			 * Compare parent lease using parent key. If there is no
-			 * a lease that has same parent key, Send lease break
-			 * notification.
-			 */
-			smb_send_parent_lease_break_noti(fp, lc);
-
-			req_op_level = smb2_map_lease_to_oplock(lc->req_state);
-			ksmbd_debug(SMB,
-				    "lease req for(%s) req oplock state 0x%x, lease state 0x%x\n",
-				    name, req_op_level, lc->req_state);
-			rc = find_same_lease_key(conn, fp->f_ci, lc);
-			if (rc)
-				goto err_out1;
-		} else if (open_flags == O_RDONLY &&
-			   (req_op_level == SMB2_OPLOCK_LEVEL_BATCH ||
-			    req_op_level == SMB2_OPLOCK_LEVEL_EXCLUSIVE))
-			req_op_level = SMB2_OPLOCK_LEVEL_II;
-
-		rc = smb_grant_oplock(work, req_op_level,
-				      fp->persistent_id, fp,
-				      le32_to_cpu(req->hdr.Id.SyncId.TreeId),
-				      lc, share_ret,
-				      smb3_hdr_replay(&req->hdr));
-		if (rc < 0)
-			goto err_out1;
-	}
+	rc = smb2_open_oplock(work, req, fp, &ctx, open_flags, created, name);
+	if (rc < 0)
+		goto err_out1;
 
 	if (req->CreateOptions & FILE_DELETE_ON_CLOSE_LE) {
 		smb_break_all_levII_oplock_for_delete(work, fp);
@@ -5101,370 +5663,26 @@ int smb2_open(struct ksmbd_work *work)
 			goto err_out1;
 	}
 
-	if (req->CreateContextsOffset) {
-		struct create_alloc_size_req *az_req;
-
-		az_req = (struct create_alloc_size_req *)smb2_find_context_vals(req,
-					SMB2_CREATE_ALLOCATION_SIZE, 4);
-		if (IS_ERR(az_req)) {
-			rc = PTR_ERR(az_req);
-			goto err_out1;
-		} else if (az_req) {
-			int err;
-
-			if (le16_to_cpu(az_req->ccontext.DataOffset) +
-			    le32_to_cpu(az_req->ccontext.DataLength) <
-			    sizeof(struct create_alloc_size_req)) {
-				rc = -EINVAL;
-				goto err_out1;
-			}
-			alloc_size = le64_to_cpu(az_req->AllocationSize);
-			fp->allocation_size_set = true;
-			ksmbd_debug(SMB,
-				    "request smb2 create allocate size : %llu\n",
-				    alloc_size);
-			/*
-			 * fp->filp is the base file's data fork for a stream
-			 * handle (streams are xattr-backed on the same
-			 * underlying file) -- fallocate has no meaning for a
-			 * stream and would otherwise pre-allocate storage on
-			 * the base file's data instead.
-			 */
-			if (!ksmbd_stream_fd(fp)) {
-				smb_break_all_levII_oplock(work, fp, 1);
-				err = vfs_fallocate(fp->filp, FALLOC_FL_KEEP_SIZE, 0,
-						    alloc_size);
-				if (err < 0)
-					ksmbd_debug(SMB,
-						    "vfs_fallocate is failed : %d\n",
-						    err);
-			}
-		}
-
-		context = smb2_find_context_vals(req, SMB2_CREATE_QUERY_ON_DISK_ID, 4);
-		if (IS_ERR(context)) {
-			rc = PTR_ERR(context);
-			goto err_out1;
-		} else if (context) {
-			ksmbd_debug(SMB, "get query on disk id context\n");
-			query_disk_id = 1;
-		}
-
-		if (test_share_config_flag(share, KSMBD_SHARE_FLAG_TIME_MACHINE)) {
-			context = smb2_find_context_vals(req, SMB2_CREATE_AAPL, 4);
-			if (IS_ERR(context)) {
-				rc = PTR_ERR(context);
-				goto err_out1;
-			} else if (context) {
-				struct aapl_server_query_req *aapl_req;
-
-				if (le32_to_cpu(context->DataLength) <
-				    sizeof(struct aapl_server_query_req)) {
-					rc = -EINVAL;
-					goto err_out1;
-				}
-
-				aapl_req = (struct aapl_server_query_req *)
-					((char *)context +
-					 le16_to_cpu(context->DataOffset));
-				if (le32_to_cpu(aapl_req->cmd) ==
-				    SMB2_CRTCTX_AAPL_SERVER_QUERY) {
-					conn->is_aapl = true;
-					aapl_ctxt = true;
-					aapl_req_bitmap = le64_to_cpu(aapl_req->req_bitmap);
-					aapl_client_caps = le64_to_cpu(aapl_req->client_caps);
-				}
-			}
-		} else if (conn->is_aapl == false) {
-			context = smb2_find_context_vals(req, SMB2_CREATE_AAPL, 4);
-			if (IS_ERR(context)) {
-				rc = PTR_ERR(context);
-				goto err_out1;
-			} else if (context)
-				conn->is_aapl = true;
-		}
-	}
-
-	rc = ksmbd_vfs_getattr(&path, &stat);
+	rc = smb2_apply_create_contexts(work, req, fp, &ctx);
 	if (rc)
 		goto err_out1;
 
-	if (stat.result_mask & STATX_BTIME)
-		fp->create_time = ksmbd_UnixTimeToNT(stat.btime);
-	else
-		fp->create_time = ksmbd_UnixTimeToNT(stat.ctime);
-	fp->change_time = ksmbd_UnixTimeToNT(stat.ctime);
-	fp->allocation_size = S_ISDIR(stat.mode) ? 0 :
-		(alloc_size ?: stat.blocks << 9);
-	if (created || fp->f_ci->m_fattr == 0)
-		fp->f_ci->m_fattr =
-			cpu_to_le32(smb2_get_dos_mode(&stat, le32_to_cpu(req->FileAttributes)));
-
-	if (!created)
-		smb2_update_xattrs(tcon, &path, fp);
-	if (need_truncate && req->FileAttributes) {
-		dos_attr = le32_to_cpu(req->FileAttributes);
-		fp->f_ci->m_fattr =
-			cpu_to_le32(smb2_get_dos_mode(&stat, dos_attr));
-		smb2_new_xattrs(tcon, &path, fp);
-	}
-
-	ksmbd_vfs_update_compressed_fattr(path.dentry, &fp->f_ci->m_fattr);
-
-	if (created) {
-		if (fp->coption & FILE_NO_COMPRESSION_LE) {
-			rc = ksmbd_vfs_set_compression_create(work, fp,
-							      COMPRESSION_FORMAT_NONE);
-			if (rc)
-				fp->f_ci->m_fattr &= ~FILE_ATTRIBUTE_COMPRESSED_LE;
-			rc = 0;
-		} else if (smb2_parent_compressed(tcon, &path)) {
-			rc = ksmbd_vfs_set_compression_create(work, fp,
-							      COMPRESSION_FORMAT_LZNT1);
-			if (rc)
-				fp->f_ci->m_fattr |= FILE_ATTRIBUTE_COMPRESSED_LE;
-			rc = 0;
-		}
-	}
-
-	if (created)
-		smb2_new_xattrs(tcon, &path, fp);
+	rc = smb2_init_file_attributes(work, req, fp, &stat, &ctx,
+				       created, need_truncate);
+	if (rc)
+		goto err_out1;
 
 	fp->create_action = cpu_to_le32(file_info);
 
-	if (dh_info.type == DURABLE_REQ_V2 || dh_info.type == DURABLE_REQ) {
-		if (dh_info.type == DURABLE_REQ_V2 && dh_info.persistent &&
-		    test_share_config_flag(work->tcon->share_conf,
-					   KSMBD_SHARE_FLAG_CONTINUOUS_AVAILABILITY) &&
-		    (conn->vals->req_capabilities &
-			     SMB2_GLOBAL_CAP_PERSISTENT_HANDLES)) {
-			/* MS-SMB2 3.3.5.9.10: a persistent open is durable too. */
-			fp->is_durable = true;
-			fp->is_persistent = true;
-		} else {
-			fp->is_durable = true;
-		}
-		if (dh_info.type == DURABLE_REQ_V2) {
-			if (dh_info.app_instance_id)
-				memcpy(fp->app_instance_id,
-				       dh_info.AppInstanceId,
-				       SMB2_CREATE_GUID_SIZE);
-			if (dh_info.timeout)
-				fp->durable_timeout =
-					min_t(unsigned int, dh_info.timeout,
-					      DURABLE_HANDLE_MAX_TIMEOUT);
-			else
-				fp->durable_timeout = 60000;
-		}
-	}
+	smb2_set_durable_handle(work, fp, &ctx.dh_info);
 
 	/*
-	 * conn->is_aapl detection above (this function's create-context
-	 * parsing) is skipped on the reconnect path below, since a
-	 * reconnect always arrives on a fresh connection -- if the client
-	 * cares, it sends its own AAPL context on this same CREATE, which
-	 * this function's normal (non-reconnect) parsing already handles.
+	 * AAPL detection in smb2_apply_create_contexts() applies only to
+	 * the normal CREATE path and is skipped on reconnect and replay.
 	 */
-	reconnected_fp:
-	if (dh_info.replay)
-		file_info = le32_to_cpu(fp->create_action);
-	rsp->StructureSize = cpu_to_le16(89);
-	opinfo = opinfo_get(fp);
-	rsp->OplockLevel = opinfo != NULL ? opinfo->level : 0;
-	/*
-	 * A durable CREATE replay does not modify the existing open. When
-	 * replayed without an oplock, however, its response reflects that
-	 * request and cannot include a new durable-handle response context.
-	 */
-	if (dh_info.replay && !lc &&
-	    req_op_level == SMB2_OPLOCK_LEVEL_NONE) {
-		rsp->OplockLevel = SMB2_OPLOCK_LEVEL_NONE;
-		durable_rsp = false;
-	}
-	rsp->Flags = 0;
-	rsp->CreateAction = cpu_to_le32(file_info);
-	rsp->CreationTime = cpu_to_le64(fp->create_time);
-	time = ksmbd_UnixTimeToNT(stat.atime);
-	rsp->LastAccessTime = cpu_to_le64(time);
-	time = ksmbd_UnixTimeToNT(stat.mtime);
-	fp->open_mtime = time;
-	rsp->LastWriteTime = cpu_to_le64(time);
-	rsp->ChangeTime = cpu_to_le64(fp->change_time);
-	/*
-	 * The cached allocation size hides filesystem rounding for the
-	 * requested allocation, but it can go stale when the file grows past
-	 * it via writes (e.g. across a durable reconnect). Refresh it once the
-	 * file exceeds the cached value, rounding the end of file up to the
-	 * volume allocation unit (the filesystem block size, matching the
-	 * SectorsPerAllocationUnit/BytesPerSector ksmbd advertises) rather than
-	 * using the raw on-disk block count, which can include filesystem
-	 * preallocation and metadata rounding.
-	 */
-	if (ksmbd_stream_fd(fp)) {
-		loff_t seof = ksmbd_stream_eof(fp);
-
-		rsp->AllocationSize = cpu_to_le64((u64)seof);
-		rsp->EndofFile = cpu_to_le64((u64)seof);
-	} else {
-		if (!S_ISDIR(stat.mode) && stat.size > fp->allocation_size)
-			fp->allocation_size = round_up(stat.size, stat.blksize);
-		rsp->AllocationSize = cpu_to_le64(fp->allocation_size);
-		rsp->EndofFile = S_ISDIR(stat.mode) ? 0 : cpu_to_le64(stat.size);
-	}
-	rsp->FileAttributes = fp->f_ci->m_fattr;
-
-	rsp->Reserved2 = 0;
-
-	rsp->PersistentFileId = fp->persistent_id;
-	rsp->VolatileFileId = fp->volatile_id;
-
-	rsp->CreateContextsOffset = 0;
-	rsp->CreateContextsLength = 0;
-	iov_len = offsetof(struct smb2_create_rsp, Buffer);
-
-	/* If lease is request send lease context response */
-	if (opinfo && opinfo->is_lease) {
-		struct create_context *lease_ccontext;
-
-		ksmbd_debug(SMB, "lease granted on(%s) lease state 0x%x\n",
-			    name, opinfo->o_lease->state);
-		rsp->OplockLevel = SMB2_OPLOCK_LEVEL_LEASE;
-
-		lease_ccontext = (struct create_context *)rsp->Buffer;
-		contxt_cnt++;
-		create_lease_buf(rsp->Buffer, opinfo->o_lease);
-		le32_add_cpu(&rsp->CreateContextsLength,
-			     conn->vals->create_lease_size);
-		iov_len += conn->vals->create_lease_size;
-		next_ptr = &lease_ccontext->Next;
-		next_off = conn->vals->create_lease_size;
-	}
-	opinfo_put(opinfo);
-
-	if (maximal_access_ctxt) {
-		struct create_context *mxac_ccontext;
-
-		if (maximal_access == 0)
-			ksmbd_vfs_query_maximal_access(idmap,
-						       path.dentry,
-						       &maximal_access);
-		mxac_ccontext = (struct create_context *)(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength));
-		contxt_cnt++;
-		create_mxac_rsp_buf(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength),
-				le32_to_cpu(maximal_access));
-		le32_add_cpu(&rsp->CreateContextsLength,
-			     conn->vals->create_mxac_size);
-		iov_len += conn->vals->create_mxac_size;
-		if (next_ptr)
-			*next_ptr = cpu_to_le32(next_off);
-		next_ptr = &mxac_ccontext->Next;
-		next_off = conn->vals->create_mxac_size;
-	}
-
-	if (query_disk_id) {
-		struct create_context *disk_id_ccontext;
-
-		disk_id_ccontext = (struct create_context *)(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength));
-		contxt_cnt++;
-		create_disk_id_rsp_buf(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength),
-				stat.ino, tcon->id);
-		le32_add_cpu(&rsp->CreateContextsLength,
-			     conn->vals->create_disk_id_size);
-		iov_len += conn->vals->create_disk_id_size;
-		if (next_ptr)
-			*next_ptr = cpu_to_le32(next_off);
-		next_ptr = &disk_id_ccontext->Next;
-		next_off = conn->vals->create_disk_id_size;
-	}
-
-	if (durable_rsp &&
-	    (dh_info.type == DURABLE_REQ || dh_info.type == DURABLE_REQ_V2)) {
-		struct create_context *durable_ccontext;
-
-		durable_ccontext = (struct create_context *)(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength));
-		contxt_cnt++;
-		if (dh_info.type == DURABLE_REQ) {
-			create_durable_rsp_buf(rsp->Buffer +
-					le32_to_cpu(rsp->CreateContextsLength));
-			le32_add_cpu(&rsp->CreateContextsLength,
-					conn->vals->create_durable_size);
-			iov_len += conn->vals->create_durable_size;
-		} else {
-			create_durable_v2_rsp_buf(rsp->Buffer +
-					le32_to_cpu(rsp->CreateContextsLength),
-					fp);
-			le32_add_cpu(&rsp->CreateContextsLength,
-					conn->vals->create_durable_v2_size);
-			iov_len += conn->vals->create_durable_v2_size;
-		}
-
-		if (next_ptr)
-			*next_ptr = cpu_to_le32(next_off);
-		next_ptr = &durable_ccontext->Next;
-		next_off = dh_info.type == DURABLE_REQ ?
-			conn->vals->create_durable_size :
-			conn->vals->create_durable_v2_size;
-	}
-
-	if (posix_ctxt) {
-		struct create_context *posix_ccontext;
-
-		posix_ccontext = (struct create_context *)(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength));
-		contxt_cnt++;
-		create_posix_rsp_buf(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength),
-				fp);
-		le32_add_cpu(&rsp->CreateContextsLength,
-			     conn->vals->create_posix_size);
-		iov_len += conn->vals->create_posix_size;
-		if (next_ptr)
-			*next_ptr = cpu_to_le32(next_off);
-		next_ptr = &posix_ccontext->Next;
-		next_off = conn->vals->create_posix_size;
-	}
-
-	/*
-	 * AAPL create context response: see smb2pdu.h for the capability
-	 * rationale. Scoped to TIME_MACHINE shares only.
-	 */
-	if (aapl_ctxt) {
-		if (aapl_client_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR)
-			conn->aapl_readdir_attr = true;
-		/*
-		 * V2 extends the same inline-FinderInfo mechanism (see
-		 * smb2pdu.h), so a V2-requesting client also gets
-		 * aapl_readdir_attr treatment -- the reply just advertises
-		 * the V2 bit instead of the V1 one (create_aapl_rsp_buf).
-		 */
-		if (aapl_client_caps & SMB2_CRTCTX_AAPL_SUPPORTS_READ_DIR_ATTR_V2) {
-			conn->aapl_readdir_attr = true;
-			conn->aapl_readdir_attr_v2 = true;
-		}
-
-		contxt_cnt++;
-		create_aapl_rsp_buf(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength),
-				SMB2_CRTCTX_AAPL_FULL_SYNC,
-				aapl_req_bitmap,
-				conn->aapl_readdir_attr_v2);
-		le32_add_cpu(&rsp->CreateContextsLength,
-			     conn->vals->create_aapl_size);
-		iov_len += conn->vals->create_aapl_size;
-		if (next_ptr)
-			*next_ptr = cpu_to_le32(next_off);
-		/* AAPL is last; next_ptr need not be updated */
-	}
-
-	if (contxt_cnt > 0) {
-		rsp->CreateContextsOffset =
-			cpu_to_le32(offsetof(struct smb2_create_rsp, Buffer));
-	}
+reconnected_fp:
+	iov_len = smb2_build_create_rsp(work, rsp, fp, &stat, &ctx,
+					file_info, name);
 
 err_out:
 	if (rc && (file_present || created))
@@ -5475,7 +5693,7 @@ err_out1:
 
 err_out2:
 	if (!rc) {
-		if (!dh_info.replay)
+		if (!ctx.dh_info.replay)
 			rc = ksmbd_update_fstate(&work->sess->file_table, fp,
 						 FP_INITED);
 		if (!rc)
@@ -5484,50 +5702,18 @@ err_out2:
 			rc = ksmbd_iov_pin_rsp(work, (void *)rsp, iov_len);
 	}
 	if (rc) {
-		if (rc == -EINVAL)
-			rsp->hdr.Status = STATUS_INVALID_PARAMETER;
-		else if (rc == -EOPNOTSUPP)
-			rsp->hdr.Status = STATUS_NOT_SUPPORTED;
-		else if ((rc == -EACCES || rc == -ESTALE || rc == -EXDEV) &&
-			 !rsp->hdr.Status) {
-			if (req->DesiredAccess & FILE_ACCESS_SYSTEM_SECURITY_LE)
-				rsp->hdr.Status = STATUS_PRIVILEGE_NOT_HELD;
-			else
-				rsp->hdr.Status = STATUS_ACCESS_DENIED;
-		}
-		else if (rc == -ENOENT)
-			rsp->hdr.Status = STATUS_OBJECT_NAME_INVALID;
-		else if (rc == -EPERM)
-			rsp->hdr.Status = STATUS_SHARING_VIOLATION;
-		else if (rc == -EBUSY)
-			rsp->hdr.Status = STATUS_DELETE_PENDING;
-		else if (rc == -EBADF)
-			rsp->hdr.Status = STATUS_OBJECT_NAME_NOT_FOUND;
-		else if (rc == -ENOEXEC)
-			rsp->hdr.Status = STATUS_DUPLICATE_OBJECTID;
-		else if (rc == -ENXIO)
-			rsp->hdr.Status = STATUS_NO_SUCH_DEVICE;
-		else if (rc == -EEXIST)
-			rsp->hdr.Status = STATUS_OBJECT_NAME_COLLISION;
-		else if (rc == -EMFILE)
-			rsp->hdr.Status = STATUS_INSUFFICIENT_RESOURCES;
-		else if (rc == -EINPROGRESS)
-			rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
-		else if (rc == -EAGAIN)
-			rsp->hdr.Status = STATUS_FILE_NOT_AVAILABLE;
-		if (!rsp->hdr.Status)
-			rsp->hdr.Status = STATUS_UNEXPECTED_IO_ERROR;
+		smb2_create_error_status(req, rsp, rc);
 
-		if (fp && !dh_info.replay)
+		if (fp && !ctx.dh_info.replay)
 			ksmbd_fd_put(work, fp);
 		smb2_set_err_rsp(work);
 		ksmbd_debug(SMB, "Error response: %x\n", rsp->hdr.Status);
 	}
 
-	if (dh_info.replay)
-		ksmbd_put_durable_fd(dh_info.fp);
+	if (ctx.dh_info.replay)
+		ksmbd_put_durable_fd(ctx.dh_info.fp);
 
-	if (dh_info.reconnected) {
+	if (ctx.dh_info.reconnected) {
 		/*
 		 * If reconnect succeeded, fp was republished in the
 		 * session file table.  On a later error, ksmbd_fd_put()
@@ -5535,14 +5721,14 @@ err_out2:
 		 * lookup reference through the same session-aware path so
 		 * final close removes the volatile id before freeing fp.
 		 */
-		if (rc && fp == dh_info.fp)
-			ksmbd_fd_put(work, dh_info.fp);
+		if (rc && fp == ctx.dh_info.fp)
+			ksmbd_fd_put(work, ctx.dh_info.fp);
 		else
-			ksmbd_put_durable_fd(dh_info.fp);
+			ksmbd_put_durable_fd(ctx.dh_info.fp);
 	}
 
 	kfree(name);
-	kfree(lc);
+	kfree(ctx.lc);
 
 	return rc;
 }
