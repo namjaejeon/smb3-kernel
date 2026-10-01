@@ -104,6 +104,8 @@ Persistent handle              Under development.
 Resilient handle               Planned for future.
 SMB2 notify                    Under development.
 Sparse file support            Supported.
+SMB2 user quotas               Supported through ksmbd.mountd for native user
+                               quotas and configured Btrfs qgroups.
 DCE/RPC support                Partially Supported. a few calls(NetShareEnumAll,
                                NetServerGetInfo, SAMR, LSARPC) that are needed
                                for file server handled via netlink interface
@@ -163,6 +165,50 @@ How to run
 	$ sudo ksmbd.mountd
 
 6. Access share from Windows or Linux using SMB3 client (cifs.ko or smbclient of samba)
+
+SMB2 user quotas
+================
+
+SMB2 quota queries and updates are handled by ksmbd.mountd through netlink.
+Quota support is optional. Older ksmbd-tools versions can still start the
+server and serve ordinary SMB requests. If the daemon does not advertise
+the quota feature at startup, the kernel sends no quota IPC requests,
+does not advertise volume quota support, and returns STATUS_NOT_SUPPORTED
+for SMB quota query and update operations. To use quotas, both the kernel and
+ksmbd-tools must support the quota IPC interface.
+
+Volume quota state queries also require the quota state IPC feature. They
+report whether quotas are tracked or enforced, and whether Btrfs accounting
+is incomplete or being rebuilt. If the daemon does not advertise this feature,
+these queries succeed with quota state flags clear to preserve compatibility
+with older daemons.
+
+For filesystems with native user quotas, ksmbd.mountd uses quotactl_fd().
+Configure user quota accounting and enforcement locally before accessing
+quotas through SMB. This includes enabling the filesystem's quota support
+and CONFIG_QUOTACTL. CONFIG_QUOTA is not required for the Btrfs backend.
+The daemon must have permission to administer quotas and see the same paths
+and mounts as ksmbd.
+
+Btrfs uses a share-specific mapping from Linux UIDs to existing qgroups.
+Set the btrfs quota map share option to a space-separated list of
+mappings. Each mapping consists of a UID followed by a colon and the qgroup
+ID. For example, a writable share at /srv/storage/homes can map UID 1000
+to qgroup 0/256 and UID 1001 to qgroup 0/257.
+
+Use the users' UIDs and the existing qgroups on the share's Btrfs filesystem.
+Enable Btrfs quotas and create the subvolumes and qgroups locally. The mapping
+does not move files or change their ownership.
+Btrfs exposes referenced-space usage and a hard limit. Its SMB warning
+threshold must be -1. An unlimited hard limit is -1.
+
+Authenticated users can query their own quota. Enumerating quotas and setting
+limits require an SMB session mapped to Linux UID 0. Updates also require a
+writable tree connection. SMB operations do not enable quota accounting or
+set filesystem-wide default limits.
+
+See the ksmbd-tools README linked in the How to run section for the quota
+usage guide, filesystem preparation, and smbcquotas examples.
 
 Shutdown KSMBD
 ==============

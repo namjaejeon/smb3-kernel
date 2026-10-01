@@ -130,6 +130,7 @@ struct ksmbd_file {
 	__u64				open_mtime;
 
 	bool				is_nt_open;
+	bool				is_quota;
 	bool				attrib_only;
 	bool				allocation_size_set;
 
@@ -157,6 +158,8 @@ struct ksmbd_file {
 	/* if ls is happening on directory, below is valid*/
 	struct ksmbd_readdir_data	readdir_data;
 	struct mutex			readdir_lock;
+	struct mutex			quota_lock;
+	u32				current_quota_id;
 	int				dot_dotdot[2];
 	unsigned int			f_state;
 	bool				reserve_lease_break;
@@ -234,6 +237,8 @@ bool ksmbd_has_other_nonposix_open(struct dentry *dentry);
 bool ksmbd_has_nonposix_open_child(struct ksmbd_file *old_fp);
 unsigned int ksmbd_open_durable_fd(struct ksmbd_file *fp);
 struct ksmbd_file *ksmbd_open_fd(struct ksmbd_work *work, struct file *filp);
+struct ksmbd_file *ksmbd_open_quota_fd(struct ksmbd_work *work,
+				      struct file *filp);
 void ksmbd_launch_ksmbd_durable_scavenger(void);
 void ksmbd_stop_durable_scavenger(void);
 bool ksmbd_durable_scavenger_active(void);
