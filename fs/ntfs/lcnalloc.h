@@ -123,7 +123,11 @@ static inline int ntfs_cluster_free_from_rl(struct ntfs_volume *vol,
 	int ret;
 	unsigned int memalloc_flags;
 
+	if (!rl)
+		return 0;
 	memalloc_flags = memalloc_nofs_save();
+	if (!NVolFreeClusterKnown(vol))
+		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
 	down_write(&vol->lcnbmp_lock);
 	ret = ntfs_cluster_free_from_rl_nolock(vol, rl);
 	up_write(&vol->lcnbmp_lock);

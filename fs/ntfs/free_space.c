@@ -1,0 +1,370 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/* Free cluster extents indexed by starting LCN and decreasing length. */
+
+#include <linux/bitops.h>
+#include <linux/slab.h>
+
+#include "free_space.h"
+#include "lcnalloc.h"
+#include "ntfs.h"
+
+#define NTFS_MAX_FREE_EXTENTS (32U * 1024)
+
+struct ntfs_free_extent {
+	struct rb_node start_node;
+	struct rb_node length_node;
+	s64 start;
+	s64 length;
+};
+
+struct ntfs_cluster_range {
+	s64 start;
+	s64 end;
+};
+
+static void ntfs_free_extent_unlink(struct ntfs_free_space *space,
+		struct ntfs_free_extent *extent)
+{
+	rb_erase(&extent->start_node, &space->by_start);
+	rb_erase(&extent->length_node, &space->by_length);
+	space->nr_extents--;
+}
+
+static void ntfs_free_extent_link(struct ntfs_free_space *space,
+		struct ntfs_free_extent *extent)
+{
+	struct rb_node **link = &space->by_start.rb_node, *parent = NULL;
+
+	while (*link) {
+		struct ntfs_free_extent *entry;
+
+		parent = *link;
+		entry = rb_entry(parent, struct ntfs_free_extent, start_node);
+		if (extent->start < entry->start)
+			link = &parent->rb_left;
+		else
+			link = &parent->rb_right;
+	}
+	rb_link_node(&extent->start_node, parent, link);
+	rb_insert_color(&extent->start_node, &space->by_start);
+
+	link = &space->by_length.rb_node;
+	parent = NULL;
+	while (*link) {
+		struct ntfs_free_extent *entry;
+
+		parent = *link;
+		entry = rb_entry(parent, struct ntfs_free_extent, length_node);
+		if (extent->length > entry->length ||
+		    (extent->length == entry->length &&
+		     extent->start < entry->start))
+			link = &parent->rb_left;
+		else
+			link = &parent->rb_right;
+	}
+	rb_link_node(&extent->length_node, parent, link);
+	rb_insert_color(&extent->length_node, &space->by_length);
+	space->nr_extents++;
+}
+
+/* Find the last extent starting at or before @start. */
+static struct rb_node *ntfs_free_extent_before(struct ntfs_free_space *space,
+		s64 start)
+{
+	struct rb_node *node = space->by_start.rb_node, *before = NULL;
+
+	while (node) {
+		struct ntfs_free_extent *extent;
+
+		extent = rb_entry(node, struct ntfs_free_extent, start_node);
+		if (extent->start > start) {
+			node = node->rb_left;
+		} else {
+			before = node;
+			node = node->rb_right;
+		}
+	}
+	return before;
+}
+
+void ntfs_free_space_destroy(struct ntfs_free_space *space)
+{
+	struct rb_node *node;
+
+	while ((node = rb_first(&space->by_start))) {
+		struct ntfs_free_extent *extent;
+
+		extent = rb_entry(node, struct ntfs_free_extent, start_node);
+		rb_erase(node, &space->by_start);
+		kfree(extent);
+	}
+	space->by_length = RB_ROOT;
+	space->nr_extents = 0;
+	space->complete = false;
+}
+
+void ntfs_free_space_add(struct ntfs_free_space *space, s64 start, s64 length)
+{
+	struct ntfs_free_extent *extent = NULL;
+	struct rb_node *node;
+	s64 end = start + length;
+
+	if (!length)
+		return;
+
+	node = ntfs_free_extent_before(space, start);
+	if (node) {
+		struct ntfs_free_extent *entry;
+
+		entry = rb_entry(node, struct ntfs_free_extent, start_node);
+		if (entry->start + entry->length < start)
+			node = rb_next(node);
+	} else {
+		node = rb_first(&space->by_start);
+	}
+
+	/* Merge adjacent or overlapping extents, including rollback updates. */
+	while (node) {
+		struct ntfs_free_extent *entry;
+		struct rb_node *next = rb_next(node);
+
+		entry = rb_entry(node, struct ntfs_free_extent, start_node);
+		if (entry->start > end)
+			break;
+		start = min(start, entry->start);
+		end = max(end, entry->start + entry->length);
+		ntfs_free_extent_unlink(space, entry);
+		if (!extent)
+			extent = entry;
+		else
+			kfree(entry);
+		node = next;
+	}
+
+	if (!extent && space->nr_extents == NTFS_MAX_FREE_EXTENTS) {
+		struct ntfs_free_extent *smallest;
+
+		space->complete = false;
+		node = rb_last(&space->by_length);
+		smallest = rb_entry(node, struct ntfs_free_extent, length_node);
+		if (end - start <= smallest->length)
+			return;
+		ntfs_free_extent_unlink(space, smallest);
+		extent = smallest;
+	}
+	if (!extent) {
+		/* Cache misses must not make cluster allocation fail. */
+		extent = kmalloc_obj(*extent, GFP_NOWAIT | __GFP_NOWARN);
+		if (!extent) {
+			space->complete = false;
+			return;
+		}
+	}
+	extent->start = start;
+	extent->length = end - start;
+	ntfs_free_extent_link(space, extent);
+}
+
+void ntfs_free_space_remove(struct ntfs_free_space *space, s64 start, s64 length)
+{
+	struct rb_node *node = ntfs_free_extent_before(space, start);
+	s64 end = start + length;
+
+	if (!node)
+		node = rb_first(&space->by_start);
+	while (node) {
+		struct ntfs_free_extent *extent;
+		struct rb_node *next = rb_next(node);
+		s64 extent_end;
+
+		extent = rb_entry(node, struct ntfs_free_extent, start_node);
+		if (extent->start >= end)
+			break;
+		extent_end = extent->start + extent->length;
+		if (extent_end <= start) {
+			node = next;
+			continue;
+		}
+		ntfs_free_extent_unlink(space, extent);
+		if (extent->start < start) {
+			extent->length = start - extent->start;
+			ntfs_free_extent_link(space, extent);
+			if (extent_end > end) {
+				ntfs_free_space_add(space, end, extent_end - end);
+				break;
+			}
+		} else {
+			if (extent_end > end) {
+				extent->start = end;
+				extent->length = extent_end - end;
+				ntfs_free_extent_link(space, extent);
+				break;
+			}
+			kfree(extent);
+		}
+		node = next;
+	}
+}
+
+void ntfs_free_space_add_bitmap(struct ntfs_free_space *space,
+		const unsigned long *bitmap, s64 start, unsigned int bits)
+{
+	unsigned int bit = 0;
+
+	while (bit < bits) {
+		unsigned int end;
+
+		bit = find_next_zero_bit_le(bitmap, bits, bit);
+		if (bit == bits)
+			break;
+		end = find_next_bit_le(bitmap, bits, bit);
+		ntfs_free_space_add(space, start + bit, end - bit);
+		bit = end;
+	}
+}
+
+static unsigned int ntfs_get_allocation_ranges(struct ntfs_volume *vol, int zone,
+		struct ntfs_cluster_range *ranges)
+{
+	if (zone == MFT_ZONE) {
+		ranges[0].start = vol->mft_zone_start;
+		ranges[0].end = vol->mft_zone_end;
+		return 1;
+	}
+	ranges[0].start = vol->mft_zone_end;
+	ranges[0].end = vol->nr_clusters;
+	ranges[1].start = 0;
+	ranges[1].end = vol->mft_zone_start;
+	return 2;
+}
+
+static void ntfs_select_free_extent(s64 start, s64 end,
+		const struct ntfs_cluster_range *range, s64 *best_start,
+		s64 *best_length)
+{
+	start = max(start, range->start);
+	end = min(end, range->end);
+	if (end - start > *best_length) {
+		*best_start = start;
+		*best_length = end - start;
+	}
+}
+
+/* Scan the bitmap only when the extent cache cannot satisfy the request. */
+static int ntfs_free_space_scan(struct ntfs_volume *vol,
+		const struct ntfs_cluster_range *range, s64 count,
+		s64 *best_start, s64 *best_length)
+{
+	struct address_space *mapping = vol->lcnbmp_ino->i_mapping;
+	s64 run_start = 0, run_length = 0;
+	pgoff_t index, last;
+
+	if (range->start >= range->end)
+		return 0;
+	index = range->start >> (PAGE_SHIFT + 3);
+	last = (range->end - 1) >> (PAGE_SHIFT + 3);
+	for (; index <= last; index++) {
+		struct folio *folio;
+		unsigned long *bitmap;
+		s64 page_start = (s64)index << (PAGE_SHIFT + 3);
+		unsigned int bit = max_t(s64, range->start - page_start, 0);
+		unsigned int bits = min_t(s64, range->end - page_start,
+					 PAGE_SIZE * BITS_PER_BYTE);
+
+		if (!vol->lcn_empty_bits_per_page[index]) {
+			run_length = 0;
+			continue;
+		}
+		folio = read_mapping_folio(mapping, index, NULL);
+		if (IS_ERR(folio))
+			return PTR_ERR(folio);
+		folio_lock(folio);
+		bitmap = kmap_local_folio(folio, 0);
+		while (bit < bits) {
+			unsigned int free_bit, end;
+
+			free_bit = find_next_zero_bit_le(bitmap, bits, bit);
+			if (free_bit > bit)
+				run_length = 0;
+			if (free_bit == bits)
+				break;
+			end = find_next_bit_le(bitmap, bits, free_bit);
+			if (!run_length)
+				run_start = page_start + free_bit;
+			run_length += end - free_bit;
+			ntfs_free_space_add(&vol->free_space,
+					    page_start + free_bit, end - free_bit);
+			if (run_length > *best_length) {
+				*best_start = run_start;
+				*best_length = run_length;
+			}
+			if (run_length >= count)
+				break;
+			if (end < bits)
+				run_length = 0;
+			bit = end;
+		}
+		kunmap_local(bitmap);
+		folio_unlock(folio);
+		folio_put(folio);
+		if (*best_length >= count)
+			break;
+	}
+	return 0;
+}
+
+int ntfs_free_space_find(struct ntfs_volume *vol, int zone, s64 hint,
+		s64 count, s64 *start, s64 *length)
+{
+	struct ntfs_free_space *space = &vol->free_space;
+	struct ntfs_cluster_range ranges[2];
+	struct rb_node *node;
+	unsigned int i, nr_ranges = ntfs_get_allocation_ranges(vol, zone, ranges);
+	int err;
+
+	lockdep_assert_held_write(&vol->lcnbmp_lock);
+	*length = 0;
+	node = ntfs_free_extent_before(space, hint);
+	if (node) {
+		struct ntfs_free_extent *extent;
+
+		extent = rb_entry(node, struct ntfs_free_extent, start_node);
+		for (i = 0; i < nr_ranges; i++) {
+			if (hint < ranges[i].start || hint >= ranges[i].end)
+				continue;
+			if (extent->start + extent->length <= hint)
+				break;
+			*start = hint;
+			*length = min(extent->start + extent->length,
+				      ranges[i].end) - hint;
+			*length = min(*length, count);
+			return 0;
+		}
+	}
+
+	for (node = rb_first(&space->by_length); node; node = rb_next(node)) {
+		struct ntfs_free_extent *extent;
+
+		extent = rb_entry(node, struct ntfs_free_extent, length_node);
+		if (extent->length <= *length)
+			break;
+		for (i = 0; i < nr_ranges; i++)
+			ntfs_select_free_extent(extent->start,
+					extent->start + extent->length, &ranges[i],
+					start, length);
+	}
+	if (*length >= count || space->complete) {
+		*length = min(*length, count);
+		return 0;
+	}
+
+	for (i = 0; i < nr_ranges; i++) {
+		err = ntfs_free_space_scan(vol, &ranges[i], count, start, length);
+		if (err)
+			return err;
+		if (*length >= count)
+			break;
+	}
+	*length = min(*length, count);
+	return 0;
+}

@@ -1419,6 +1419,7 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 		folio_unlock(folio);
 		kunmap_local(b);
 		folio_put(folio);
+		ntfs_free_space_remove(&vol->free_space, lcn, 1);
 		up_write(&vol->lcnbmp_lock);
 		/* Update the mft bitmap runlist. */
 		rl->length++;

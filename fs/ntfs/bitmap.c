@@ -140,6 +140,8 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 
 	if (start_bit < 0 || cnt < 0 || value > 1)
 		return -EINVAL;
+	if (!cnt)
+		return 0;
 
 	/*
 	 * Calculate the indices for the pages containing the first and last
@@ -262,9 +264,18 @@ done:
 	folio_unlock(folio);
 	kunmap_local(kaddr);
 	folio_put(folio);
+	if (ni->mft_no == FILE_Bitmap && NVolFreeClusterKnown(vol)) {
+		if (value)
+			ntfs_free_space_remove(&vol->free_space, start_bit, count);
+		else
+			ntfs_free_space_add(&vol->free_space, start_bit, count);
+	}
 	ntfs_debug("Done.");
 	return 0;
 rollback:
+	/* A failed rollback must never leave used clusters in the free cache. */
+	if (ni->mft_no == FILE_Bitmap)
+		ntfs_free_space_destroy(&vol->free_space);
 	/*
 	 * Current state:
 	 *	- no pages are mapped

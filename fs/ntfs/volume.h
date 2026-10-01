@@ -18,6 +18,7 @@
 #include <linux/errseq.h>
 
 #include "layout.h"
+#include "free_space.h"
 
 #define NTFS_VOL_UID	BIT(1)
 #define NTFS_VOL_GID	BIT(2)
@@ -90,6 +91,7 @@
  * @dirty_clusters: Number of clusters that are dirty.
  * @sparse_compression_unit: Size of compression/sparse unit in clusters.
  * @lcn_empty_bits_per_page: Number of empty bits per page in the LCN bitmap.
+ * @free_space: Cached free cluster extents, protected by lcnbmp_lock.
  * @precalc_work: Work structure for background pre-calculation tasks.
  * @preallocated_size: reallocation size (in bytes).
  */
@@ -163,6 +165,7 @@ struct ntfs_volume {
 	atomic64_t dirty_clusters;
 	u8 sparse_compression_unit;
 	unsigned int *lcn_empty_bits_per_page;
+	struct ntfs_free_space free_space;
 	struct work_struct precalc_work;
 	loff_t preallocated_size;
 };

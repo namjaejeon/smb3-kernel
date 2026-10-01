@@ -1890,6 +1890,7 @@ static void ntfs_volume_free(struct ntfs_volume *vol)
 	unload_nls(vol->nls_map);
 
 	kvfree(vol->lcn_empty_bits_per_page);
+	ntfs_free_space_destroy(&vol->free_space);
 	kfree(vol->volume_label);
 	kfree(vol);
 }
@@ -2149,12 +2150,20 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 	struct folio *folio;
 	pgoff_t index, max_index;
 	struct file_ra_state ra = { 0 };
+	unsigned int memalloc_flags;
 
 	ntfs_debug("Entering.");
 	/* Serialize accesses to the cluster bitmap. */
 
 	if (NVolFreeClusterKnown(vol))
 		return atomic64_read(&vol->free_clusters);
+	memalloc_flags = memalloc_nofs_save();
+	down_write(&vol->lcnbmp_lock);
+	if (NVolFreeClusterKnown(vol)) {
+		nr_free = atomic64_read(&vol->free_clusters);
+		goto unlock;
+	}
+	vol->free_space.complete = true;
 
 	file_ra_state_init(&ra, mapping);
 
@@ -2182,6 +2191,7 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 			ntfs_debug("Skipping page (index 0x%lx).", index);
 			nr_free -= PAGE_SIZE * 8;
 			vol->lcn_empty_bits_per_page[index] = 0;
+			vol->free_space.complete = false;
 			continue;
 		}
 
@@ -2196,6 +2206,11 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 		nr_used = bitmap_weight(kaddr, PAGE_SIZE * BITS_PER_BYTE);
 		nr_free -= nr_used;
 		vol->lcn_empty_bits_per_page[index] = PAGE_SIZE * BITS_PER_BYTE - nr_used;
+		ntfs_free_space_add_bitmap(&vol->free_space, kaddr,
+				(s64)index << (PAGE_SHIFT + 3),
+				min_t(s64, PAGE_SIZE * BITS_PER_BYTE,
+				      vol->nr_clusters -
+				      ((s64)index << (PAGE_SHIFT + 3))));
 		kunmap_local(kaddr);
 		folio_unlock(folio);
 		folio_put(folio);
@@ -2215,6 +2230,9 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 		atomic64_set(&vol->free_clusters, nr_free);
 
 	NVolSetFreeClusterKnown(vol);
+unlock:
+	up_write(&vol->lcnbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
 	wake_up_all(&vol->free_waitq);
 	ntfs_debug("Exiting.");
 	return nr_free;
@@ -2737,6 +2755,7 @@ iput_tmp_ino_err_out_now:
 err_out_now:
 	sb->s_fs_info = NULL;
 	kvfree(vol->lcn_empty_bits_per_page);
+	ntfs_free_space_destroy(&vol->free_space);
 	kfree(vol->volume_label);
 	unload_nls(vol->nls_map);
 	kfree(vol);
