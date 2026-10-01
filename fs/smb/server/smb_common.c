@@ -830,8 +830,10 @@ int __ksmbd_override_fsids(struct ksmbd_work *work,
 	set_groups(cred, gi);
 	put_group_info(gi);
 
-	if (!uid_eq(cred->fsuid, GLOBAL_ROOT_UID))
+	if (!uid_eq(cred->fsuid, GLOBAL_ROOT_UID)) {
 		cred->cap_effective = cap_drop_fs_set(cred->cap_effective);
+		cap_lower(cred->cap_effective, CAP_SYS_RESOURCE);
+	}
 
 	WARN_ON(work->saved_cred);
 	work->saved_cred = override_creds(cred);

@@ -19,6 +19,15 @@ struct ksmbd_session;
 struct ksmbd_share_config;
 struct ksmbd_tree_connect;
 struct sockaddr;
+struct path;
+struct ksmbd_work;
+struct ksmbd_quota_request;
+struct ksmbd_quota_response;
+
+struct ksmbd_quota_request *
+ksmbd_ipc_quota_alloc(struct ksmbd_work *work, const struct path *path);
+int ksmbd_ipc_quota_request(struct ksmbd_quota_request *req,
+			    struct ksmbd_quota_response *resp);
 
 struct ksmbd_tree_connect_response *
 ksmbd_ipc_tree_connect_request(struct ksmbd_session *sess,

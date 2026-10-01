@@ -529,6 +529,7 @@ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
 		    char *buf, size_t count, loff_t *pos, bool sync,
 		    ssize_t *written)
 {
+	const struct cred *saved_cred;
 	struct file *filp;
 	int err = 0;
 
@@ -566,7 +567,9 @@ int ksmbd_vfs_write(struct ksmbd_work *work, struct ksmbd_file *fp,
 	/* Do we need to break any of a levelII oplock? */
 	smb_break_all_levII_oplock(work, fp, 1);
 
+	saved_cred = override_creds(filp->f_cred);
 	err = kernel_write(filp, buf, count, pos);
+	revert_creds(saved_cred);
 	if (err < 0) {
 		ksmbd_debug(VFS, "smb write failed, err = %d\n", err);
 		goto out;
