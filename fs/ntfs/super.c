@@ -162,9 +162,10 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		}
 		break;
 	case Opt_mft_zone_multiplier:
-		if (vol->mft_zone_multiplier && vol->mft_zone_multiplier !=
-				result.int_32) {
-			ntfs_error(vol->sb, "Cannot change mft_zone_multiplier on remount.");
+		if (fc->purpose == FS_CONTEXT_FOR_RECONFIGURE &&
+		    NTFS_SB(fc->root->d_sb)->mft_zone_multiplier != result.int_32) {
+			ntfs_error(vol->sb,
+				   "Cannot change mft_zone_multiplier on remount.");
 			return -EINVAL;
 		}
 		if (result.int_32 < 1 || result.int_32 > 4) {
