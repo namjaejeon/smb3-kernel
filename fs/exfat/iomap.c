@@ -148,7 +148,28 @@ static int exfat_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 static int exfat_write_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 		unsigned int flags, struct iomap *iomap, struct iomap *srcmap)
 {
-	return __exfat_iomap_begin(inode, offset, length, flags, iomap, true);
+	struct exfat_inode_info *ei = EXFAT_I(inode);
+	loff_t end;
+	int err;
+
+	err = __exfat_iomap_begin(inode, offset, length, flags, iomap, true);
+	if (err || flags & (IOMAP_DIRECT | IOMAP_FAULT) ||
+	    iomap->flags & IOMAP_F_NEW)
+		return err;
+
+	end = iomap->offset + iomap->length;
+	if (end >= ei->valid_size ||
+	    round_up(end, i_blocksize(inode)) <= ei->valid_size)
+		return 0;
+
+	/*
+	 * The write ends before valid_size in the same block. ZERO_TAIL would
+	 * also erase valid bytes between the write and valid_size. Zero only
+	 * the invalid tail before write_begin reads the block into the cache.
+	 * The mapping lock has been dropped and the folio is not locked yet.
+	 */
+	return iomap_truncate_page(inode, ei->valid_size, NULL, &exfat_iomap_ops,
+				   NULL, NULL);
 }
 
 static DEFINE_IOMAP_ITER_NEXT(exfat_iomap_next, exfat_iomap_begin);
