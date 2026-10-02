@@ -4,6 +4,15 @@
  *   Author(s): Namjae Jeon <linkinjeon@kernel.org>
  */
 
+#ifndef __KSMBD_NDR_H
+#define __KSMBD_NDR_H
+
+struct inode;
+struct mnt_idmap;
+struct xattr_dos_attrib;
+struct xattr_smb_acl;
+struct xattr_ntacl;
+
 struct ndr {
 	char	*data;
 	int	offset;
@@ -18,5 +27,6 @@ int ndr_encode_posix_acl(struct ndr *n, struct mnt_idmap *idmap,
 			 struct inode *inode, struct xattr_smb_acl *acl,
 			 struct xattr_smb_acl *def_acl);
 int ndr_encode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl);
-int ndr_encode_v3_ntacl(struct ndr *n, struct xattr_ntacl *acl);
 int ndr_decode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl);
+
+#endif /* __KSMBD_NDR_H */

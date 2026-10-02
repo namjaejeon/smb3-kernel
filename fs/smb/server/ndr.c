@@ -5,127 +5,118 @@
  */
 
 #include <linux/fs.h>
+#include <linux/overflow.h>
 
 #include "glob.h"
 #include "ndr.h"
+#include "xattr.h"
 
 static inline char *ndr_get_field(struct ndr *n)
 {
 	return n->data + n->offset;
 }
 
-static int try_to_realloc_ndr_blob(struct ndr *n, size_t sz)
+static int ndr_init(struct ndr *n, size_t length)
 {
+	n->offset = 0;
+	n->length = 0;
+	n->data = NULL;
+	if (length > INT_MAX)
+		return -EOVERFLOW;
+
+	n->length = length;
+	n->data = kzalloc(length, KSMBD_DEFAULT_GFP);
+	if (!n->data)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static int ndr_reserve(struct ndr *n, size_t sz)
+{
+	size_t required, length;
 	char *data;
 
-	data = krealloc(n->data, n->offset + sz + 1024, KSMBD_DEFAULT_GFP);
+	if (check_add_overflow((size_t)n->offset, sz, &required) ||
+	    required > INT_MAX)
+		return -EOVERFLOW;
+
+	if (required <= n->length)
+		return 0;
+
+	length = max(required, min_t(size_t, (size_t)n->length * 2, INT_MAX));
+	data = krealloc(n->data, length, KSMBD_DEFAULT_GFP);
 	if (!data)
 		return -ENOMEM;
 
 	n->data = data;
-	n->length += 1024;
-	memset(n->data + n->offset, 0, 1024);
+	n->length = length;
+	return 0;
+}
+
+static int ndr_write_bytes(struct ndr *n, const void *value, size_t sz)
+{
+	int ret;
+
+	ret = ndr_reserve(n, sz);
+	if (ret)
+		return ret;
+
+	memcpy(ndr_get_field(n), value, sz);
+	n->offset += sz;
+	return 0;
+}
+
+static int ndr_write_align(struct ndr *n, unsigned int alignment)
+{
+	size_t padding = ALIGN((size_t)n->offset, alignment) - n->offset;
+	int ret;
+
+	ret = ndr_reserve(n, padding);
+	if (ret)
+		return ret;
+
+	memset(ndr_get_field(n), 0, padding);
+	n->offset += padding;
 	return 0;
 }
 
 static int ndr_write_int16(struct ndr *n, __u16 value)
 {
-	if (n->length <= n->offset + sizeof(value)) {
-		int ret;
+	__le16 encoded = cpu_to_le16(value);
 
-		ret = try_to_realloc_ndr_blob(n, sizeof(value));
-		if (ret)
-			return ret;
-	}
-
-	*(__le16 *)ndr_get_field(n) = cpu_to_le16(value);
-	n->offset += sizeof(value);
-	return 0;
+	return ndr_write_bytes(n, &encoded, sizeof(encoded));
 }
 
 static int ndr_write_int32(struct ndr *n, __u32 value)
 {
-	if (n->length <= n->offset + sizeof(value)) {
-		int ret;
+	__le32 encoded = cpu_to_le32(value);
 
-		ret = try_to_realloc_ndr_blob(n, sizeof(value));
-		if (ret)
-			return ret;
-	}
-
-	*(__le32 *)ndr_get_field(n) = cpu_to_le32(value);
-	n->offset += sizeof(value);
-	return 0;
+	return ndr_write_bytes(n, &encoded, sizeof(encoded));
 }
 
 static int ndr_write_int64(struct ndr *n, __u64 value)
 {
-	if (n->length <= n->offset + sizeof(value)) {
-		int ret;
+	__le64 encoded = cpu_to_le64(value);
 
-		ret = try_to_realloc_ndr_blob(n, sizeof(value));
-		if (ret)
-			return ret;
-	}
-
-	*(__le64 *)ndr_get_field(n) = cpu_to_le64(value);
-	n->offset += sizeof(value);
-	return 0;
+	return ndr_write_bytes(n, &encoded, sizeof(encoded));
 }
 
-static int ndr_write_bytes(struct ndr *n, void *value, size_t sz)
+static int ndr_write_string(struct ndr *n, const char *value)
 {
-	if (n->length <= n->offset + sz) {
-		int ret;
+	int ret;
 
-		ret = try_to_realloc_ndr_blob(n, sz);
-		if (ret)
-			return ret;
-	}
+	ret = ndr_write_bytes(n, value, strlen(value) + 1);
+	if (ret)
+		return ret;
 
-	memcpy(ndr_get_field(n), value, sz);
-	n->offset += sz;
-	return 0;
-}
-
-static int ndr_write_string(struct ndr *n, char *value)
-{
-	size_t sz;
-
-	sz = strlen(value) + 1;
-	if (n->length <= n->offset + sz) {
-		int ret;
-
-		ret = try_to_realloc_ndr_blob(n, sz);
-		if (ret)
-			return ret;
-	}
-
-	memcpy(ndr_get_field(n), value, sz);
-	n->offset += sz;
-	n->offset = ALIGN(n->offset, 2);
-	return 0;
-}
-
-static int ndr_read_string(struct ndr *n, void *value, size_t sz)
-{
-	int len;
-
-	if (n->offset + sz > n->length)
-		return -EINVAL;
-
-	len = strnlen(ndr_get_field(n), sz);
-	if (value)
-		memcpy(value, ndr_get_field(n), len);
-	len++;
-	n->offset += len;
-	n->offset = ALIGN(n->offset, 2);
-	return 0;
+	return ndr_write_align(n, 2);
 }
 
 static int ndr_read_bytes(struct ndr *n, void *value, size_t sz)
 {
-	if (n->offset + sz > n->length)
+	if (n->offset < 0 || n->offset > n->length ||
+	    sz > n->length - n->offset)
 		return -EINVAL;
 
 	if (value)
@@ -134,36 +125,83 @@ static int ndr_read_bytes(struct ndr *n, void *value, size_t sz)
 	return 0;
 }
 
-static int ndr_read_int16(struct ndr *n, __u16 *value)
+static int ndr_read_string(struct ndr *n, size_t max_len)
 {
-	if (n->offset + sizeof(__u16) > n->length)
+	size_t len, limit;
+	int ret;
+
+	ret = ndr_read_bytes(n, NULL, 0);
+	if (ret)
+		return ret;
+
+	limit = min_t(size_t, max_len, n->length - n->offset);
+	len = strnlen(ndr_get_field(n), limit);
+	if (len == limit)
 		return -EINVAL;
 
-	if (value)
-		*value = le16_to_cpu(*(__le16 *)ndr_get_field(n));
-	n->offset += sizeof(__u16);
-	return 0;
+	len = ALIGN((size_t)n->offset + len + 1, 2) - n->offset;
+	return ndr_read_bytes(n, NULL, len);
+}
+
+static int ndr_read_int16(struct ndr *n, __u16 *value)
+{
+	__le16 encoded;
+	int ret;
+
+	ret = ndr_read_bytes(n, value ? &encoded : NULL, sizeof(encoded));
+	if (!ret && value)
+		*value = le16_to_cpu(encoded);
+	return ret;
 }
 
 static int ndr_read_int32(struct ndr *n, __u32 *value)
 {
-	if (n->offset + sizeof(__u32) > n->length)
-		return -EINVAL;
+	__le32 encoded;
+	int ret;
 
-	if (value)
-		*value = le32_to_cpu(*(__le32 *)ndr_get_field(n));
-	n->offset += sizeof(__u32);
-	return 0;
+	ret = ndr_read_bytes(n, value ? &encoded : NULL, sizeof(encoded));
+	if (!ret && value)
+		*value = le32_to_cpu(encoded);
+	return ret;
 }
 
 static int ndr_read_int64(struct ndr *n, __u64 *value)
 {
-	if (n->offset + sizeof(__u64) > n->length)
-		return -EINVAL;
+	__le64 encoded;
+	int ret;
 
-	if (value)
-		*value = le64_to_cpu(*(__le64 *)ndr_get_field(n));
-	n->offset += sizeof(__u64);
+	ret = ndr_read_bytes(n, value ? &encoded : NULL, sizeof(encoded));
+	if (!ret && value)
+		*value = le64_to_cpu(encoded);
+	return ret;
+}
+
+static int ndr_write_version(struct ndr *n, __u16 version)
+{
+	int ret;
+
+	ret = ndr_write_int16(n, version);
+	if (ret)
+		return ret;
+	return ndr_write_int32(n, version);
+}
+
+static int ndr_read_version(struct ndr *n, __u16 *version)
+{
+	__u32 version2;
+	int ret;
+
+	ret = ndr_read_int16(n, version);
+	if (ret)
+		return ret;
+	ret = ndr_read_int32(n, &version2);
+	if (ret)
+		return ret;
+	if (*version != version2) {
+		ksmbd_debug(VFS, "ndr version mismatched(version: %d, version2: %d)\n",
+			    *version, version2);
+		return -EINVAL;
+	}
 	return 0;
 }
 
@@ -172,11 +210,9 @@ int ndr_encode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 	char hex_attr[12] = {0};
 	int ret;
 
-	n->offset = 0;
-	n->length = 1024;
-	n->data = kzalloc(n->length, KSMBD_DEFAULT_GFP);
-	if (!n->data)
-		return -ENOMEM;
+	ret = ndr_init(n, 1024);
+	if (ret)
+		return ret;
 
 	if (da->version == 3) {
 		snprintf(hex_attr, 10, "0x%x", da->attr);
@@ -187,11 +223,7 @@ int ndr_encode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 	if (ret)
 		return ret;
 
-	ret = ndr_write_int16(n, da->version);
-	if (ret)
-		return ret;
-
-	ret = ndr_write_int32(n, da->version);
+	ret = ndr_write_version(n, da->version);
 	if (ret)
 		return ret;
 
@@ -228,31 +260,19 @@ int ndr_encode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 
 int ndr_decode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 {
-	char hex_attr[12];
-	unsigned int version2;
 	int ret;
 
 	n->offset = 0;
-	ret = ndr_read_string(n, hex_attr, sizeof(hex_attr));
+	ret = ndr_read_string(n, 12);
 	if (ret)
 		return ret;
 
-	ret = ndr_read_int16(n, &da->version);
+	ret = ndr_read_version(n, &da->version);
 	if (ret)
 		return ret;
 
 	if (da->version != 3 && da->version != 4) {
 		ksmbd_debug(VFS, "v%d version is not supported\n", da->version);
-		return -EINVAL;
-	}
-
-	ret = ndr_read_int32(n, &version2);
-	if (ret)
-		return ret;
-
-	if (da->version != version2) {
-		ksmbd_debug(VFS, "ndr version mismatched(version: %d, version2: %d)\n",
-		       da->version, version2);
 		return -EINVAL;
 	}
 
@@ -301,7 +321,9 @@ static int ndr_encode_posix_acl_entry(struct ndr *n, struct xattr_smb_acl *acl)
 	if (ret)
 		return ret;
 
-	n->offset = ALIGN(n->offset, 8);
+	ret = ndr_write_align(n, 8);
+	if (ret)
+		return ret;
 	ret = ndr_write_int32(n, acl->count);
 	if (ret)
 		return ret;
@@ -311,7 +333,9 @@ static int ndr_encode_posix_acl_entry(struct ndr *n, struct xattr_smb_acl *acl)
 		return ret;
 
 	for (i = 0; i < acl->count; i++) {
-		n->offset = ALIGN(n->offset, 8);
+		ret = ndr_write_align(n, 8);
+		if (ret)
+			return ret;
 		ret = ndr_write_int16(n, acl->entries[i].type);
 		if (ret)
 			return ret;
@@ -320,12 +344,13 @@ static int ndr_encode_posix_acl_entry(struct ndr *n, struct xattr_smb_acl *acl)
 		if (ret)
 			return ret;
 
-		if (acl->entries[i].type == SMB_ACL_USER) {
-			n->offset = ALIGN(n->offset, 8);
-			ret = ndr_write_int64(n, acl->entries[i].uid);
-		} else if (acl->entries[i].type == SMB_ACL_GROUP) {
-			n->offset = ALIGN(n->offset, 8);
-			ret = ndr_write_int64(n, acl->entries[i].gid);
+		if (acl->entries[i].type == SMB_ACL_USER ||
+		    acl->entries[i].type == SMB_ACL_GROUP) {
+			ret = ndr_write_align(n, 8);
+			if (ret)
+				return ret;
+			ret = ndr_write_int64(n, acl->entries[i].type == SMB_ACL_USER ?
+					      acl->entries[i].uid : acl->entries[i].gid);
 		}
 		if (ret)
 			return ret;
@@ -348,11 +373,9 @@ int ndr_encode_posix_acl(struct ndr *n,
 	vfsuid_t vfsuid;
 	vfsgid_t vfsgid;
 
-	n->offset = 0;
-	n->length = 1024;
-	n->data = kzalloc(n->length, KSMBD_DEFAULT_GFP);
-	if (!n->data)
-		return -ENOMEM;
+	ret = ndr_init(n, 1024);
+	if (ret)
+		return ret;
 
 	if (acl) {
 		/* ACL ACCESS */
@@ -399,17 +422,11 @@ int ndr_encode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 	unsigned int ref_id = 0x00020004;
 	int ret;
 
-	n->offset = 0;
-	n->length = 2048;
-	n->data = kzalloc(n->length, KSMBD_DEFAULT_GFP);
-	if (!n->data)
-		return -ENOMEM;
-
-	ret = ndr_write_int16(n, acl->version);
+	ret = ndr_init(n, 2048);
 	if (ret)
 		return ret;
 
-	ret = ndr_write_int32(n, acl->version);
+	ret = ndr_write_version(n, acl->version);
 	if (ret)
 		return ret;
 
@@ -449,24 +466,14 @@ int ndr_encode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 
 int ndr_decode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 {
-	unsigned int version2;
 	int ret;
 
 	n->offset = 0;
-	ret = ndr_read_int16(n, &acl->version);
+	ret = ndr_read_version(n, &acl->version);
 	if (ret)
 		return ret;
 	if (acl->version != 4) {
 		ksmbd_debug(VFS, "v%d version is not supported\n", acl->version);
-		return -EINVAL;
-	}
-
-	ret = ndr_read_int32(n, &version2);
-	if (ret)
-		return ret;
-	if (acl->version != version2) {
-		ksmbd_debug(VFS, "ndr version mismatched(version: %d, version2: %d)\n",
-		       acl->version, version2);
 		return -EINVAL;
 	}
 
