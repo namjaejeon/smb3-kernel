@@ -6,6 +6,7 @@
 
 #include <linux/fs.h>
 #include <linux/overflow.h>
+#include <kunit/visibility.h>
 
 #include "glob.h"
 #include "ndr.h"
@@ -257,6 +258,7 @@ int ndr_encode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 		ret = ndr_write_int64(n, da->change_time);
 	return ret;
 }
+EXPORT_SYMBOL_IF_KUNIT(ndr_encode_dos_attr);
 
 int ndr_decode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 {
@@ -312,6 +314,7 @@ int ndr_decode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 
 	return ret;
 }
+EXPORT_SYMBOL_IF_KUNIT(ndr_decode_dos_attr);
 
 static int ndr_encode_posix_acl_entry(struct ndr *n, struct xattr_smb_acl *acl)
 {
@@ -419,6 +422,7 @@ int ndr_encode_posix_acl(struct ndr *n,
 		return ndr_encode_posix_acl_entry(n, def_acl);
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(ndr_encode_posix_acl);
 
 int ndr_encode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 {
@@ -466,6 +470,7 @@ int ndr_encode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 	ret = ndr_write_bytes(n, acl->sd_buf, acl->sd_size);
 	return ret;
 }
+EXPORT_SYMBOL_IF_KUNIT(ndr_encode_v4_ntacl);
 
 int ndr_decode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 {
@@ -525,3 +530,4 @@ int ndr_decode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 	n->offset += acl->sd_size;
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(ndr_decode_v4_ntacl);
