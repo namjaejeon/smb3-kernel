@@ -357,6 +357,39 @@ int ntfs_free_space_find_at(struct ntfs_volume *vol, s64 hint, s64 end,
 	return 0;
 }
 
+/* Find the largest free run in the current bitmap page's remaining range. */
+static int ntfs_free_space_find_local(struct ntfs_volume *vol, s64 begin,
+		s64 end, s64 *start, s64 *length)
+{
+	struct ntfs_free_space *space = &vol->free_space;
+	struct ntfs_cluster_range range = {
+		.start = begin,
+		.end = begin + min_t(s64, end - begin,
+			PAGE_SIZE * BITS_PER_BYTE -
+			(begin & (PAGE_SIZE * BITS_PER_BYTE - 1))),
+	};
+	struct rb_node *node = ntfs_free_extent_before(space, begin);
+
+	if (!node)
+		node = rb_first(&space->by_start);
+	for (; node; node = rb_next(node)) {
+		struct ntfs_free_extent *extent;
+
+		extent = rb_entry(node, struct ntfs_free_extent, start_node);
+		if (extent->start >= range.end)
+			break;
+		ntfs_select_free_extent(extent->start,
+				extent->start + extent->length, &range,
+				start, length);
+	}
+	if (space->complete)
+		return 0;
+
+	/* An incomplete cache cannot establish the largest run in this page. */
+	return ntfs_free_space_scan(vol, &range, range.end - range.start,
+				   start, length);
+}
+
 /* The allocator supplies one zone pass; the cache only selects an extent. */
 int ntfs_free_space_find(struct ntfs_volume *vol, s64 begin, s64 end,
 		s64 count, s64 *start, s64 *length)
@@ -371,6 +404,21 @@ int ntfs_free_space_find(struct ntfs_volume *vol, s64 begin, s64 end,
 	if (begin >= end)
 		return 0;
 
+	/*
+	 * Prefer a local maximum that can satisfy the request, leaving its tail
+	 * available for this file's adjacency hint. Small concurrent allocations
+	 * can then start in separate holes instead of sharing one large extent.
+	 * Use the zone-wide index when the local runs are too short, so larger
+	 * requests still benefit from extents spanning bitmap pages.
+	 */
+	err = ntfs_free_space_find_local(vol, begin, end, start, length);
+	if (err)
+		return err;
+	if (*length >= count) {
+		*length = count;
+		return 0;
+	}
+	*length = 0;
 	for (node = rb_first(&space->by_length); node; node = rb_next(node)) {
 		struct ntfs_free_extent *extent;
 

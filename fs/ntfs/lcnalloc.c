@@ -167,9 +167,10 @@ static bool ntfs_shrink_mft_zone(struct ntfs_volume *vol)
  * then switch zones. Without a hint inside the MFT zone, DATA allocations use
  * the reservation only after exhausting both data zones and halving it.
  *
- * Search the free extent cache before scanning the bitmap, choosing large
- * extents within each zone pass. Mark bitmap ranges and update counters once
- * per extent. Successful explicit hints do not move the volume's cursors.
+ * Try caller-supplied adjacency hints first. When choosing a new location,
+ * prefer the largest local free run if it can satisfy the request, otherwise
+ * search the zone-wide extent index. Mark bitmap ranges and update counters
+ * once per extent. Successful explicit hints do not move the volume's cursors.
  *
  * Return: allocated runlist, or an error pointer. All committed extents are
  * rolled back on failure. The caller must not hold lcnbmp_lock.
@@ -186,6 +187,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 	unsigned int memalloc_flags;
 	int search_zone, done_zones, pass, err = 0;
 	bool used_zone_pos = start_lcn < 0;
+	bool adjacent_hint = start_lcn >= 0;
 
 	if (start_vcn < 0 || count <= 0 || count > S64_MAX - start_vcn ||
 	    start_lcn < LCN_HOLE ||
@@ -214,15 +216,18 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 	pass = hint == zone_begin ? 2 : 1;
 
 	while (allocated < count) {
-		s64 start = hint, length;
+		s64 start = hint, length = 0;
 
-		err = ntfs_free_space_find_at(vol, hint, zone_end,
-					      count - allocated, &length);
-		if (err)
-			goto rollback;
+		if (adjacent_hint) {
+			err = ntfs_free_space_find_at(vol, hint, zone_end,
+						      count - allocated, &length);
+			if (err)
+				goto rollback;
+		}
 		if (!length && !used_zone_pos) {
 			/* The caller's adjacency hint ended; use the zone cursor. */
 			used_zone_pos = true;
+			adjacent_hint = false;
 			zone_start = hint = zone_hint;
 			pass = hint == zone_begin ? 2 : 1;
 			continue;
@@ -239,6 +244,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 				pass = 2;
 				zone_end = min(zone_start, zone_end);
 				zone_start = hint = zone_begin;
+				adjacent_hint = false;
 				continue;
 			}
 			if (nr_runs && used_zone_pos)
@@ -255,6 +261,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 				if (zone_hint >= zone_end)
 					zone_hint = zone_begin;
 				zone_start = initial_pos = hint = zone_hint;
+				adjacent_hint = false;
 				pass = hint == zone_begin ? 2 : 1;
 				continue;
 			}
@@ -268,6 +275,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 			search_zone = NTFS_ZONE_DATA1;
 			zone_begin = zone_start = initial_pos = hint =
 				zone_hint = vol->data1_zone_pos;
+			adjacent_hint = false;
 			pass = 2;
 			done_zones &= ~NTFS_ZONE_DATA1;
 			continue;
@@ -313,6 +321,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 		rl[nr_runs].lcn = is_extension ? LCN_ENOENT : LCN_RL_NOT_MAPPED;
 		rl[nr_runs].length = 0;
 		hint = start + length;
+		adjacent_hint = true;
 		if (is_contig)
 			break;
 	}
