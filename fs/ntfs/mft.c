@@ -2103,7 +2103,7 @@ undo_alloc:
  *
  * Return 0 on success and -errno on error.
  */
-static int ntfs_mft_record_layout(const struct ntfs_volume *vol, const s64 mft_no,
+int ntfs_mft_record_layout(const struct ntfs_volume *vol, const s64 mft_no,
 		struct mft_record *m)
 {
 	struct attr_record *a;

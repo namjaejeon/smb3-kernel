@@ -82,6 +82,8 @@ static inline int write_mft_record(struct ntfs_inode *ni, struct mft_record *m, 
 int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
 		struct ntfs_inode **ni, struct ntfs_inode *base_ni,
 		struct mft_record **ni_mrec, const s64 mft_data_vcn);
+int ntfs_mft_record_layout(const struct ntfs_volume *vol, const s64 mft_no,
+		struct mft_record *m);
 int ntfs_mft_record_free(struct ntfs_volume *vol, struct ntfs_inode *ni);
 int ntfs_mft_records_write(const struct ntfs_volume *vol, const u64 mref,
 		const s64 count, struct mft_record *b);

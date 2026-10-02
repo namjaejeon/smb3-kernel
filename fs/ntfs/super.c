@@ -23,6 +23,7 @@
 #include "ea.h"
 #include "volume.h"
 #include "stream.h"
+#include "upgrade.h"
 
 /* A global default upcase table and a corresponding reference count. */
 static __le16 *default_upcase;
@@ -334,6 +335,12 @@ static int ntfs_reconfigure(struct fs_context *fc)
 		}
 		if (vol->vol_flags & VOLUME_MODIFIED_BY_CHKDSK) {
 			ntfs_error(sb, "Volume has been modified by chkdsk and is read-only%s", es);
+			return -EROFS;
+		}
+		/* Conversion requires the exclusive bootstrap phase of a new mount. */
+		if (vol->major_ver < 3 &&
+		    (vol->vol_flags & VOLUME_UPGRADE_ON_MOUNT)) {
+			ntfs_error(sb, "Unmount and mount read-write to upgrade this volume%s", es);
 			return -EROFS;
 		}
 		if (vol->vol_flags & VOLUME_MUST_MOUNT_RO_MASK) {
@@ -1591,6 +1598,7 @@ static bool load_system_files(struct ntfs_volume *vol)
 	struct volume_information *vi;
 	struct ntfs_attr_search_ctx *ctx;
 	struct restart_page_header *rp;
+	__le16 ro_mask = VOLUME_MUST_MOUNT_RO_MASK;
 	int err;
 	u8 saved_on_errors;
 
@@ -1690,7 +1698,8 @@ iput_volume_failed:
 
 	ntfs_attr_reinit_search_ctx(ctx);
 	if (ntfs_attr_lookup(AT_VOLUME_INFORMATION, NULL, 0, 0, 0, NULL, 0,
-			ctx) || ctx->attr->non_resident || ctx->attr->flags) {
+			ctx) || ctx->attr->non_resident || ctx->attr->flags ||
+	    le32_to_cpu(ctx->attr->data.resident.value_length) < sizeof(*vi)) {
 		ntfs_attr_put_search_ctx(ctx);
 get_ctx_vol_failed:
 		unmap_mft_record(NTFS_I(vol->vol_ino));
@@ -1708,7 +1717,9 @@ get_ctx_vol_failed:
 		vol->major_ver, vol->minor_ver, sb->s_id, vol->cluster_size);
 
 	/* Make sure that no unsupported volume flags are set. */
-	if (vol->vol_flags & VOLUME_MUST_MOUNT_RO_MASK) {
+	if (vol->major_ver == 1 && vol->minor_ver == 2)
+		ro_mask &= ~VOLUME_UPGRADE_ON_MOUNT;
+	if (vol->vol_flags & ro_mask) {
 		static const char *es1a = "Volume is dirty";
 		static const char *es1b = "Volume has been modified by chkdsk";
 		static const char *es1c = "Volume has unsupported flags set";
@@ -1803,6 +1814,11 @@ get_ctx_vol_failed:
 		ntfs_error(sb,
 		    "Errors were recorded during mount.  Mounting read-only.  Run chkdsk.");
 	}
+
+	/* Upgrade under exclusive mount-time access, before any normal writes. */
+	err = ntfs_upgrade_volume(vol);
+	if (err)
+		goto iput_root_err_out;
 
 	/* If (still) a read-write mount, empty the logfile. */
 	if (!sb_rdonly(sb) &&
@@ -2485,6 +2501,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	int silent = fc->sb_flags & SB_SILENT;
 
 	vol->sb = sb;
+	init_waitqueue_head(&vol->free_waitq);
 
 	/*
 	 * We do a pretty difficult piece of bootstrap by reading the
@@ -2683,7 +2700,6 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 				   7) >> 3) + PAGE_SIZE - 1) >> PAGE_SHIFT);
 		ntfs_debug("Free mft records(%lld)", nr_records);
 
-		init_waitqueue_head(&vol->free_waitq);
 		INIT_WORK(&vol->precalc_work, precalc_free_clusters);
 		queue_work(ntfs_wq, &vol->precalc_work);
 		return 0;
