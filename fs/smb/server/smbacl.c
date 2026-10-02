@@ -909,6 +909,7 @@ int parse_sec_desc(struct mnt_idmap *idmap, struct smb_ntsd *pntsd,
 
 	return 0;
 }
+EXPORT_SYMBOL_IF_KUNIT(parse_sec_desc);
 
 size_t smb_acl_sec_desc_scratch_len(struct smb_fattr *fattr,
 		struct smb_ntsd *ppntsd, int ppntsd_size, int addition_info)
@@ -1020,6 +1021,7 @@ out:
 	*secdesclen = offset;
 	return rc;
 }
+EXPORT_SYMBOL_IF_KUNIT(build_sec_desc);
 
 static int smb_append_inherited_ace(struct smb_ace **ace, int *nt_size,
 				    u16 *ace_cnt, const struct smb_sid *sid,

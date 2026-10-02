@@ -282,10 +282,272 @@ out:
 	fput(file);
 }
 
+static void ksmbd_parse_dacl_boundary_test(struct kunit *test)
+{
+	struct smb_fattr fattr = {
+		.cf_uid = INVALID_UID,
+		.cf_gid = INVALID_GID,
+		.cf_mode = S_IFREG | 0644,
+	};
+	struct smb_ntsd *ntsd;
+	int size, ret;
+
+	ntsd = build_boundary_ntsd(test, &test_nonmatching_sid, 0,
+				   FILE_READ_DATA, &size);
+	KUNIT_ASSERT_NOT_NULL(test, ntsd);
+	ret = parse_sec_desc(&nop_mnt_idmap, ntsd, size, &fattr);
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	KUNIT_EXPECT_PTR_EQ(test, fattr.cf_acls, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, fattr.cf_dacls, NULL);
+	posix_acl_release(fattr.cf_acls);
+	posix_acl_release(fattr.cf_dacls);
+}
+
+static void ksmbd_build_dacl_boundary_test(struct kunit *test)
+{
+	struct smb_fattr fattr = {
+		.cf_uid = KUIDT_INIT(0),
+		.cf_gid = KGIDT_INIT(100),
+		.cf_mode = S_IFREG | 0644,
+	};
+	struct smb_ntsd *old, *new;
+	struct smb_acl *acl;
+	struct smb_ace *ace;
+	u32 size;
+	int old_size, ret;
+
+	old = build_boundary_ntsd(test, &test_owner_sid, FILE_READ_DATA,
+				  FILE_WRITE_DATA, &old_size);
+	KUNIT_ASSERT_NOT_NULL(test, old);
+	new = kunit_kzalloc(test, 256, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, new);
+	ret = build_sec_desc(&nop_mnt_idmap, new, old, old_size, DACL_SECINFO, &size, &fattr);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	acl = (struct smb_acl *)((char *)new + le32_to_cpu(new->dacloffset));
+	KUNIT_EXPECT_EQ(test, le16_to_cpu(acl->num_aces), 1);
+	KUNIT_EXPECT_EQ(test, size, sizeof(*new) + sizeof(*acl) +
+			 test_ace_size(&test_owner_sid));
+	ace = (struct smb_ace *)(acl + 1);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(ace->access_req), FILE_READ_DATA);
+}
+
+static void ksmbd_build_mode_dacl_test(struct kunit *test)
+{
+	struct smb_fattr fattr = {
+		.cf_uid = KUIDT_INIT(0),
+		.cf_gid = KGIDT_INIT(100),
+	};
+	struct smb_ntsd *ntsd;
+	struct smb_acl *acl;
+	struct smb_ace *ace;
+	struct smb_sid *owner;
+	u32 size;
+	u8 inherit_flags = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE;
+	int is_dir, i, ret;
+
+	ntsd = kunit_kzalloc(test, 512, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ntsd);
+	for (is_dir = 0; is_dir <= 1; is_dir++) {
+		fattr.cf_mode = (is_dir ? S_IFDIR : S_IFREG) | 0754;
+		ret = build_sec_desc(&nop_mnt_idmap, ntsd, NULL, 0,
+				     OWNER_SECINFO | GROUP_SECINFO | DACL_SECINFO, &size, &fattr);
+		KUNIT_ASSERT_EQ(test, ret, 0);
+		KUNIT_EXPECT_EQ(test, le32_to_cpu(ntsd->osidoffset), 20);
+		KUNIT_EXPECT_EQ(test, le32_to_cpu(ntsd->gsidoffset), 36);
+		KUNIT_EXPECT_EQ(test, le32_to_cpu(ntsd->dacloffset), 52);
+		KUNIT_EXPECT_EQ(test, size, is_dir ? 168 : 128);
+		owner = (struct smb_sid *)((char *)ntsd + 20);
+		KUNIT_EXPECT_MEMEQ(test, owner, &test_owner_sid, CIFS_SID_BASE_SIZE + 8);
+		acl = (struct smb_acl *)((char *)ntsd + 52);
+		KUNIT_EXPECT_EQ(test, le16_to_cpu(acl->num_aces), is_dir ? 5 : 3);
+		KUNIT_EXPECT_EQ(test, le16_to_cpu(acl->size), size - 52);
+		ace = (struct smb_ace *)(acl + 1);
+		for (i = 0; i < le16_to_cpu(acl->num_aces); i++) {
+			KUNIT_EXPECT_EQ(test, ace->type, ACCESS_ALLOWED_ACE_TYPE);
+			KUNIT_EXPECT_EQ(test, ace->flags,
+					is_dir && (i == 2 || i == 3) ? inherit_flags : 0);
+			ace = (struct smb_ace *)((char *)ace + le16_to_cpu(ace->size));
+		}
+		KUNIT_EXPECT_EQ(test, (char *)ace - (char *)ntsd, size);
+	}
+}
+
+static void ksmbd_parse_group_acl_test(struct kunit *test)
+{
+	static const struct smb_sid group = {
+		1, 2, {0, 0, 0, 0, 0, 22}, {cpu_to_le32(2), cpu_to_le32(100)}
+	};
+	static const short tags[] = { ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK, ACL_OTHER };
+	static const u16 perms[] = { 0, 4, 4, 7, 0 };
+	struct smb_fattr fattr = {
+		.cf_uid = INVALID_UID,
+		.cf_gid = INVALID_GID,
+		.cf_mode = S_IFREG | 0640,
+	};
+	struct smb_ntsd *ntsd;
+	struct smb_acl *acl;
+	struct smb_sid *sid;
+	int size, ret, i;
+
+	size = sizeof(*ntsd) + sizeof(*acl) + test_ace_size(&group) + CIFS_SID_BASE_SIZE + 8;
+	ntsd = kunit_kzalloc(test, size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ntsd);
+	ntsd->type = cpu_to_le16(DACL_PRESENT);
+	ntsd->dacloffset = cpu_to_le32(sizeof(*ntsd));
+	acl = (struct smb_acl *)(ntsd + 1);
+	acl->size = cpu_to_le16(sizeof(*acl) + test_ace_size(&group));
+	acl->num_aces = cpu_to_le16(1);
+	fill_test_ace((struct smb_ace *)(acl + 1), &group, FILE_READ_DATA);
+	ntsd->gsidoffset = cpu_to_le32(sizeof(*ntsd) + le16_to_cpu(acl->size));
+	sid = (struct smb_sid *)((char *)ntsd + le32_to_cpu(ntsd->gsidoffset));
+	memcpy(sid, &group, CIFS_SID_BASE_SIZE + 8);
+
+	ret = parse_sec_desc(&nop_mnt_idmap, ntsd, size, &fattr);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	if (ret || !fattr.cf_acls || !fattr.cf_dacls) {
+		KUNIT_FAIL(test, "access and default ACLs must be allocated");
+		goto out;
+	}
+	KUNIT_EXPECT_TRUE(test, gid_eq(fattr.cf_gid, KGIDT_INIT(100)));
+	KUNIT_EXPECT_EQ(test, fattr.cf_acls->a_count, ARRAY_SIZE(tags));
+	KUNIT_EXPECT_EQ(test, fattr.cf_dacls->a_count, ARRAY_SIZE(tags));
+	for (i = 0; i < min_t(size_t, fattr.cf_acls->a_count, ARRAY_SIZE(tags)); i++) {
+		KUNIT_EXPECT_EQ(test, fattr.cf_acls->a_entries[i].e_tag, tags[i]);
+		KUNIT_EXPECT_EQ(test, fattr.cf_acls->a_entries[i].e_perm, perms[i]);
+		KUNIT_EXPECT_EQ(test, fattr.cf_dacls->a_entries[i].e_tag, tags[i]);
+		KUNIT_EXPECT_EQ(test, fattr.cf_dacls->a_entries[i].e_perm, perms[i]);
+	}
+out:
+	posix_acl_release(fattr.cf_acls);
+	posix_acl_release(fattr.cf_dacls);
+}
+
+static void ksmbd_acl_test_release(void *acl)
+{
+	posix_acl_release(acl);
+}
+
+static void ksmbd_build_dacl_overflow_test(struct kunit *test)
+{
+	struct smb_fattr fattr = {
+		.cf_uid = KUIDT_INIT(0),
+		.cf_gid = KGIDT_INIT(100),
+		.cf_mode = S_IFREG | 0644,
+	};
+	struct smb_ntsd *ntsd;
+	u32 size;
+	int i, ret;
+
+	fattr.cf_acls = posix_acl_alloc(3000, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, fattr.cf_acls);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, ksmbd_acl_test_release,
+							fattr.cf_acls), 0);
+	for (i = 0; i < fattr.cf_acls->a_count; i++) {
+		fattr.cf_acls->a_entries[i].e_tag = ACL_GROUP;
+		fattr.cf_acls->a_entries[i].e_gid = KGIDT_INIT(i);
+		fattr.cf_acls->a_entries[i].e_perm = 7;
+	}
+	ntsd = kunit_kzalloc(test, sizeof(*ntsd) + sizeof(struct smb_acl) +
+			     3000 * sizeof(struct smb_ace), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ntsd);
+	ret = build_sec_desc(&nop_mnt_idmap, ntsd, NULL, 0, DACL_SECINFO, &size, &fattr);
+	KUNIT_EXPECT_EQ(test, ret, -EOVERFLOW);
+}
+
+static void ksmbd_parse_sid_bounds_test(struct kunit *test)
+{
+	struct smb_fattr fattr = {
+		.cf_uid = INVALID_UID,
+		.cf_gid = INVALID_GID,
+	};
+	struct smb_ntsd *ntsd;
+	struct smb_sid *sid;
+	int size = sizeof(*ntsd) + CIFS_SID_BASE_SIZE;
+
+	ntsd = kunit_kzalloc(test, size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ntsd);
+	ntsd->type = cpu_to_le16(DACL_PRESENT);
+	KUNIT_EXPECT_EQ(test, parse_sec_desc(&nop_mnt_idmap, ntsd, -1, &fattr), -EINVAL);
+	ntsd->osidoffset = cpu_to_le32(U32_MAX);
+	KUNIT_EXPECT_EQ(test, parse_sec_desc(&nop_mnt_idmap, ntsd, size, &fattr), -EINVAL);
+	ntsd->osidoffset = cpu_to_le32(sizeof(*ntsd));
+	sid = (struct smb_sid *)(ntsd + 1);
+	sid->num_subauth = SID_MAX_SUB_AUTHORITIES + 1;
+	KUNIT_EXPECT_EQ(test, parse_sec_desc(&nop_mnt_idmap, ntsd, size, &fattr), -EINVAL);
+	sid->num_subauth = 1;
+	KUNIT_EXPECT_EQ(test, parse_sec_desc(&nop_mnt_idmap, ntsd, size, &fattr), -EINVAL);
+}
+
+static void ksmbd_smb_check_perm_dacl_order_test(struct kunit *test)
+{
+	static const struct {
+		u8 first_type;
+		u32 first_access;
+		u8 second_type;
+		u8 second_flags;
+		u32 second_access;
+		bool write_granted;
+	} cases[] = {
+		{ ACCESS_ALLOWED_ACE_TYPE, FILE_READ_DATA,
+		  ACCESS_DENIED_ACE_TYPE, 0, FILE_WRITE_DATA, false },
+		{ ACCESS_DENIED_ACE_TYPE, FILE_WRITE_DATA,
+		  ACCESS_ALLOWED_ACE_TYPE, 0, FILE_READ_DATA | FILE_WRITE_DATA, false },
+		{ ACCESS_ALLOWED_ACE_TYPE, FILE_READ_DATA | FILE_WRITE_DATA,
+		  ACCESS_DENIED_ACE_TYPE, 0, FILE_WRITE_DATA, true },
+		{ ACCESS_ALLOWED_ACE_TYPE, FILE_READ_DATA,
+		  ACCESS_ALLOWED_ACE_TYPE, INHERIT_ONLY_ACE, FILE_WRITE_DATA, false },
+	};
+	struct smb_ntsd *ntsd;
+	struct smb_acl *acl;
+	struct smb_ace *first, *second;
+	struct file *file;
+	__le32 access;
+	int i, size, ret;
+
+	file = shmem_file_setup("ksmbd-kunit-dacl-order", 0,
+				mk_vma_flags(VMA_NORESERVE_BIT));
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		ntsd = build_boundary_ntsd(test, &test_owner_sid, cases[i].first_access,
+					   cases[i].second_access, &size);
+		if (!ntsd) {
+			KUNIT_FAIL(test, "failed to allocate security descriptor");
+			break;
+		}
+		acl = (struct smb_acl *)(ntsd + 1);
+		acl->size = cpu_to_le16(size - sizeof(*ntsd));
+		first = (struct smb_ace *)(acl + 1);
+		second = (struct smb_ace *)((char *)first + le16_to_cpu(first->size));
+		first->type = cases[i].first_type;
+		second->type = cases[i].second_type;
+		second->flags = cases[i].second_flags;
+		ret = ksmbd_vfs_set_sd_xattr(NULL, mnt_idmap(file->f_path.mnt),
+					     &file->f_path, ntsd, size, false);
+		KUNIT_EXPECT_EQ(test, ret, 0);
+		if (ret)
+			break;
+		access = FILE_MAXIMAL_ACCESS_LE;
+		ret = smb_check_perm_dacl(NULL, &file->f_path, &access,
+					  FILE_MAXIMAL_ACCESS_LE, 0, false);
+		KUNIT_EXPECT_EQ_MSG(test, ret, 0, "case %d", i);
+		KUNIT_EXPECT_TRUE(test, le32_to_cpu(access) & FILE_READ_DATA);
+		KUNIT_EXPECT_EQ_MSG(test, !!(le32_to_cpu(access) & FILE_WRITE_DATA),
+				    cases[i].write_granted, "case %d", i);
+	}
+	fput(file);
+}
+
 static struct kunit_case ksmbd_smbacl_test_cases[] = {
 	KUNIT_CASE(ksmbd_dacl_walk_must_stop_at_declared_size),
 	KUNIT_CASE(ksmbd_smb_check_perm_dacl_boundary_test),
 	KUNIT_CASE(ksmbd_smb_check_perm_dacl_maximal_boundary_test),
+	KUNIT_CASE(ksmbd_parse_dacl_boundary_test),
+	KUNIT_CASE(ksmbd_build_dacl_boundary_test),
+	KUNIT_CASE(ksmbd_build_mode_dacl_test),
+	KUNIT_CASE(ksmbd_parse_group_acl_test),
+	KUNIT_CASE(ksmbd_build_dacl_overflow_test),
+	KUNIT_CASE(ksmbd_parse_sid_bounds_test),
+	KUNIT_CASE(ksmbd_smb_check_perm_dacl_order_test),
 	{}
 };
 
