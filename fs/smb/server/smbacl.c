@@ -1266,17 +1266,19 @@ int smb_check_perm_dacl(struct ksmbd_conn *conn, const struct path *path,
 	struct smb_acl *pdacl;
 	struct smb_acl_iter iter;
 	struct posix_acl *posix_acls;
-	int rc = 0, pntsd_size, pdacl_size;
+	int rc = 0, pntsd_size;
 	struct smb_sid sid;
 	int requested = le32_to_cpu(*pdaccess & ~FILE_MAXIMAL_ACCESS_LE);
 	int granted = requested;
 	struct smb_ace *ace;
+	struct smb_ace *matched_ace = NULL;
 	int i, found = 0;
 	unsigned int access_bits = 0, denied = 0;
 	struct smb_ace *others_ace = NULL;
 	struct posix_acl_entry *pa_entry;
 	unsigned int sid_type = SIDOWNER;
 	bool is_owner, owner_rights = false;
+	bool maximal_access = *pdaccess & FILE_MAXIMAL_ACCESS_LE;
 	vfsuid_t vfsuid;
 
 	ksmbd_debug(SMB, "check permission using windows acl\n");
@@ -1287,10 +1289,9 @@ int smb_check_perm_dacl(struct ksmbd_conn *conn, const struct path *path,
 
 	if (smb_get_dacl(pntsd, pntsd_size, &pdacl) || !pdacl)
 		goto err_out;
-	pdacl_size = le16_to_cpu(pdacl->size);
 
 	if (!pdacl->num_aces) {
-		if (!(pdacl_size - sizeof(struct smb_acl)) &&
+		if (le16_to_cpu(pdacl->size) == sizeof(*pdacl) &&
 		    *pdaccess & ~(FILE_READ_CONTROL_LE | FILE_WRITE_DAC_LE)) {
 			rc = -EACCES;
 			goto err_out;
@@ -1304,37 +1305,54 @@ int smb_check_perm_dacl(struct ksmbd_conn *conn, const struct path *path,
 	vfsuid = i_uid_into_vfsuid(idmap, d_inode(path->dentry));
 	is_owner = uid == from_kuid(&init_user_ns, vfsuid_into_kuid(vfsuid));
 
-	if (*pdaccess & FILE_MAXIMAL_ACCESS_LE) {
-		smb_acl_iter_init(&iter, pdacl);
-		while ((ace = smb_acl_next_ace(&iter))) {
-			if (!smb_ace_sid_valid(ace))
-				break;
+	smb_acl_iter_init(&iter, pdacl);
+	while ((ace = smb_acl_next_ace(&iter))) {
+		bool matches_user, matches_other;
 
-			if (!compare_sids(&sid_owner_rights, &ace->sid)) {
-				owner_rights = true;
-				if (!is_owner)
-					continue;
-			}
+		if (!smb_ace_sid_valid(ace))
+			break;
 
-			if (ace->flags & INHERIT_ONLY_ACE ||
-			    (compare_sids(&sid, &ace->sid) &&
-			     compare_sids(&sid_unix_NFS_mode, &ace->sid) &&
-			     compare_sids(&sid_everyone, &ace->sid) &&
-			     compare_sids(&sid_authusers, &ace->sid) &&
-			     compare_sids(&sid_owner_rights, &ace->sid)))
-				continue;
-
-			switch (ace->type) {
-			case ACCESS_ALLOWED_ACE_TYPE:
-				access_bits |= le32_to_cpu(ace->access_req);
-				break;
-			case ACCESS_DENIED_ACE_TYPE:
-			case ACCESS_DENIED_CALLBACK_ACE_TYPE:
-				denied |= ~access_bits &
-					le32_to_cpu(ace->access_req);
-				break;
+		matches_user = !compare_sids(&sid, &ace->sid) ||
+			       !compare_sids(&sid_unix_NFS_mode, &ace->sid);
+		matches_other = !compare_sids(&sid_everyone, &ace->sid) ||
+				!compare_sids(&sid_authusers, &ace->sid);
+		if (!found) {
+			if (matches_user) {
+				matched_ace = ace;
+				found = 1;
+			} else if (matches_other) {
+				others_ace = ace;
 			}
 		}
+
+		if (!maximal_access) {
+			if (found)
+				break;
+			continue;
+		}
+
+		if (!compare_sids(&sid_owner_rights, &ace->sid)) {
+			owner_rights = true;
+			if (!is_owner)
+				continue;
+		} else if (!matches_user && !matches_other) {
+			continue;
+		}
+
+		if (ace->flags & INHERIT_ONLY_ACE)
+			continue;
+		switch (ace->type) {
+		case ACCESS_ALLOWED_ACE_TYPE:
+			access_bits |= le32_to_cpu(ace->access_req);
+			break;
+		case ACCESS_DENIED_ACE_TYPE:
+		case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+			denied |= ~access_bits & le32_to_cpu(ace->access_req);
+			break;
+		}
+	}
+
+	if (maximal_access) {
 		if (is_owner && !owner_rights)
 			access_bits |= READ_CONTROL | WRITE_DAC |
 				FILE_READ_ATTRIBUTES | DELETE;
@@ -1345,21 +1363,7 @@ int smb_check_perm_dacl(struct ksmbd_conn *conn, const struct path *path,
 			access_bits |= FILE_EXECUTE;
 		granted = requested | access_bits;
 	}
-
-	smb_acl_iter_init(&iter, pdacl);
-	while ((ace = smb_acl_next_ace(&iter))) {
-		if (!smb_ace_sid_valid(ace))
-			break;
-
-		if (!compare_sids(&sid, &ace->sid) ||
-		    !compare_sids(&sid_unix_NFS_mode, &ace->sid)) {
-			found = 1;
-			break;
-		}
-		if (!compare_sids(&sid_everyone, &ace->sid) ||
-		    !compare_sids(&sid_authusers, &ace->sid))
-			others_ace = ace;
-	}
+	ace = matched_ace;
 
 	if (IS_ENABLED(CONFIG_FS_POSIX_ACL)) {
 		posix_acls = get_inode_acl(d_inode(path->dentry), ACL_TYPE_ACCESS);
