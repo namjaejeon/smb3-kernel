@@ -583,8 +583,19 @@ remap_rl:
 	/* Revalidate the initialized boundary after locking each folio. */
 	iomap->validity_cookie = READ_ONCE(ni->initialized_size);
 	if (iomap->type == IOMAP_MAPPED) {
+		loff_t boundary = round_up(iomap->validity_cookie,
+					  i_blocksize(inode));
 		loff_t end = iomap->offset + iomap->length;
 
+		/* Existing allocation beyond initialized_size contains stale data. */
+		if (iomap->offset >= boundary) {
+			iomap->flags |= IOMAP_F_NEW;
+			return 0;
+		}
+		if (end > boundary) {
+			iomap->length = boundary - iomap->offset;
+			end = boundary;
+		}
 		if (end >= iomap->validity_cookie)
 			iomap->flags |= IOMAP_F_ZERO_TAIL;
 		else
@@ -674,10 +685,19 @@ static int ntfs_write_da_iomap_begin_non_resident(struct inode *inode,
 			return err;
 	}
 
-	if (ntfs_iomap_flags & NTFS_IOMAP_FLAGS_MKWRITE &&
-	    iomap->offset + iomap->length > ni->initialized_size) {
-		err = ntfs_attr_set_initialized_size(ni, iomap->offset +
-				iomap->length);
+	if ((ntfs_iomap_flags & NTFS_IOMAP_FLAGS_DIO) &&
+	    iomap->type == IOMAP_MAPPED) {
+		loff_t boundary = round_down(READ_ONCE(ni->initialized_size),
+					  i_blocksize(inode));
+
+		/*
+		 * DIO writes cover complete blocks. Include a partly initialized
+		 * block so extending initialized_size always completes in a worker.
+		 */
+		if (iomap->offset >= boundary)
+			iomap->type = IOMAP_UNWRITTEN;
+		else if (iomap->offset + iomap->length > boundary)
+			iomap->length = boundary - iomap->offset;
 	}
 
 	return err;
@@ -782,9 +802,22 @@ static int ntfs_write_iomap_end(struct inode *inode, loff_t pos, loff_t length,
 				ssize_t written, unsigned int flags,
 				struct iomap *iomap)
 {
+	loff_t end, zeroed;
+	int err;
+
 	if (iomap->type == IOMAP_INLINE)
 		return ntfs_write_iomap_end_resident(inode, pos, length,
 						     written, flags, iomap);
+	if (written > 0 && !(flags & (IOMAP_DIRECT | IOMAP_FAULT))) {
+		end = pos + written;
+		zeroed = end;
+		if (written == length &&
+		    (iomap->flags & (IOMAP_F_NEW | IOMAP_F_ZERO_TAIL)))
+			zeroed = round_up(end, i_blocksize(inode));
+		err = ntfs_update_initialized_size(inode, end, zeroed);
+		if (err)
+			return err;
+	}
 	return written;
 }
 

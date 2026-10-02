@@ -464,6 +464,7 @@ void __ntfs_init_inode(struct super_block *sb, struct ntfs_inode *ni)
 	ntfs_debug("Entering.");
 	rwlock_init(&ni->size_lock);
 	ni->initialized_size = ni->allocated_size = 0;
+	ni->zeroed_size = 0;
 	ni->seq_no = 0;
 	atomic_set(&ni->count, 1);
 	ni->vol = NTFS_SB(sb);
@@ -1270,6 +1271,7 @@ no_data_attr_special_case:
 	if (S_ISLNK(vi->i_mode) && ni->target)
 		vi->i_size = strlen(ni->target);
 
+	ni->zeroed_size = ni->initialized_size;
 	ntfs_debug("Done.");
 	return 0;
 unm_err_out:
@@ -1499,6 +1501,7 @@ static int ntfs_read_locked_attr_inode(struct inode *base_vi, struct inode *vi)
 	ntfs_attr_put_search_ctx(ctx);
 	unmap_mft_record(base_ni);
 
+	ni->zeroed_size = ni->initialized_size;
 	ntfs_debug("Done.");
 	return 0;
 
@@ -2480,42 +2483,109 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 	return 0;
 }
 
-int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
-				 const loff_t new_size)
+/*
+ * Complete allocated folios in an uninitialized range using the read path,
+ * which returns zeroes beyond initialized_size and preserves uptodate blocks.
+ * Dirty them before advancing initialized_size so that cached zeroes also
+ * survive writeback and eviction. Holes need no disk initialization.
+ *
+ * The caller holds i_rwsem and the exclusive invalidate lock. In particular,
+ * no read fault may cache zeroes after a preserved folio has been written back
+ * but before the new initialized_size is published.
+ */
+static int ntfs_zero_new_range(struct inode *vi, loff_t start, loff_t end)
+{
+	struct address_space *mapping = vi->i_mapping;
+	struct iomap_iter iter = {
+		.inode = vi,
+		.pos = start,
+		.len = end - start,
+		.flags = IOMAP_ZERO,
+	};
+	int ret;
+
+	while ((ret = iomap_iter(&iter, &ntfs_seek_iomap_ops)) > 0) {
+		loff_t pos = iter.pos;
+		loff_t next = pos + iomap_length(&iter);
+
+		if (iter.iomap.type == IOMAP_MAPPED) {
+			while (pos < next) {
+				struct folio *folio;
+
+				folio = read_mapping_folio(mapping, pos >> PAGE_SHIFT,
+							   NULL);
+				if (IS_ERR(folio)) {
+					iter.status = PTR_ERR(folio);
+					break;
+				}
+				folio_lock(folio);
+				if (folio->mapping != mapping) {
+					folio_unlock(folio);
+					folio_put(folio);
+					continue;
+				}
+				folio_mark_dirty(folio);
+				pos = min(next, folio_next_pos(folio));
+				folio_unlock(folio);
+				folio_put(folio);
+				balance_dirty_pages_ratelimited(mapping);
+				cond_resched();
+			}
+			if (iter.status < 0)
+				continue;
+		}
+		iter.status = iomap_iter_advance_full(&iter);
+	}
+	return ret;
+}
+
+int ntfs_update_initialized_size(struct inode *vi, loff_t new_size,
+				 loff_t zeroed_size)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
-	loff_t old_init_size;
-	unsigned long flags;
+	int err = 0;
+
+	mutex_lock(&ni->mrec_lock);
+	if (new_size > ni->initialized_size)
+		err = ntfs_attr_set_initialized_size(ni, new_size);
+	if (!err)
+		ni->zeroed_size = max(ni->zeroed_size, zeroed_size);
+	mutex_unlock(&ni->mrec_lock);
+	return err;
+}
+
+int ntfs_extend_initialized_size(struct inode *vi, loff_t new_size)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	loff_t start;
 	int err;
 
-	read_lock_irqsave(&ni->size_lock, flags);
-	old_init_size = ni->initialized_size;
-	read_unlock_irqrestore(&ni->size_lock, flags);
-
+	lockdep_assert_held_write(&vi->i_rwsem);
 	if (!NInoNonResident(ni))
 		return -EINVAL;
-	if (old_init_size >= new_size)
+	if (ni->initialized_size >= new_size)
 		return 0;
 
+	mutex_lock(&ni->mrec_lock);
+	down_write(&ni->runlist.lock);
 	err = ntfs_attr_map_whole_runlist(ni);
+	up_write(&ni->runlist.lock);
+	mutex_unlock(&ni->mrec_lock);
 	if (err)
 		return err;
 
-	if (!NInoCompressed(ni) && old_init_size < offset) {
-		err = iomap_zero_range(vi, old_init_size,
-				       offset - old_init_size,
-				       NULL, &ntfs_seek_iomap_ops,
-				       &ntfs_iomap_folio_ops, NULL);
+	start = max(ni->initialized_size, ni->zeroed_size);
+	filemap_invalidate_lock(vi->i_mapping);
+	if (start < new_size) {
+		unmap_mapping_range(vi->i_mapping, start, new_size - start, 0);
+		err = ntfs_zero_new_range(vi, start, new_size);
 		if (err)
-			return err;
+			goto out;
 	}
-
-
-	mutex_lock(&ni->mrec_lock);
-	err = ntfs_attr_set_initialized_size(ni, new_size);
-	mutex_unlock(&ni->mrec_lock);
-	if (err)
-		truncate_setsize(vi, old_init_size);
+	err = ntfs_update_initialized_size(vi, new_size,
+					   round_up(new_size, i_blocksize(vi)));
+out:
+	filemap_invalidate_unlock(vi->i_mapping);
 	return err;
 }
 

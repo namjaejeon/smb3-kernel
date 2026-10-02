@@ -511,6 +511,14 @@ static int ntfs_file_write_dio_end_io(struct kiocb *iocb, ssize_t size,
 		return error;
 
 	if (size) {
+		loff_t end = iocb->ki_pos + size;
+
+		/* Pure overwrites can complete in interrupt context. */
+		if (flags & IOMAP_DIO_UNWRITTEN) {
+			error = ntfs_update_initialized_size(inode, end, end);
+			if (error)
+				return error;
+		}
 		if (i_size_read(inode) < iocb->ki_pos + size) {
 			i_size_write(inode, iocb->ki_pos + size);
 			mark_inode_dirty(inode);
@@ -569,7 +577,9 @@ out:
 
 static int ntfs_expand_for_write(struct ntfs_inode *ni, loff_t end)
 {
+	struct inode *vi = VFS_I(ni);
 	struct ntfs_volume *vol = ni->vol;
+	loff_t old_size = i_size_read(vi);
 	loff_t prealloc_size = 0;
 	int err;
 
@@ -588,6 +598,8 @@ static int ntfs_expand_for_write(struct ntfs_inode *ni, loff_t end)
 	mutex_lock(&ni->mrec_lock);
 	err = ntfs_attr_expand(ni, end, prealloc_size);
 	mutex_unlock(&ni->mrec_lock);
+	if (!err)
+		ntfs_pagecache_extend(vi, old_size, end);
 
 	return err;
 }
@@ -648,6 +660,10 @@ static ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	count = ret;
 	end = pos + count;
 
+	if (NInoNonResident(ni) && !NInoCompressed(ni) &&
+	    end > READ_ONCE(ni->initialized_size))
+		inode_dio_wait(vi);
+
 	old_data_size = ni->data_size;
 	old_init_size = ni->initialized_size;
 
@@ -658,8 +674,8 @@ static ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	}
 
 	if (NInoNonResident(ni) && !NInoCompressed(ni) &&
-	    end > old_init_size) {
-		ret = ntfs_extend_initialized_size(vi, pos, end);
+	    pos > old_init_size) {
+		ret = ntfs_extend_initialized_size(vi, pos);
 		if (ret < 0)
 			goto out;
 	}
@@ -698,14 +714,39 @@ out_lock:
 static vm_fault_t ntfs_filemap_page_mkwrite(struct vm_fault *vmf)
 {
 	struct inode *inode = file_inode(vmf->vma->vm_file);
+	struct ntfs_inode *ni = NTFS_I(inode);
 	struct address_space *mapping = inode->i_mapping;
+	loff_t page_start, new_init_size;
 	vm_fault_t ret;
+	int err;
 
 	if (NInoWofCompressed(NTFS_I(inode)))
 		return VM_FAULT_SIGBUS;
 
 	sb_start_pagefault(inode->i_sb);
+	/* A blocking inode lock can deadlock against a write's user faults. */
+	if (!inode_trylock(inode)) {
+		ret = VM_FAULT_NOPAGE;
+		goto out_pagefault;
+	}
 	file_update_time(vmf->vma->vm_file);
+
+	page_start = (loff_t)vmf->pgoff << PAGE_SHIFT;
+	new_init_size = min_t(loff_t, page_start + PAGE_SIZE, i_size_read(inode));
+	if (page_start >= new_init_size) {
+		ret = VM_FAULT_NOPAGE;
+		goto out_inode;
+	}
+	if (NInoNonResident(ni) &&
+	    new_init_size > READ_ONCE(ni->initialized_size)) {
+		inode_dio_wait(inode);
+		/* Initialize the gap before iomap locks the faulting folio. */
+		err = ntfs_extend_initialized_size(inode, page_start);
+		if (err) {
+			ret = vmf_fs_error(err);
+			goto out_inode;
+		}
+	}
 
 	/*
 	 * Serialize against truncate/fallocate which hold the lock
@@ -713,8 +754,19 @@ static vm_fault_t ntfs_filemap_page_mkwrite(struct vm_fault *vmf)
 	 */
 	filemap_invalidate_lock_shared(mapping);
 	ret = iomap_page_mkwrite(vmf, &ntfs_page_mkwrite_iomap_ops, NULL);
+	if (ret == VM_FAULT_LOCKED && NInoNonResident(ni)) {
+		err = ntfs_update_initialized_size(inode, new_init_size,
+						   round_up(new_init_size, i_blocksize(inode)));
+		if (err) {
+			folio_unlock(page_folio(vmf->page));
+			ret = vmf_fs_error(err);
+		}
+	}
 	filemap_invalidate_unlock_shared(mapping);
 
+out_inode:
+	inode_unlock(inode);
+out_pagefault:
 	sb_end_pagefault(inode->i_sb);
 	return ret;
 }
@@ -735,23 +787,6 @@ static int ntfs_file_mmap_prepare(struct vm_area_desc *desc)
 
 	if (NInoCompressed(NTFS_I(inode)) || NInoWofCompressed(NTFS_I(inode)))
 		return -EOPNOTSUPP;
-
-	if (vma_desc_test_all(desc, VMA_SHARED_BIT, VMA_MAYWRITE_BIT)) {
-		struct inode *inode = file_inode(file);
-		loff_t from, to;
-		int err;
-
-		from = ((loff_t)desc->pgoff << PAGE_SHIFT);
-		to = min_t(loff_t, i_size_read(inode),
-			   from + desc->end - desc->start);
-
-		if (NTFS_I(inode)->initialized_size < to) {
-			err = ntfs_extend_initialized_size(inode, to, to);
-			if (err)
-				return err;
-		}
-	}
-
 
 	file_accessed(file);
 	desc->vm_ops = &ntfs_file_vm_ops;

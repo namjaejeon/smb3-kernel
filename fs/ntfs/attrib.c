@@ -2170,6 +2170,7 @@ int ntfs_attr_make_non_resident(struct ntfs_inode *ni, const u32 data_size)
 		ni->runlist.count = 0;
 	write_lock_irqsave(&ni->size_lock, flags);
 	ni->allocated_size = new_size;
+	ni->zeroed_size = ni->initialized_size;
 	if ((NInoSparse(ni) && !NInoWofCompressed(ni)) || NInoCompressed(ni)) {
 		ni->itype.compressed.size = ni->allocated_size;
 		if (a->data.non_resident.compression_unit) {
@@ -2363,6 +2364,10 @@ int ntfs_attr_set_initialized_size(struct ntfs_inode *ni, loff_t new_size)
 		goto out_ctx;
 
 	ctx->attr->data.non_resident.initialized_size = cpu_to_le64(new_size);
+	if (new_size < ni->initialized_size)
+		ni->zeroed_size = min(ni->zeroed_size, new_size);
+	else
+		ni->zeroed_size = max(ni->zeroed_size, new_size);
 	ni->initialized_size = new_size;
 	mark_mft_record_dirty(ctx->ntfs_ino);
 out_ctx:
@@ -3101,6 +3106,7 @@ static void ntfs_attr_init(struct ntfs_inode *ni, const bool non_resident,
 	ni->allocated_size = allocated_size;
 	ni->data_size = data_size;
 	ni->initialized_size = initialized_size;
+	ni->zeroed_size = initialized_size;
 	if (compressed || sparse) {
 		struct ntfs_volume *vol = ni->vol;
 
@@ -4257,6 +4263,7 @@ static int ntfs_attr_make_resident(struct ntfs_inode *ni, struct ntfs_attr_searc
 	NInoClearEncrypted(ni);
 	ni->flags &= ~FILE_ATTR_ENCRYPTED;
 	ni->initialized_size = ni->data_size;
+	ni->zeroed_size = ni->initialized_size;
 	ni->allocated_size = ni->itype.compressed.size = (ni->data_size + 7) & ~7;
 	ni->itype.compressed.block_size = 0;
 	ni->itype.compressed.block_size_bits = ni->itype.compressed.block_clusters = 0;
@@ -4416,6 +4423,7 @@ static int ntfs_non_resident_attr_shrink(struct ntfs_inode *ni,
 		ni->initialized_size = newsize;
 		ctx->attr->data.non_resident.initialized_size = cpu_to_le64(newsize);
 	}
+	ni->zeroed_size = min(ni->zeroed_size, newsize);
 
 	/*
 	 * Drop any page-cache folios that now lie beyond the shrunk
@@ -4830,6 +4838,7 @@ attr_resize_again:
 		if (!err) {
 			/* Update attribute size everywhere. */
 			attr_ni->data_size = attr_ni->initialized_size = newsize;
+			attr_ni->zeroed_size = newsize;
 			attr_ni->allocated_size = (newsize + 7) & ~7;
 			if (NInoCompressed(attr_ni) || NInoSparse(attr_ni))
 				attr_ni->itype.compressed.size = attr_ni->allocated_size;
@@ -5592,6 +5601,7 @@ int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s6
 	ni->data_size += ntfs_cluster_to_bytes(vol, len);
 	if (ntfs_cluster_to_bytes(vol, start_vcn) < ni->initialized_size)
 		ni->initialized_size += ntfs_cluster_to_bytes(vol, len);
+	ni->zeroed_size = ni->initialized_size;
 	ret = ntfs_attr_update_mapping_pairs_locked(ni, 0, ni);
 	up_write(&ni->runlist.lock);
 	if (ret)
@@ -5675,6 +5685,7 @@ int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn, 
 		else
 			ni->initialized_size = ntfs_cluster_to_bytes(vol, start_vcn);
 	}
+	ni->zeroed_size = ni->initialized_size;
 
 	if (ni->allocated_size > 0) {
 		ret = ntfs_attr_update_mapping_pairs_locked(ni, 0, ni);

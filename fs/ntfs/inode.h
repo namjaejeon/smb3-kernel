@@ -110,6 +110,8 @@ struct ntfs_inode {
 	struct runlist runlist;
 	s64 data_size;
 	s64 initialized_size;
+	/* Contiguous initialized range, including prepared block tails. */
+	s64 zeroed_size;
 	s64 allocated_size;
 	struct timespec64 i_crtime;
 	void *mrec;
@@ -354,8 +356,9 @@ static inline void ntfs_commit_inode(struct inode *vi)
 }
 
 int ntfs_inode_sync_filename(struct ntfs_inode *ni);
-int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
-		const loff_t new_size);
+int ntfs_extend_initialized_size(struct inode *vi, loff_t new_size);
+int ntfs_update_initialized_size(struct inode *vi, loff_t new_size,
+				 loff_t zeroed_size);
 void ntfs_set_vfs_operations(struct inode *inode, mode_t mode, dev_t dev);
 struct folio *ntfs_get_locked_folio(struct address_space *mapping,
 		pgoff_t index, pgoff_t end_index, struct file_ra_state *ra);
