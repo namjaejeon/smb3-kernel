@@ -1005,8 +1005,8 @@ struct runlist_element *ntfs_mapping_pairs_decompress(const struct ntfs_volume *
 				goto err_out;
 			}
 
-			/* Enter the current lcn into the runlist element. */
-			rl[rlpos].lcn = lcn;
+			/* Keep the on-disk -1 hole distinct from LCN_DELALLOC. */
+			rl[rlpos].lcn = vol->major_ver < 3 && lcn == -1 ? LCN_HOLE : lcn;
 		}
 		/* Get to the next runlist element, skipping zero-sized holes */
 		if (rl[rlpos].length)
@@ -1287,7 +1287,7 @@ int ntfs_get_size_for_mapping_pairs(const struct ntfs_volume *vol,
 		 * an lcn of -1 and not a delta_lcn of -1 (unless both are -1).
 		 */
 		if (likely(rl->lcn >= 0 || vol->major_ver < 3)) {
-			prev_lcn = rl->lcn;
+			prev_lcn = rl->lcn == LCN_HOLE ? -1 : rl->lcn;
 			if (likely(rl->lcn >= 0))
 				prev_lcn += delta;
 			/* Change in lcn. */
@@ -1299,6 +1299,7 @@ int ntfs_get_size_for_mapping_pairs(const struct ntfs_volume *vol,
 	/* Do the full runs. */
 	for (; rl->length && !the_end; rl++) {
 		s64 length = rl->length;
+		s64 lcn = rl->lcn == LCN_HOLE ? -1 : rl->lcn;
 
 		if (unlikely(length < 0 || rl->lcn < LCN_HOLE))
 			goto err_out;
@@ -1324,9 +1325,8 @@ int ntfs_get_size_for_mapping_pairs(const struct ntfs_volume *vol,
 		 */
 		if (likely(rl->lcn >= 0 || vol->major_ver < 3)) {
 			/* Change in lcn. */
-			rls += ntfs_get_nr_significant_bytes(rl->lcn -
-					prev_lcn);
-			prev_lcn = rl->lcn;
+			rls += ntfs_get_nr_significant_bytes(lcn - prev_lcn);
+			prev_lcn = lcn;
 		}
 
 		if (rls > max_mp_size)
@@ -1500,7 +1500,7 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 		 * change.
 		 */
 		if (likely(rl->lcn >= 0 || vol->major_ver < 3)) {
-			prev_lcn = rl->lcn;
+			prev_lcn = rl->lcn == LCN_HOLE ? -1 : rl->lcn;
 			if (likely(rl->lcn >= 0))
 				prev_lcn += delta;
 			/* Write change in lcn. */
@@ -1523,6 +1523,7 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 	/* Do the full runs. */
 	for (; rl->length && !the_end; rl++) {
 		s64 length = rl->length;
+		s64 lcn = rl->lcn == LCN_HOLE ? -1 : rl->lcn;
 
 		if (unlikely(length < 0 || rl->lcn < LCN_HOLE))
 			goto err_out;
@@ -1551,10 +1552,10 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 		if (likely(rl->lcn >= 0 || vol->major_ver < 3)) {
 			/* Write change in lcn. */
 			lcn_len = ntfs_write_significant_bytes(dst + 1 +
-					len_len, dst_max, rl->lcn - prev_lcn);
+					len_len, dst_max, lcn - prev_lcn);
 			if (unlikely(lcn_len < 0))
 				goto size_err;
-			prev_lcn = rl->lcn;
+			prev_lcn = lcn;
 		} else {
 			if (rl->lcn == LCN_DELALLOC)
 				de_cnt += rl->length;

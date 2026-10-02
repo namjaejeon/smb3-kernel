@@ -9,6 +9,7 @@ The Linux NTFS filesystem driver
 
    - Overview
    - Utilities support
+   - Upgrading NTFS 1.2 volumes
    - Supported mount options
 
 
@@ -32,6 +33,56 @@ NTFS devices.
 The project is available at:
 
   https://github.com/ntfsprogs-plus/ntfsprogs-plus
+
+
+Upgrading NTFS 1.2 volumes
+==========================
+
+A read-write mount upgrades supported NTFS 1.2 volumes to NTFS 3.0 only when
+``UPGRADE_ON_MOUNT`` (0x0004) is set in the volume flags. Conversion finishes
+before making the filesystem available and is synchronous: normal I/O must
+not observe a mixture of old and new metadata. Without the flag, the volume
+retains its NTFS 1.2 format. Read-only mounts do not upgrade the volume. To
+upgrade a flagged volume mounted read-only, unmount it and mount it
+read-write. A read-only to read-write remount does not convert it.
+
+The conversion creates ``$Secure`` in MFT record 9, ``$Extend`` in record 11,
+and ``$Quota``, ``$ObjId`` and ``$Reparse`` below ``$Extend``. It also updates
+``$AttrDef`` and converts legacy mapping pairs that encode holes. Existing
+file data, per-file security descriptors and 48-byte standard information
+attributes are retained. NTFS 3.0 is the target because it can retain the
+old MFT record headers. Converting to 3.1 would require relocating the
+update sequence array in existing records.
+
+A flagged volume already containing the NTFS 3.x system files but still
+reporting version 1.2 is checked before finishing its conversion. The
+``UPGRADE_ON_MOUNT`` flag is cleared after successful conversion. Existing
+NTFS 3.0 and 3.1 volumes are not converted.
+
+The driver checks allocated MFT records before starting the upgrade. It
+rejects populated legacy ``$Quota`` files, reserved records with unexpected
+uses, legacy volume-version or symbolic-link attributes, and other layouts
+it cannot convert. Dirty volumes, damaged metadata and Windows hibernation
+also prevent conversion. Before writing upgrade metadata, unsupported
+layouts or insufficient space cause the requested read-write mount to fall
+back to read-only. Space checks include the new files, MFT records, the
+MFT metadata reserve and growth of the MFT data and bitmap attributes.
+Damaged metadata, read errors and memory allocation failures abort the
+mount. Unsupported layouts can be upgraded using Windows.
+
+The dirty and upgrade flags are persisted before modifying metadata.
+Metadata and allocation bitmaps are flushed before the final version
+update. This is not a journaled transaction: an interrupted conversion or
+I/O failure can leave a partially converted, dirty volume. A failed
+conversion after upgrade writes have started aborts the mount. Repair the
+volume using Windows ``chkdsk`` before attempting another read-write mount.
+The prepared-layout check is not automatic recovery for an interrupted
+upgrade. It does not bypass the dirty-volume checks.
+
+Regression testing should use disposable images and cover conversion,
+data and stream contents, compressed holes, read-only mounts, dirty volumes
+and unchanged format when the upgrade flag is absent. Keep backups before
+upgrading existing volumes.
 
 
 Supported mount options

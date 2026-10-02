@@ -993,7 +993,6 @@ static bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const u64 mft_no,
 static const char *es = "  Leaving inconsistent metadata.  Unmount and run chkdsk.";
 
 #define FIRST_NORMAL_MFT_RECORD	24
-#define MFT_RECORD_RESERVE	4
 
 /*
  * Records 12-15 are marked in use by Windows but normally have no name
@@ -1828,7 +1827,8 @@ static int ntfs_mft_data_extend_allocation_nolock(struct ntfs_volume *vol)
 	/* Keep room for the allocating record and at least one MFT reserve. */
 	min_nr = DIV_ROUND_UP_ULL((u64)vol->mft_record_size * 2, vol->cluster_size);
 	/* Want to allocate 16 mft records worth of clusters. */
-	nr = vol->mft_record_size << 4 >> vol->cluster_size_bits;
+	nr = vol->mft_record_size * MFT_DATA_EXTEND_RECORDS >>
+			vol->cluster_size_bits;
 	if (!nr)
 		nr = min_nr;
 	/* Ensure we do not go above 2^32-1 mft records. */
@@ -2103,7 +2103,7 @@ undo_alloc:
  *
  * Return 0 on success and -errno on error.
  */
-static int ntfs_mft_record_layout(const struct ntfs_volume *vol, const s64 mft_no,
+int ntfs_mft_record_layout(const struct ntfs_volume *vol, const s64 mft_no,
 		struct mft_record *m)
 {
 	struct attr_record *a;
