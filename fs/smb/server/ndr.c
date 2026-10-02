@@ -210,12 +210,12 @@ int ndr_encode_dos_attr(struct ndr *n, struct xattr_dos_attrib *da)
 	char hex_attr[12] = {0};
 	int ret;
 
-	ret = ndr_init(n, 1024);
+	ret = ndr_init(n, 64);
 	if (ret)
 		return ret;
 
 	if (da->version == 3) {
-		snprintf(hex_attr, 10, "0x%x", da->attr);
+		snprintf(hex_attr, sizeof(hex_attr), "0x%x", da->attr);
 		ret = ndr_write_string(n, hex_attr);
 	} else {
 		ret = ndr_write_string(n, "");
@@ -357,6 +357,8 @@ static int ndr_encode_posix_acl_entry(struct ndr *n, struct xattr_smb_acl *acl)
 
 		/* push permission */
 		ret = ndr_write_int32(n, acl->entries[i].perm);
+		if (ret)
+			return ret;
 	}
 
 	return ret;
@@ -390,7 +392,6 @@ int ndr_encode_posix_acl(struct ndr *n,
 	if (def_acl) {
 		/* DEFAULT ACL ACCESS */
 		ret = ndr_write_int32(n, ref_id);
-		ref_id += 4;
 	} else {
 		ret = ndr_write_int32(n, 0);
 	}
@@ -411,10 +412,12 @@ int ndr_encode_posix_acl(struct ndr *n,
 
 	if (acl) {
 		ret = ndr_encode_posix_acl_entry(n, acl);
-		if (def_acl && !ret)
-			ret = ndr_encode_posix_acl_entry(n, def_acl);
+		if (ret)
+			return ret;
 	}
-	return ret;
+	if (def_acl)
+		return ndr_encode_posix_acl_entry(n, def_acl);
+	return 0;
 }
 
 int ndr_encode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
@@ -422,7 +425,7 @@ int ndr_encode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 	unsigned int ref_id = 0x00020004;
 	int ret;
 
-	ret = ndr_init(n, 2048);
+	ret = ndr_init(n, size_add(NDR_NTSD_OFFSETOF, acl->sd_size));
 	if (ret)
 		return ret;
 
@@ -495,9 +498,12 @@ int ndr_decode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 	if (ret)
 		return ret;
 
-	ndr_read_bytes(n, acl->desc, 10);
+	ret = ndr_read_bytes(n, acl->desc, sizeof(acl->desc));
+	if (ret)
+		return ret;
 	if (strncmp(acl->desc, "posix_acl", 9)) {
-		pr_err("Invalid acl description : %s\n", acl->desc);
+		pr_err("Invalid acl description : %.*s\n",
+		       (int)sizeof(acl->desc), acl->desc);
 		return -EINVAL;
 	}
 
@@ -512,10 +518,10 @@ int ndr_decode_v4_ntacl(struct ndr *n, struct xattr_ntacl *acl)
 		return ret;
 
 	acl->sd_size = n->length - n->offset;
-	acl->sd_buf = kzalloc(acl->sd_size, KSMBD_DEFAULT_GFP);
+	acl->sd_buf = kmemdup(ndr_get_field(n), acl->sd_size, KSMBD_DEFAULT_GFP);
 	if (!acl->sd_buf)
 		return -ENOMEM;
 
-	ret = ndr_read_bytes(n, acl->sd_buf, acl->sd_size);
-	return ret;
+	n->offset += acl->sd_size;
+	return 0;
 }
