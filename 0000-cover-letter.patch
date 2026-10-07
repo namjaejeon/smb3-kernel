@@ -1,0 +1,97 @@
+From cb40429c46618118c0b8ecf684e9aa5100d9dd97 Mon Sep 17 00:00:00 2001
+From: Namjae Jeon <linkinjeon@kernel.org>
+Date: Wed, 7 Oct 2026 07:35:33 +0900
+Subject: [PATCH v3 0/4] ntfs: add named data stream support
+
+NTFS supports multiple named $DATA attributes, commonly known as
+alternate data streams. This series adds support for accessing these
+streams in the ntfs driver through a new ioctl interface and an
+optional Windows-style pathname interface.
+
+v3:
+  - Fix named-stream runlist error handling to unlock the base inode MFT
+    record mutex.
+  - Reject streams_interface changes on remount to avoid stale dentries.
+  - Propagate named-stream read errors and document short-read EOF behavior.
+  - Update base-file timestamps for partial stream writes even when the write
+    fails, and document failed-write semantics.
+  - Reject named-stream removal from NTFS read-only base objects and clarify
+    pathname deletion authorization through the parent directory.
+  - Refresh stream inode timestamps after successful updates to the base inode.
+
+v2:
+  - Add the optional Windows-style pathname interface, exposing streams as
+    regular files with the operations needed by Wine.
+  - Document both interfaces and add MAINTAINERS coverage for the UAPI.
+
+The ioctl interface provides stream enumeration, reading, writing, and
+removal through an opened base file. Read and write requests specify a
+stream name and byte range. Names use the mounted NLS by default, with
+raw UTF-16LE available for lossless access. These ioctls remain available
+regardless of the pathname mount option.
+
+For example, a userspace program can enumerate streams on an opened base
+file as follows. Usual headers are assumed. Error handling and retrying
+with a larger buffer after ENOSPC are omitted:
+
+  int fd = open("/mnt/file", O_RDONLY);
+  size_t size = 8192;
+  struct ntfs_list_streams *req =
+          calloc(1, sizeof(*req) + size);
+
+  req->buffer_size = size;
+  ioctl(fd, NTFS_IOC_LIST_STREAMS, req);
+  printf("Total named streams: %llu\n",
+         (unsigned long long)req->stream_count);
+  free(req);
+  close(fd);
+
+The pathname interface is disabled by default and can be enabled with
+streams_interface=windows. In this mode, file:stream opens a
+named $DATA stream as a regular file descriptor, allowing ordinary file
+operations to be used:
+
+  $ mount -t ntfs /dev/sdb1 /mnt -o streams_interface=windows
+  $ printf 'This is a secret note\n' > /mnt/file:Note
+  $ cat /mnt/file:Note
+  This is a secret note
+
+A stream can be created only for an existing file or directory. Only the
+final path component's file:stream form is supported. The pathname
+interface accepts a base file name and stream name only. It rejects paths
+that also specify an NTFS attribute type such as $DATA. In windows mode,
+ordinary filenames containing ':' are hidden from directory listings.
+
+Namjae Jeon (4):
+  ntfs: add named stream ioctls support
+  ntfs: add pathname access for named streams
+  MAINTAINERS: ntfs: add UAPI header
+  ntfs: document named streams
+
+ Documentation/filesystems/ntfs.rst            |   34 +
+ .../userspace-api/ioctl/ioctl-number.rst      |    1 +
+ MAINTAINERS                                   |    1 +
+ fs/ntfs/Makefile                              |    2 +-
+ fs/ntfs/attrib.c                              |  168 +-
+ fs/ntfs/attrib.h                              |    2 +-
+ fs/ntfs/attrlist.c                            |    3 +-
+ fs/ntfs/dir.c                                 |    7 +-
+ fs/ntfs/ea.c                                  |   21 +-
+ fs/ntfs/file.c                                |  253 ++-
+ fs/ntfs/inode.c                               |  206 +-
+ fs/ntfs/inode.h                               |   19 +
+ fs/ntfs/iomap.c                               |   62 +-
+ fs/ntfs/named_stream.c                        | 1812 +++++++++++++++++
+ fs/ntfs/namei.c                               |  175 +-
+ fs/ntfs/stream.h                              |   81 +
+ fs/ntfs/super.c                               |   23 +
+ fs/ntfs/volume.h                              |    3 +
+ fs/ntfs/wof.c                                 |    6 +-
+ include/uapi/linux/ntfs.h                     |  123 ++
+ 20 files changed, 2792 insertions(+), 210 deletions(-)
+ create mode 100644 fs/ntfs/named_stream.c
+ create mode 100644 fs/ntfs/stream.h
+ create mode 100644 include/uapi/linux/ntfs.h
+
+-- 
+2.25.1
