@@ -266,11 +266,14 @@ unsigned int exfat_find_free_bitmap(struct super_block *sb, unsigned int clu)
 			bitval |= cpu_to_lel(clu_mask);
 			clu_mask = 0;
 		}
-		if (lel_to_cpu(bitval) != ULONG_MAX) {
-			clu_bits = lel_to_cpu(bitval);
+		clu_bits = lel_to_cpu(bitval);
+		while (clu_bits != ULONG_MAX) {
 			clu_free = clu_base + ffz(clu_bits);
-			if (clu_free < sbi->num_clusters)
+			if (clu_free >= sbi->num_clusters)
+				break;
+			if (!xa_load(&sbi->dio_reservations, clu_free))
 				return clu_free;
+			clu_bits |= BIT(clu_free - clu_base);
 		}
 		clu_base += BITS_PER_LONG;
 		map_b += sizeof(long);
@@ -296,6 +299,8 @@ int exfat_count_used_clusters(struct super_block *sb, unsigned int *ret_count)
 	unsigned int total_clus = EXFAT_DATA_CLUSTER_COUNT(sbi);
 	unsigned int last_mask = total_clus & (BITS_PER_LONG - 1);
 	unsigned long *bitmap, clu_bits;
+	unsigned long index;
+	void *entry;
 
 	total_clus &= ~last_mask;
 	for (i = 0; i < total_clus; i += BITS_PER_LONG) {
@@ -314,6 +319,9 @@ int exfat_count_used_clusters(struct super_block *sb, unsigned int *ret_count)
 		count += hweight_long(clu_bits & BITMAP_LAST_WORD_MASK(last_mask));
 	}
 
+	/* Reservations also consume space until committed or cancelled. */
+	xa_for_each(&sbi->dio_reservations, index, entry)
+		count++;
 	*ret_count = count;
 	return 0;
 }

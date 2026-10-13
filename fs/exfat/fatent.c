@@ -10,6 +10,7 @@
 
 #include "exfat_raw.h"
 #include "exfat_fs.h"
+#include "iomap.h"
 
 static int exfat_mirror_bh(struct super_block *sb, struct buffer_head *bh)
 {
@@ -431,6 +432,238 @@ static void exfat_clean_bdev_aliases(struct super_block *sb,
 
 	clean_bdev_aliases(sb->s_bdev, exfat_cluster_to_sector(sbi, clu),
 			   (sector_t)count << sbi->sect_per_clus_bits);
+}
+
+/* Reserve a contiguous run without dirtying either the bitmap or the FAT. */
+int exfat_reserve_dio_alloc(struct exfat_dio *dio, unsigned int count)
+{
+	struct inode *inode = file_inode(dio->iocb.ki_filp);
+	struct super_block *sb = inode->i_sb;
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	struct exfat_dio_alloc *alloc, *last;
+	unsigned int hint, clu, mapped = 1;
+	int err = 0;
+
+	alloc = kzalloc_obj(*alloc, GFP_NOFS);
+	if (!alloc)
+		return -ENOMEM;
+
+	mutex_lock(&sbi->s_lock);
+	if (list_empty(&dio->allocs)) {
+		if (dio->old_clusters) {
+			err = exfat_map_cluster(inode, dio->old_clusters - 1,
+						&dio->last_clu, &mapped, 0, NULL);
+			if (err)
+				goto out_unlock;
+		}
+		hint = dio->last_clu == EXFAT_EOF_CLUSTER ?
+			sbi->clu_srch_ptr : dio->last_clu + 1;
+	} else {
+		last = list_last_entry(&dio->allocs, struct exfat_dio_alloc, list);
+		hint = last->clu + last->count;
+	}
+	if (!is_valid_cluster(sbi, hint))
+		hint = EXFAT_FIRST_CLUSTER;
+
+	mutex_lock(&sbi->bitmap_lock);
+	if (unlikely(sbi->used_clusters > EXFAT_DATA_CLUSTER_COUNT(sbi))) {
+		err = -EIO;
+		goto out_bitmap;
+	}
+	if (count > EXFAT_DATA_CLUSTER_COUNT(sbi) - sbi->used_clusters) {
+		err = -ENOSPC;
+		goto out_bitmap;
+	}
+	clu = exfat_find_free_bitmap(sb, hint);
+	if (clu == EXFAT_EOF_CLUSTER) {
+		err = -ENOSPC;
+		goto out_bitmap;
+	}
+	alloc->clu = clu;
+	while (alloc->count < count && is_valid_cluster(sbi, clu)) {
+		if (exfat_test_bitmap(sb, clu) ||
+		    xa_load(&sbi->dio_reservations, clu))
+			break;
+		err = xa_insert(&sbi->dio_reservations, clu, xa_mk_value(1),
+				GFP_NOFS);
+		if (err)
+			goto undo;
+		alloc->count++;
+		sbi->used_clusters++;
+		clu++;
+	}
+	sbi->clu_srch_ptr = clu;
+	exfat_clean_bdev_aliases(sb, alloc->clu, alloc->count);
+	list_add_tail(&alloc->list, &dio->allocs);
+	mutex_unlock(&sbi->bitmap_lock);
+	mutex_unlock(&sbi->s_lock);
+	return 0;
+
+undo:
+	while (alloc->count) {
+		xa_erase(&sbi->dio_reservations, alloc->clu + --alloc->count);
+		sbi->used_clusters--;
+	}
+out_bitmap:
+	mutex_unlock(&sbi->bitmap_lock);
+out_unlock:
+	mutex_unlock(&sbi->s_lock);
+	kfree(alloc);
+	return err;
+}
+
+void exfat_release_dio_alloc(struct exfat_dio *dio)
+{
+	struct super_block *sb = file_inode(dio->iocb.ki_filp)->i_sb;
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	struct exfat_dio_alloc *alloc, *next;
+	unsigned int i;
+
+	if (list_empty(&dio->allocs))
+		return;
+	mutex_lock(&sbi->s_lock);
+	mutex_lock(&sbi->bitmap_lock);
+	list_for_each_entry_safe(alloc, next, &dio->allocs, list) {
+		for (i = 0; i < alloc->count; i++) {
+			xa_erase(&sbi->dio_reservations, alloc->clu + i);
+			sbi->used_clusters--;
+		}
+		list_del(&alloc->list);
+		kfree(alloc);
+	}
+	mutex_unlock(&sbi->bitmap_lock);
+	mutex_unlock(&sbi->s_lock);
+}
+
+/*
+ * Called after all data bios have completed, with s_lock held. Prepare the
+ * private chain and any old NoFatChain conversion before changing the live
+ * file. A preparation error leaves only unused FAT entries in free clusters.
+ *
+ * Prefetch both copies of the old tail's FAT sector before publishing bitmap
+ * bits, so no allocation or read failure can interrupt the in-memory attach.
+ * Final FAT/bitmap/stream-entry persistence is the normal non-journaled exFAT
+ * update; this does not make that final metadata update crash atomic.
+ */
+int exfat_commit_dio_alloc(struct exfat_dio *dio, loff_t end)
+{
+	struct inode *inode = file_inode(dio->iocb.ki_filp);
+	struct super_block *sb = inode->i_sb;
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	struct exfat_inode_info *ei = EXFAT_I(inode);
+	struct exfat_dio_alloc *alloc, *next;
+	struct buffer_head *tail_bh = NULL, *mirror_bh = NULL;
+	unsigned int count = exfat_bytes_to_cluster_round_up(sbi, end);
+	unsigned int remaining, n, prev = dio->last_clu, first, i;
+	bool fat = dio->old_clusters && ei->flags == ALLOC_FAT_CHAIN;
+	int err = 0;
+
+	lockdep_assert_held(&sbi->s_lock);
+	if (count <= dio->old_clusters)
+		return 0;
+	count -= dio->old_clusters;
+	remaining = count;
+	list_for_each_entry(alloc, &dio->allocs, list) {
+		n = min(alloc->count, remaining);
+		if (prev != EXFAT_EOF_CLUSTER && alloc->clu != prev + 1)
+			fat = true;
+		prev = alloc->clu + n - 1;
+		remaining -= n;
+		if (!remaining)
+			break;
+	}
+	if (WARN_ON_ONCE(remaining))
+		return -EIO;
+	alloc = list_first_entry(&dio->allocs, struct exfat_dio_alloc, list);
+	first = alloc->clu;
+	exfat_set_volume_dirty(sb);
+	if (fat) {
+		if (dio->old_clusters && ei->flags == ALLOC_NO_FAT_CHAIN) {
+			err = exfat_chain_cont_cluster(sb, ei->start_clu,
+						       dio->old_clusters);
+			if (err)
+				return err;
+		}
+		remaining = count;
+		prev = EXFAT_EOF_CLUSTER;
+		list_for_each_entry(alloc, &dio->allocs, list) {
+			n = min(alloc->count, remaining);
+			err = exfat_chain_cont_cluster(sb, alloc->clu, n);
+			if (err)
+				return err;
+			if (prev != EXFAT_EOF_CLUSTER) {
+				err = exfat_ent_set(sb, prev, alloc->clu);
+				if (err)
+					return err;
+			}
+			prev = alloc->clu + n - 1;
+			remaining -= n;
+			if (!remaining)
+				break;
+		}
+		if (dio->old_clusters) {
+			sector_t sec = FAT_ENT_OFFSET_SECTOR(sb, dio->last_clu);
+
+			tail_bh = sb_bread(sb, sec);
+			if (!tail_bh)
+				return -EIO;
+			if (sbi->FAT2_start_sector != sbi->FAT1_start_sector) {
+				sec += sbi->FAT2_start_sector - sbi->FAT1_start_sector;
+				mirror_bh = sb_getblk(sb, sec);
+				if (!mirror_bh) {
+					brelse(tail_bh);
+					return -ENOMEM;
+				}
+			}
+		}
+	}
+
+	mutex_lock(&sbi->bitmap_lock);
+	remaining = count;
+	list_for_each_entry_safe(alloc, next, &dio->allocs, list) {
+		n = min(alloc->count, remaining);
+		for (i = 0; i < n; i++) {
+			exfat_set_bitmap(sb, alloc->clu + i, inode_needs_sync(inode));
+			xa_erase(&sbi->dio_reservations, alloc->clu + i);
+		}
+		alloc->clu += n;
+		alloc->count -= n;
+		if (!alloc->count) {
+			list_del(&alloc->list);
+			kfree(alloc);
+		}
+		remaining -= n;
+		if (!remaining)
+			break;
+	}
+	/* used_clusters already accounts for the reservations. */
+	mutex_unlock(&sbi->bitmap_lock);
+
+	if (tail_bh) {
+		unsigned int off = FAT_ENT_OFFSET_BYTE_IN_SECTOR(sb, dio->last_clu);
+
+		*(__le32 *)(tail_bh->b_data + off) = cpu_to_le32(first);
+		if (mirror_bh)
+			memcpy(mirror_bh->b_data, tail_bh->b_data, sb->s_blocksize);
+	}
+	if (!dio->old_clusters)
+		ei->start_clu = first;
+	ei->flags = fat ? ALLOC_FAT_CHAIN : ALLOC_NO_FAT_CHAIN;
+	inode->i_blocks += exfat_cluster_to_sectors(sbi, count);
+	dio->committed = true;
+
+	if (tail_bh) {
+		err = exfat_update_bh(tail_bh, sb->s_flags & SB_SYNCHRONOUS);
+		brelse(tail_bh);
+	}
+	if (mirror_bh) {
+		int ret = exfat_update_bh(mirror_bh, sb->s_flags & SB_SYNCHRONOUS);
+
+		if (!err)
+			err = ret;
+		brelse(mirror_bh);
+	}
+	return err;
 }
 
 int exfat_alloc_cluster(struct inode *inode, unsigned int num_alloc,
