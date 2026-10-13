@@ -14,6 +14,7 @@
 #include <linux/backing-dev.h>
 #include <uapi/linux/exfat.h>
 #include <linux/buffer_head.h>
+#include <linux/xarray.h>
 
 #define EXFAT_ROOT_INO		1
 
@@ -246,6 +247,8 @@ struct exfat_sb_info {
 
 	unsigned int clu_srch_ptr; /* cluster search pointer */
 	unsigned int used_clusters; /* number of used clusters */
+	/* DIO reservations are counted above, but are not in vol_amap yet. */
+	struct xarray dio_reservations;
 
 	unsigned long s_exfat_flags; /* Exfat superblock flags */
 

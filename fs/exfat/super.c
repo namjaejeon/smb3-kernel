@@ -774,8 +774,10 @@ static void exfat_free(struct fs_context *fc)
 {
 	struct exfat_sb_info *sbi = fc->s_fs_info;
 
-	if (sbi)
+	if (sbi) {
+		xa_destroy(&sbi->dio_reservations);
 		exfat_free_sbi(sbi);
+	}
 }
 
 static int exfat_reconfigure(struct fs_context *fc)
@@ -844,6 +846,7 @@ static int exfat_init_fs_context(struct fs_context *fc)
 
 	mutex_init(&sbi->s_lock);
 	mutex_init(&sbi->bitmap_lock);
+	xa_init(&sbi->dio_reservations);
 	ratelimit_state_init(&sbi->ratelimit, DEFAULT_RATELIMIT_INTERVAL,
 			DEFAULT_RATELIMIT_BURST);
 
@@ -885,8 +888,11 @@ static void exfat_kill_sb(struct super_block *sb)
 	struct exfat_sb_info *sbi = sb->s_fs_info;
 
 	kill_block_super(sb);
-	if (sbi)
+	if (sbi) {
+		/* Reservations are only accessed from process context. */
+		xa_destroy(&sbi->dio_reservations);
 		call_rcu(&sbi->rcu, delayed_free);
+	}
 }
 
 static struct file_system_type exfat_fs_type = {
