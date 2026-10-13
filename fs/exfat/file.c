@@ -301,10 +301,10 @@ int __exfat_truncate(struct inode *inode)
 		ei->start_clu = EXFAT_EOF_CLUSTER;
 	}
 
-	if (i_size_read(inode) < exfat_get_valid_size(ei)) {
+	if (i_size_read(inode) < exfat_get_valid_size(ei))
 		exfat_set_valid_size(ei, i_size_read(inode));
+	if (i_size_read(inode) < exfat_get_zeroed_size(ei))
 		exfat_set_zeroed_size(ei, i_size_read(inode));
-	}
 
 	if (ei->type == TYPE_FILE)
 		ei->attr |= EXFAT_ATTR_ARCHIVE;
@@ -970,9 +970,15 @@ static ssize_t exfat_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
 	inode_lock_shared(inode);
 
 	if (iocb->ki_flags & IOCB_DIRECT) {
+		/* Snapshot before writeback or destination faults can advance VDL. */
+		loff_t valid_size = exfat_get_valid_size(EXFAT_I(inode));
+
 		file_accessed(iocb->ki_filp);
 		ret = iomap_dio_rw(iocb, iter, &exfat_iomap_ops, NULL, 0,
-				NULL, 0);
+				   &valid_size, 0);
+		if (ret >= 0 && iov_iter_count(iter) &&
+		    iocb->ki_pos < i_size_read(inode))
+			ret = filemap_read(iocb, iter, ret);
 	} else {
 		ret = generic_file_read_iter(iocb, iter);
 	}
