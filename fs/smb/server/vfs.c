@@ -2252,7 +2252,21 @@ int ksmbd_vfs_set_rp_xattr(struct mnt_idmap *idmap, const struct path *path,
 		.rp_size = len,
 		.hash_type = XATTR_RP_HASH_TYPE_SHA256,
 	};
+	void *old_data;
+	u32 old_tag, old_len;
 	int ret;
+
+	/* Serialize the tag comparison and update against other SMB requests. */
+	lockdep_assert_held_write(&ksmbd_reparse_sem);
+	ret = ksmbd_vfs_get_rp_xattr(idmap, path->dentry, &old_tag,
+				     &old_data, &old_len);
+	if (!ret) {
+		kfree(old_data);
+		if (old_tag != tag)
+			return -EIO;
+	} else if (ret != -ENODATA && ret != -EOPNOTSUPP) {
+		return ret;
+	}
 
 	if (d_is_dir(path->dentry)) {
 		ret = ksmbd_vfs_path_empty_dir(path);
