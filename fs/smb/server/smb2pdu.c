@@ -329,14 +329,16 @@ static int smb2_reparse_unparsed_len(struct ksmbd_work *work,
 				     const char *name, u16 *unparsed_len)
 {
 	__le16 *utf16;
+	size_t name_len = strlen(name);
 	int len;
 
-	utf16 = kmalloc_array(PATH_MAX, sizeof(*utf16), KSMBD_DEFAULT_GFP);
+	/* Conversion can emit one UTF-16 unit per byte, plus the terminator. */
+	utf16 = kvmalloc_array(name_len + 1, sizeof(*utf16), KSMBD_DEFAULT_GFP);
 	if (!utf16)
 		return -ENOMEM;
-	len = smbConvertToUTF16(utf16, name, strlen(name),
+	len = smbConvertToUTF16(utf16, name, name_len,
 				work->conn->local_nls, 0);
-	kfree(utf16);
+	kvfree(utf16);
 	if (len < 0 || len > U16_MAX / sizeof(*utf16))
 		return -EINVAL;
 	*unparsed_len = len * sizeof(*utf16);
