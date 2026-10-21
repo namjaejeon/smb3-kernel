@@ -1726,6 +1726,33 @@ __le32 smb2_get_reparse_tag_special_file(umode_t mode)
 	return 0;
 }
 
+__le32 smb2_get_posix_mode(umode_t mode)
+{
+	u32 type = POSIX_TYPE_FILE;
+
+	switch (mode & S_IFMT) {
+	case S_IFDIR:
+		type = POSIX_TYPE_DIR;
+		break;
+	case S_IFLNK:
+		type = POSIX_TYPE_SYMLINK;
+		break;
+	case S_IFCHR:
+		type = POSIX_TYPE_CHARDEV;
+		break;
+	case S_IFBLK:
+		type = POSIX_TYPE_BLKDEV;
+		break;
+	case S_IFIFO:
+		type = POSIX_TYPE_FIFO;
+		break;
+	case S_IFSOCK:
+		type = POSIX_TYPE_SOCKET;
+		break;
+	}
+	return cpu_to_le32((mode & 07777) | (type << POSIX_FILETYPE_SHIFT));
+}
+
 static int smb2_get_native_reparse_point(struct dentry *dentry, u32 *tag,
 					 void **data, u32 *len)
 {
@@ -6197,9 +6224,11 @@ resolve_path:
 		posix_ccontext = (struct create_context *)(rsp->Buffer +
 				le32_to_cpu(rsp->CreateContextsLength));
 		contxt_cnt++;
-		create_posix_rsp_buf(rsp->Buffer +
-				le32_to_cpu(rsp->CreateContextsLength),
-				fp);
+		rc = create_posix_rsp_buf(rsp->Buffer +
+					 le32_to_cpu(rsp->CreateContextsLength),
+					 fp);
+		if (rc)
+			goto err_out1;
 		le32_add_cpu(&rsp->CreateContextsLength,
 			     conn->vals->create_posix_size);
 		iov_len += conn->vals->create_posix_size;
@@ -6847,33 +6876,11 @@ static int smb2_populate_readdir_entry(struct ksmbd_conn *conn, int info_level,
 		posix_info->AllocationSize = cpu_to_le64(ksmbd_kstat->kstat->blocks << 9);
 		posix_info->DeviceId = cpu_to_le32(ksmbd_kstat->kstat->dev);
 		posix_info->HardLinks = cpu_to_le32(ksmbd_kstat->kstat->nlink);
-		posix_info->ReparseTag =
-			smb2_get_reparse_tag_special_file(ksmbd_kstat->kstat->mode);
-		posix_info->Mode = cpu_to_le32(ksmbd_kstat->kstat->mode & 07777);
-		switch (ksmbd_kstat->kstat->mode & S_IFMT) {
-		case S_IFDIR:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_DIR << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFLNK:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_SYMLINK << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFCHR:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_CHARDEV << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFBLK:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_BLKDEV << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFIFO:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_FIFO << POSIX_FILETYPE_SHIFT);
-			break;
-		case S_IFSOCK:
-			posix_info->Mode |= cpu_to_le32(POSIX_TYPE_SOCKET << POSIX_FILETYPE_SHIFT);
-		}
+		posix_info->ReparseTag = smb2_get_reparse_tag(ksmbd_kstat);
+		posix_info->Mode = smb2_get_posix_mode(ksmbd_kstat->posix_mode);
 
 		posix_info->Inode = cpu_to_le64(ksmbd_kstat->kstat->ino);
-		posix_info->DosAttributes =
-			S_ISDIR(ksmbd_kstat->kstat->mode) ?
-				FILE_ATTRIBUTE_DIRECTORY_LE : FILE_ATTRIBUTE_ARCHIVE_LE;
+		posix_info->DosAttributes = ksmbd_kstat->file_attributes;
 		if (posix_info->ReparseTag)
 			posix_info->DosAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 		if (d_info->hide_dot_file && d_info->name[0] == '.')
@@ -8314,6 +8321,8 @@ static int find_file_posix_info(struct ksmbd_work *work,
 	char *filename;
 	__le16 *utf16_name;
 	__le32 *filename_len;
+	umode_t posix_mode;
+	u32 reparse_tag;
 	size_t name_bytes;
 	u64 time;
 	int fixed_len = sizeof(struct smb311_posix_qinfo) + 32 + sizeof(__le32);
@@ -8326,6 +8335,10 @@ static int find_file_posix_info(struct ksmbd_work *work,
 	}
 
 	ret = get_file_allocation_stat(fp, &stat);
+	if (ret)
+		return ret;
+	ret = ksmbd_vfs_get_reparse_info(idmap, fp->filp->f_path.dentry,
+					&reparse_tag, &posix_mode);
 	if (ret)
 		return ret;
 	max_len = smb2_calc_max_out_buf_len(work,
@@ -8380,30 +8393,12 @@ static int find_file_posix_info(struct ksmbd_work *work,
 		file_info->AllocationSize = cpu_to_le64((u64)seof);
 	}
 	file_info->HardLinks = cpu_to_le32(stat.nlink);
-	file_info->Mode = cpu_to_le32(stat.mode & 07777);
-	switch (stat.mode & S_IFMT) {
-	case S_IFDIR:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_DIR << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFLNK:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_SYMLINK << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFCHR:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_CHARDEV << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFBLK:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_BLKDEV << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFIFO:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_FIFO << POSIX_FILETYPE_SHIFT);
-		break;
-	case S_IFSOCK:
-		file_info->Mode |= cpu_to_le32(POSIX_TYPE_SOCKET << POSIX_FILETYPE_SHIFT);
-	}
+	file_info->Mode = smb2_get_posix_mode(posix_mode);
 
 	file_info->DeviceId = cpu_to_le32(stat.dev);
 	file_info->Zero = 0;
-	file_info->ReparseTag = smb2_get_reparse_tag_special_file(stat.mode);
+	file_info->ReparseTag = cpu_to_le32(reparse_tag);
+	file_info->DosAttributes &= ~FILE_ATTRIBUTE_REPARSE_POINT_LE;
 	if (file_info->ReparseTag)
 		file_info->DosAttributes |= FILE_ATTRIBUTE_REPARSE_POINT_LE;
 

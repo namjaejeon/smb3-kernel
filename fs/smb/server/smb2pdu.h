@@ -169,6 +169,7 @@ struct create_posix_rsp {
 } __packed;
 
 __le32 smb2_get_reparse_tag_special_file(umode_t mode);
+__le32 smb2_get_posix_mode(umode_t mode);
 
 #define SMB2_0_IOCTL_IS_FSCTL 0x00000001
 

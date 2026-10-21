@@ -74,6 +74,7 @@ struct ksmbd_kstat {
 	unsigned long long	create_time;
 	__le32			file_attributes;
 	u32			reparse_tag;
+	umode_t			posix_mode;
 	bool			has_ads_stream; /* AAPL READDIR_ATTR V2 xattr-presence flag */
 };
 
@@ -181,6 +182,8 @@ int ksmbd_vfs_set_rp_xattr(struct mnt_idmap *idmap, const struct path *path,
 			   u32 tag, const void *data, u32 len);
 int ksmbd_vfs_get_rp_xattr(struct mnt_idmap *idmap, struct dentry *dentry,
 			   u32 *tag, void **data, u32 *len);
+int ksmbd_vfs_get_reparse_info(struct mnt_idmap *idmap, struct dentry *dentry,
+			       u32 *tag, umode_t *mode);
 int ksmbd_vfs_remove_rp_xattr(struct mnt_idmap *idmap,
 			      const struct path *path);
 int ksmbd_vfs_set_dos_attrib_xattr(struct mnt_idmap *idmap,
