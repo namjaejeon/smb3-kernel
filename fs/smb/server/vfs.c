@@ -72,13 +72,21 @@ static int ksmbd_vfs_path_lookup(struct ksmbd_share_config *share_conf,
 				 const struct path *root_share_path)
 {
 	struct qstr last;
+	char *wide_path __free(kfree) = NULL;
 	struct dentry *d;
 	int err;
 
 	if (for_remove && flags & LOOKUP_FOLLOW)
 		return -EINVAL;
-	if (!*pathname)
+	if (!root_share_path) {
+		wide_path = kasprintf(KSMBD_DEFAULT_GFP, "%s/%s",
+				      share_conf->path, pathname);
+		if (!wide_path)
+			return -ENOMEM;
+		pathname = wide_path;
+	} else if (!*pathname) {
 		pathname = ".";
+	}
 	flags |= LOOKUP_NO_MAGICLINKS;
 	if (root_share_path)
 		flags |= LOOKUP_BENEATH;
@@ -1721,12 +1729,12 @@ static int ksmbd_vfs_lookup_in_dir(const struct path *dir, char *name,
 	return ret;
 }
 
-static
-int __ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
-			  unsigned int flags,
-			  struct path *path, bool caseless, bool for_remove)
+static int __ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
+				 unsigned int flags, struct path *path,
+				 bool caseless, bool for_remove, bool wide)
 {
 	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
+	const struct path *root = wide ? NULL : &share_conf->vfs_path;
 	struct path parent_path;
 	size_t path_len, remain_len;
 	unsigned int prefix_flags;
@@ -1734,7 +1742,7 @@ int __ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
 
 retry:
 	err = ksmbd_vfs_path_lookup(share_conf, filepath, flags, path,
-				    for_remove, &share_conf->vfs_path);
+				    for_remove, root);
 	if (!err || err != -ENOENT || !caseless)
 		return err;
 
@@ -1766,12 +1774,11 @@ retry:
 		next[0] = '\0';
 
 		/* Follow prefix symlinks unless this lookup explicitly forbids it. */
-		prefix_flags = flags | LOOKUP_BENEATH;
+		prefix_flags = flags;
 		if (!(flags & LOOKUP_NO_SYMLINKS))
 			prefix_flags |= LOOKUP_FOLLOW;
 		err = ksmbd_vfs_path_lookup(share_conf, filepath, prefix_flags,
-					    &parent_path, false,
-					    &share_conf->vfs_path);
+					    &parent_path, false, root);
 		next[0] = '/';
 		if (err)
 			goto out;
@@ -1803,7 +1810,7 @@ int ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
 			struct path *path, bool caseless)
 {
 	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
-				     caseless, false);
+				     caseless, false, false);
 }
 
 /**
@@ -1851,9 +1858,7 @@ int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *filepath,
 			     struct path *path, bool caseless,
 			     bool *wide_link, bool follow_final)
 {
-	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
 	unsigned int lookup_flags = follow_final ? LOOKUP_FOLLOW : 0;
-	char *fullpath;
 	int err;
 
 	*wide_link = false;
@@ -1871,13 +1876,8 @@ int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *filepath,
 	if (ksmbd_vfs_has_dotdot(filepath))
 		return -EACCES;
 
-	fullpath = kasprintf(KSMBD_DEFAULT_GFP, "%s/%s",
-			     share_conf->path, filepath);
-	if (!fullpath)
-		return -ENOMEM;
-	err = ksmbd_vfs_path_lookup(share_conf, fullpath, lookup_flags,
-				    path, false, NULL);
-	kfree(fullpath);
+	err = __ksmbd_vfs_kern_path(work, filepath, lookup_flags, path,
+				    caseless, false, true);
 	if (!err)
 		*wide_link = true;
 	return err;
@@ -1901,7 +1901,7 @@ int ksmbd_vfs_kern_path_start_removing(struct ksmbd_work *work, char *filepath,
 				       struct path *path, bool caseless)
 {
 	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
-				     caseless, true);
+				     caseless, true, false);
 }
 
 void ksmbd_vfs_kern_path_end_removing(const struct path *path)
