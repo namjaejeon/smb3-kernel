@@ -12666,7 +12666,8 @@ static int smb2_check_reparse_write_access(struct ksmbd_file *fp)
 	const struct cred *saved_cred;
 	int ret;
 
-	if (fp->is_wide_link || !(fp->daccess & FILE_WRITE_ATTRIBUTES_LE))
+	if (fp->is_wide_link ||
+	    !(fp->daccess & (FILE_WRITE_DATA_LE | FILE_WRITE_ATTRIBUTES_LE)))
 		return -EACCES;
 
 	saved_cred = override_creds(fp->filp->f_cred);
