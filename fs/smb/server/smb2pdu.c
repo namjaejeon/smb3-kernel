@@ -1272,8 +1272,14 @@ int smb2_allocate_rsp_buf(struct ksmbd_work *work)
 	if (cmd == SMB2_IOCTL_HE || cmd == SMB2_QUERY_DIRECTORY_HE)
 		sz = large_sz;
 
-	if (cmd == SMB2_CREATE_HE)
-		sz = max_t(size_t, sz, vals->create_rsp_size);
+	if (cmd == SMB2_CREATE_HE) {
+		/* A symlink error can contain a full 16-bit reparse payload. */
+		size_t symlink_sz = sizeof(__be32) + sizeof(struct smb2_err_rsp) +
+			sizeof(struct ksmbd_error_context_rsp) +
+			sizeof(struct ksmbd_symlink_err_rsp) + U16_MAX;
+
+		sz = max3(sz, (size_t)vals->create_rsp_size, symlink_sz);
+	}
 
 	if (cmd == SMB2_QUERY_INFO_HE) {
 		struct smb2_query_info_req *req;
@@ -1293,7 +1299,7 @@ int smb2_allocate_rsp_buf(struct ksmbd_work *work)
 
 	/* allocate large response buf for chained commands */
 	if (le32_to_cpu(hdr->NextCommand) > 0)
-		sz = large_sz;
+		sz = max(sz, large_sz);
 
 	work->response_buf = kvzalloc(sz, KSMBD_DEFAULT_GFP);
 	if (!work->response_buf)
