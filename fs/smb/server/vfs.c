@@ -154,7 +154,8 @@ static void ksmbd_vfs_inherit_owner(struct ksmbd_work *work,
 static int ksmbd_vfs_path_lookup(struct ksmbd_share_config *share_conf,
 				 const char *pathname, unsigned int flags,
 				 struct path *path, bool for_remove,
-				 const struct path *root_share_path)
+				 const struct path *root_share_path,
+				 bool check_reparse)
 {
 	struct qstr last;
 	char *wide_path __free(kfree) = NULL;
@@ -188,6 +189,8 @@ static int ksmbd_vfs_path_lookup(struct ksmbd_share_config *share_conf,
 			path_put(path);
 			return -EXDEV;
 		}
+		if (!check_reparse)
+			return 0;
 		err = ksmbd_vfs_check_reparse_components(pathname, flags,
 						root_share_path);
 		if (!err)
@@ -1881,7 +1884,8 @@ static int ksmbd_vfs_lookup_in_dir(const struct path *dir, char *name,
 
 static int __ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
 				 unsigned int flags, struct path *path,
-				 bool caseless, bool for_remove, bool wide)
+				 bool caseless, bool for_remove, bool wide,
+				 bool check_reparse)
 {
 	struct ksmbd_share_config *share_conf = work->tcon->share_conf;
 	const struct path *root = wide ? NULL : &share_conf->vfs_path;
@@ -1892,8 +1896,10 @@ static int __ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
 
 retry:
 	err = ksmbd_vfs_path_lookup(share_conf, filepath, flags, path,
-				    for_remove, root);
-	if (!err || err != -ENOENT || !caseless)
+				    for_remove, root, check_reparse);
+	/* An inspection may still need to find a reparse prefix of a long name. */
+	if (!caseless || (err != -ENOENT &&
+			 (check_reparse || err != -ENAMETOOLONG)))
 		return err;
 
 	path_len = strlen(filepath);
@@ -1927,8 +1933,9 @@ retry:
 		prefix_flags = flags;
 		if (!(flags & LOOKUP_NO_SYMLINKS))
 			prefix_flags |= LOOKUP_FOLLOW;
+		/* The final lookup validates reparse traversal after correcting case. */
 		err = ksmbd_vfs_path_lookup(share_conf, filepath, prefix_flags,
-					    &parent_path, false, root);
+					    &parent_path, false, root, false);
 		next[0] = '/';
 		if (err)
 			goto out;
@@ -1960,7 +1967,7 @@ int ksmbd_vfs_kern_path(struct ksmbd_work *work, char *filepath,
 			struct path *path, bool caseless)
 {
 	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
-				     caseless, false, false);
+				     caseless, false, false, true);
 }
 
 /**
@@ -2027,10 +2034,43 @@ int ksmbd_vfs_kern_path_wide(struct ksmbd_work *work, char *filepath,
 		return -EACCES;
 
 	err = __ksmbd_vfs_kern_path(work, filepath, lookup_flags, path,
-				    caseless, false, true);
+				    caseless, false, true, true);
 	if (!err)
 		*wide_link = true;
 	return err;
+}
+
+/**
+ * ksmbd_vfs_lookup_reparse_prefix() - look up a name for reparse inspection
+ * @work: SMB request work item
+ * @filepath: share-relative name, updated by case-insensitive matching
+ * @flags: namei lookup flags
+ * @path: returned path, for inspection only
+ * @caseless: correct the spelling of components before inspecting prefixes
+ *
+ * Keep namei confinement and the share's mount and wide-link policies, but do
+ * not recursively inspect reparse components for every textual prefix. Callers
+ * must validate a discovered prefix through ksmbd_vfs_kern_path[_wide]() before
+ * returning its metadata. This path must never be used to open or modify data.
+ *
+ * Return: 0 on success, otherwise a negative error code.
+ */
+int ksmbd_vfs_lookup_reparse_prefix(struct ksmbd_work *work, char *filepath,
+				  unsigned int flags, struct path *path,
+				  bool caseless)
+{
+	int err;
+
+	err = __ksmbd_vfs_kern_path(work, filepath, flags, path,
+				    caseless, false, false, false);
+	if (err != -EXDEV || flags & LOOKUP_NO_SYMLINKS ||
+	    !test_share_config_flag(work->tcon->share_conf,
+				    KSMBD_SHARE_FLAG_WIDE_LINKS))
+		return err;
+	if (ksmbd_vfs_has_dotdot(filepath))
+		return -EACCES;
+	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
+				     caseless, false, true, false);
 }
 
 /**
@@ -2051,7 +2091,7 @@ int ksmbd_vfs_kern_path_start_removing(struct ksmbd_work *work, char *filepath,
 				       struct path *path, bool caseless)
 {
 	return __ksmbd_vfs_kern_path(work, filepath, flags, path,
-				     caseless, true, false);
+				     caseless, true, false, true);
 }
 
 void ksmbd_vfs_kern_path_end_removing(const struct path *path)
