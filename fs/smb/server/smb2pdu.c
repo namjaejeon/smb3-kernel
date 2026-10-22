@@ -389,28 +389,56 @@ static u16 smb2_create_stream_suffix_len(const struct smb2_create_req *req)
 /**
  * smb2_reparse_unparsed_len() - measure a path suffix in SMB wire bytes
  * @work: SMB request work item
- * @name: local-charset path suffix
+ * @name: local-charset pathname or prefix after case correction
+ * @suffix: suffix boundary within @name
+ * @stream_suffix_len: UTF-16 byte length of the original stream suffix
  * @unparsed_len: returned UTF-16 byte length
  *
  * Return: 0 on success, otherwise a negative error code.
  */
 static int smb2_reparse_unparsed_len(struct ksmbd_work *work,
-				     const char *name, u16 *unparsed_len)
+				     const char *name, const char *suffix,
+				     u16 stream_suffix_len, u16 *unparsed_len)
 {
-	__le16 *utf16;
-	size_t name_len = strlen(name);
-	int len;
+	const struct smb2_create_req *req = ksmbd_req_buf_next(work);
+	const char *wire_name = (const char *)req + le16_to_cpu(req->NameOffset);
+	unsigned int wire_len = le16_to_cpu(req->NameLength);
+	unsigned int off = 0, parsed_off = 0;
+	bool found = false;
 
-	/* Conversion can emit one UTF-16 unit per byte, plus the terminator. */
-	utf16 = kvmalloc_array(name_len + 1, sizeof(*utf16), KSMBD_DEFAULT_GFP);
-	if (!utf16)
-		return -ENOMEM;
-	len = smbConvertToUTF16(utf16, name, name_len,
-				work->conn->local_nls, 0);
-	kvfree(utf16);
-	if (len < 0 || len > U16_MAX / sizeof(*utf16))
+	if (wire_len & 1 || stream_suffix_len > wire_len)
 		return -EINVAL;
-	*unparsed_len = len * sizeof(*utf16);
+	wire_len -= stream_suffix_len;
+
+	/*
+	 * Casefolding preserves separators, but can change UTF-16 name lengths.
+	 * Match component boundaries against the original request, including
+	 * when @name stops at a reparse prefix before the complete pathname.
+	 */
+	for (;;) {
+		const char *slash = strchrnul(name, '/');
+		u16 c = 0;
+
+		while (off < wire_len) {
+			c = get_unaligned_le16(wire_name + off);
+			if (!c || c == '\\' || c == '/')
+				break;
+			off += sizeof(__le16);
+		}
+		if (slash == suffix) {
+			parsed_off = off;
+			found = true;
+		}
+		if (!*slash)
+			break;
+		if (off == wire_len || (c != '\\' && c != '/'))
+			return -EINVAL;
+		off += sizeof(__le16);
+		name = slash + 1;
+	}
+	if (!found)
+		return -EINVAL;
+	*unparsed_len = off - parsed_off;
 	return 0;
 }
 
@@ -419,6 +447,7 @@ static int smb2_reparse_unparsed_len(struct ksmbd_work *work,
  * @work: SMB request work item
  * @name: share-relative pathname
  * @follow_symlinks: follow native symlinks while inspecting parent components
+ * @stream_suffix_len: UTF-16 byte length of the original stream suffix
  * @tag: returned reparse tag
  * @data: returned allocated reparse payload
  * @len: returned payload length
@@ -427,23 +456,29 @@ static int smb2_reparse_unparsed_len(struct ksmbd_work *work,
  *
  * Return: 0 when found, -ENODATA when absent, or another negative error.
  */
-static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
-				   bool follow_symlinks, u32 *tag,
+static int smb2_find_reparse_point(struct ksmbd_work *work, char *name,
+				   bool follow_symlinks, u16 stream_suffix_len, u32 *tag,
 				   void **data, u32 *len,
 				   u16 *unparsed_len, size_t *reparse_name_len)
 {
 	struct ksmbd_share_config *share = work->tcon->share_conf;
 	unsigned int flags = follow_symlinks ? LOOKUP_FOLLOW : LOOKUP_NO_SYMLINKS;
+	struct path path;
 	char *prefix, *slash, *next;
 	int ret = -ENODATA;
+
+	/* Correct case once, including existing prefixes of a missing/long name. */
+	ret = ksmbd_vfs_lookup_reparse_prefix(work, name, flags, &path, true);
+	if (!ret)
+		path_put(&path);
+	else if (ret == -ENOMEM)
+		return ret;
 
 	prefix = kstrdup(name, KSMBD_DEFAULT_GFP);
 	if (!prefix)
 		return -ENOMEM;
 	next = prefix;
 	for (;;) {
-		struct path path;
-
 		slash = strchr(next, '/');
 		if (!slash) {
 			ret = -ENODATA;
@@ -451,15 +486,8 @@ static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
 		}
 		*slash = '\0';
 		if (*prefix) {
-			if (follow_symlinks &&
-			    test_share_config_flag(share, KSMBD_SHARE_FLAG_WIDE_LINKS)) {
-				bool wide_link;
-
-				ret = ksmbd_vfs_kern_path_wide(work, prefix, &path,
-							       1, &wide_link, true);
-			} else {
-				ret = ksmbd_vfs_kern_path(work, prefix, flags, &path, 1);
-			}
+			ret = ksmbd_vfs_lookup_reparse_prefix(work, prefix, flags,
+							    &path, false);
 			if (ret) {
 				/* Leave ordinary lookup failures to the complete path lookup. */
 				if (ret == -ENOENT || ret == -ENOTDIR ||
@@ -472,14 +500,33 @@ static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
 				ret = -ENODATA;
 				break;
 			}
-			ret = ksmbd_vfs_get_rp_xattr(mnt_idmap(path.mnt),
-						     path.dentry, tag, data, len);
+			ret = ksmbd_vfs_xattr_len(mnt_idmap(path.mnt), path.dentry,
+						  XATTR_NAME_RP);
 			path_put(&path);
+			if (ret >= 0) {
+				/* Validate all aliases and ancestors before exposing metadata. */
+				if (follow_symlinks &&
+				    test_share_config_flag(share, KSMBD_SHARE_FLAG_WIDE_LINKS)) {
+					bool wide_link;
+
+					ret = ksmbd_vfs_kern_path_wide(work, prefix, &path,
+								       0, &wide_link, true);
+				} else {
+					ret = ksmbd_vfs_kern_path(work, prefix, flags,
+								  &path, 0);
+				}
+				if (ret)
+					break;
+				ret = ksmbd_vfs_get_rp_xattr(mnt_idmap(path.mnt), path.dentry,
+							     tag, data, len);
+				path_put(&path);
+			}
 			if (!ret) {
 				const char *suffix = name + (slash - prefix);
 
 				*reparse_name_len = slash - prefix;
-				ret = smb2_reparse_unparsed_len(work, suffix,
+				ret = smb2_reparse_unparsed_len(work, name, suffix,
+								stream_suffix_len,
 								unparsed_len);
 				if (ret) {
 					kfree(*data);
@@ -503,16 +550,25 @@ static int smb2_find_reparse_point(struct ksmbd_work *work, const char *name,
  * smb2_find_posix_symlink() - find a native symlink in a pathname
  * @work: SMB request work item
  * @name: share-relative pathname
+ * @stream_suffix_len: UTF-16 byte length of the original stream suffix
  * @path: returned path of the symlink component
  * @unparsed_len: returned UTF-16 length following the symlink component
  *
  * Return: 0 when found, -ENOENT when absent, or another negative error.
  */
-static int smb2_find_posix_symlink(struct ksmbd_work *work, const char *name,
-				   struct path *path, u16 *unparsed_len)
+static int smb2_find_posix_symlink(struct ksmbd_work *work, char *name,
+				   u16 stream_suffix_len, struct path *path,
+				   u16 *unparsed_len)
 {
 	char *prefix, *slash, *next;
 	int ret = -ENOENT;
+
+	ret = ksmbd_vfs_lookup_reparse_prefix(work, name, LOOKUP_NO_SYMLINKS,
+					    path, true);
+	if (!ret)
+		path_put(path);
+	else if (ret == -ENOMEM)
+		return ret;
 
 	prefix = kstrdup(name, KSMBD_DEFAULT_GFP);
 	if (!prefix)
@@ -523,15 +579,26 @@ static int smb2_find_posix_symlink(struct ksmbd_work *work, const char *name,
 		if (slash)
 			*slash = '\0';
 		if (*prefix) {
-			ret = ksmbd_vfs_kern_path(work, prefix, LOOKUP_NO_SYMLINKS,
-						  path, 1);
+			ret = ksmbd_vfs_lookup_reparse_prefix(work, prefix,
+							    LOOKUP_NO_SYMLINKS, path, false);
 			if (ret)
 				break;
 			if (d_is_symlink(path->dentry)) {
 				const char *suffix = name +
 					(slash ? slash - prefix : strlen(name));
 
-				ret = smb2_reparse_unparsed_len(work, suffix,
+				path_put(path);
+				ret = ksmbd_vfs_kern_path(work, prefix, LOOKUP_NO_SYMLINKS,
+							  path, 0);
+				if (ret)
+					break;
+				if (!d_is_symlink(path->dentry)) {
+					path_put(path);
+					ret = -EAGAIN;
+					break;
+				}
+				ret = smb2_reparse_unparsed_len(work, name, suffix,
+								stream_suffix_len,
 								unparsed_len);
 				if (ret)
 					path_put(path);
@@ -622,7 +689,7 @@ static int smb2_set_path_symlink_err_rsp(struct ksmbd_work *work, char *name,
 	u16 unparsed_len;
 	int ret;
 
-	ret = smb2_find_posix_symlink(work, name, &path, &unparsed_len);
+	ret = smb2_find_posix_symlink(work, name, stream_suffix_len, &path, &unparsed_len);
 	if (ret)
 		return ret;
 	ret = smb2_set_posix_symlink_err_rsp(work, &path, unparsed_len,
@@ -669,7 +736,8 @@ static int smb2_set_stored_symlink_err_rsp(struct ksmbd_work *work, char *name,
 		prefix = kstrndup(name, reparse_name_len, KSMBD_DEFAULT_GFP);
 		if (!prefix)
 			return -ENOMEM;
-		ret = smb2_find_posix_symlink(work, prefix, &path, &alias_unparsed_len);
+		ret = smb2_find_posix_symlink(work, prefix, stream_suffix_len,
+					     &path, &alias_unparsed_len);
 		if (!ret) {
 			if (alias_unparsed_len > U16_MAX - unparsed_len) {
 				ret = -EINVAL;
@@ -5457,6 +5525,7 @@ resolve_path:
 
 		/* Directory reparse stubs are traversable by the backing VFS. */
 		rc = smb2_find_reparse_point(work, name, follow_symlinks,
+					     stream_suffix_len,
 					     &rp_tag, &rp_data, &rp_len,
 					     &unparsed_len, &reparse_name_len);
 		if (!rc) {
