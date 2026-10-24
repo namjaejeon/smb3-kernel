@@ -13,3 +13,15 @@ config SMB_SERVER_KUNIT_TESTS
 
 	  For more information on KUnit and unit tests in the kernel,
 	  please read Documentation/dev-tools/kunit/index.rst.
+
+config SMB_SERVER_REPARSE_KUNIT_TESTS
+	bool "KUnit tests for SMB3 reparse points" if !KUNIT_ALL_TESTS
+	depends on SMB_SERVER=y && SMB_KUNIT_TESTS=y && TMPFS_XATTR
+	default SMB_SERVER_KUNIT_TESTS
+	help
+	  Test reparse metadata storage on a private tmpfs mount and native
+	  symlink pathname lookups. Absolute link tests create temporary
+	  directories at the host root and remove them during cleanup.
+	  Build these tests into the kernel so they can exercise internal
+	  VFS helpers without exporting server symbols.
+	  They run at boot as part of the SMB KUnit test suite.
