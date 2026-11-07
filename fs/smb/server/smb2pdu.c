@@ -4325,6 +4325,10 @@ static int smb2_open_quota(struct ksmbd_work *work)
 
 	WORK_BUFFERS(work, req, rsp);
 
+	/* SMB2 servers must ignore synchronous I/O create options. */
+	req->CreateOptions &= ~(FILE_SYNCHRONOUS_IO_ALERT_LE |
+				FILE_SYNCHRONOUS_IO_NONALERT_LE);
+
 	if (user_guest(work->sess->user) ||
 	    test_tree_conn_flag(work->tcon, KSMBD_TREE_CONN_FLAG_GUEST_ACCOUNT)) {
 		rc = -EACCES;
