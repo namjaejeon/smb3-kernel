@@ -3644,6 +3644,11 @@ int ntfs_attr_record_move_away(struct ntfs_attr_search_ctx *ctx, int extra)
 	return err;
 }
 
+static struct inode *ntfs_attr_accounting_inode(struct ntfs_inode *ni)
+{
+	return VFS_I(ntfs_inode_is_named_stream(ni) ? ni : ntfs_base_inode(ni));
+}
+
 /*
  * If we are in the first extent, then set/clean sparse bit,
  * update allocated and compressed size.
@@ -3763,9 +3768,10 @@ static int ntfs_attr_update_meta(struct attr_record *a, struct ntfs_inode *ni,
 	}
 
 	if (NInoSparse(ni) || NInoCompressed(ni))
-		VFS_I(base_ni)->i_blocks = ni->itype.compressed.size >> 9;
+		ntfs_attr_accounting_inode(ni)->i_blocks =
+				ni->itype.compressed.size >> 9;
 	else
-		VFS_I(base_ni)->i_blocks = ni->allocated_size >> 9;
+		ntfs_attr_accounting_inode(ni)->i_blocks = ni->allocated_size >> 9;
 	/*
 	 * Set FILE_NAME dirty flag, to update sparse bit and
 	 * allocated size in the index.
@@ -4422,10 +4428,12 @@ static int ntfs_non_resident_attr_shrink(struct ntfs_inode *ni,
 			if (nr_freed_clusters) {
 				ni->itype.compressed.size -=
 					ntfs_cluster_to_bytes(vol, nr_freed_clusters);
-				VFS_I(base_ni)->i_blocks = ni->itype.compressed.size >> 9;
+				ntfs_attr_accounting_inode(ni)->i_blocks =
+						ni->itype.compressed.size >> 9;
 			}
 		} else
-			VFS_I(base_ni)->i_blocks = ni->allocated_size >> 9;
+			ntfs_attr_accounting_inode(ni)->i_blocks =
+					ni->allocated_size >> 9;
 
 		/* Write mapping pairs for new runlist. */
 		err = ntfs_attr_update_mapping_pairs_locked(ni, 0, ni);
@@ -4822,9 +4830,11 @@ rollback_locked:
 
 		if (NInoSparse(ni) || NInoCompressed(ni)) {
 			ni->itype.compressed.size =  org_compressed_size;
-			VFS_I(base_ni)->i_blocks = ni->itype.compressed.size >> 9;
+			ntfs_attr_accounting_inode(ni)->i_blocks =
+					ni->itype.compressed.size >> 9;
 		} else
-			VFS_I(base_ni)->i_blocks = ni->allocated_size >> 9;
+			ntfs_attr_accounting_inode(ni)->i_blocks =
+					ni->allocated_size >> 9;
 	}
 	if (!runlist_locked)
 		up_write(&ni->runlist.lock);
