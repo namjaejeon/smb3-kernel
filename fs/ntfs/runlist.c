@@ -1266,7 +1266,7 @@ int ntfs_get_size_for_mapping_pairs(const struct ntfs_volume *vol,
 		if (unlikely(length < 0 || rl->lcn < LCN_HOLE))
 			goto err_out;
 		/*
-		 * If @stop_vcn is given and finishes inside this run, cap the
+		 * If @last_vcn is given and finishes inside this run, cap the
 		 * run length.
 		 */
 		if (unlikely(last_vcn >= 0 && rl[1].vcn > last_vcn)) {
@@ -1303,7 +1303,7 @@ int ntfs_get_size_for_mapping_pairs(const struct ntfs_volume *vol,
 		if (unlikely(length < 0 || rl->lcn < LCN_HOLE))
 			goto err_out;
 		/*
-		 * If @stop_vcn is given and finishes inside this run, cap the
+		 * If @last_vcn is given and finishes inside this run, cap the
 		 * run length.
 		 */
 		if (unlikely(last_vcn >= 0 && rl[1].vcn > last_vcn)) {
@@ -1401,8 +1401,8 @@ err_out:
  * @first_vcn: first vcn which to include in the mapping pairs array
  * @last_vcn: last vcn which to include in the mapping pairs array
  * @stop_vcn: on return, set to the first vcn outside the destination buffer
- * @stop_rl: on return, set to the runlist element where encoding stopped
- * @de_cluster_count: on return, set to the number of clusters encoded
+ * @stop_rl: on return, set to the run containing @stop_vcn, or the terminator
+ * @de_cluster_count: on return, set to the delayed-allocation clusters encoded
  *
  * Create the mapping pairs array from the locked runlist @rl, starting at vcn
  * @first_vcn and finishing with vcn @last_vcn and save the array in @dst.
@@ -1421,6 +1421,8 @@ err_out:
  * as partial success, in that a new attribute extent needs to be created or
  * the next extent has to be used and the mapping pairs build has to be
  * continued with @first_vcn set to *@stop_vcn.
+ * A bounded successful build stops at @last_vcn + 1 even when that VCN lies
+ * inside a run.  A buffer that cannot fit the first run stops at @first_vcn.
  *
  * Return 0 on success and -errno on error.  The following error codes are
  * defined:
@@ -1438,6 +1440,7 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 		struct runlist_element **stop_rl, unsigned int *de_cluster_count)
 {
 	s64 prev_lcn;
+	s64 next_vcn = first_vcn;
 	s8 *dst_max, *dst_next;
 	int err = -ENOSPC;
 	bool the_end = false;
@@ -1453,6 +1456,10 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 		WARN_ON(first_vcn || last_vcn > 0);
 		if (stop_vcn)
 			*stop_vcn = 0;
+		if (stop_rl)
+			*stop_rl = NULL;
+		if (de_cluster_count)
+			*de_cluster_count = 0;
 		/* Terminator byte. */
 		*dst = 0;
 		return 0;
@@ -1477,7 +1484,7 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 		if (unlikely(length < 0 || rl->lcn < LCN_HOLE))
 			goto err_out;
 		/*
-		 * If @stop_vcn is given and finishes inside this run, cap the
+		 * If @last_vcn is given and finishes inside this run, cap the
 		 * run length.
 		 */
 		if (unlikely(last_vcn >= 0 && rl[1].vcn > last_vcn)) {
@@ -1517,6 +1524,9 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 		*dst = lcn_len << 4 | len_len;
 		/* Position at next mapping pairs array element. */
 		dst = dst_next;
+		next_vcn = rl->vcn + length;
+		if (rl->lcn == LCN_DELALLOC && vol->major_ver >= 3)
+			de_cnt += length - delta;
 		/* Go to next runlist element. */
 		rl++;
 	}
@@ -1527,7 +1537,7 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 		if (unlikely(length < 0 || rl->lcn < LCN_HOLE))
 			goto err_out;
 		/*
-		 * If @stop_vcn is given and finishes inside this run, cap the
+		 * If @last_vcn is given and finishes inside this run, cap the
 		 * run length.
 		 */
 		if (unlikely(last_vcn >= 0 && rl[1].vcn > last_vcn)) {
@@ -1556,8 +1566,6 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 				goto size_err;
 			prev_lcn = rl->lcn;
 		} else {
-			if (rl->lcn == LCN_DELALLOC)
-				de_cnt += rl->length;
 			lcn_len = 0;
 		}
 		dst_next = dst + len_len + lcn_len + 1;
@@ -1567,15 +1575,20 @@ int ntfs_mapping_pairs_build(const struct ntfs_volume *vol, s8 *dst,
 		*dst = lcn_len << 4 | len_len;
 		/* Position at next mapping pairs array element. */
 		dst = dst_next;
+		next_vcn = rl->vcn + length;
+		if (rl->lcn == LCN_DELALLOC && vol->major_ver >= 3)
+			de_cnt += length;
 	}
 	/* Success. */
-	if (de_cluster_count)
-		*de_cluster_count = de_cnt;
 	err = 0;
 size_err:
-	/* Set stop vcn. */
+	if (de_cluster_count)
+		*de_cluster_count = de_cnt;
 	if (stop_vcn)
-		*stop_vcn = rl->vcn;
+		*stop_vcn = next_vcn;
+	/* The loop advanced past the run containing a capped final VCN. */
+	if (!err && the_end && next_vcn < rl->vcn)
+		rl--;
 	if (stop_rl)
 		*stop_rl = (struct runlist_element *)rl;
 	/* Add terminator byte. */
