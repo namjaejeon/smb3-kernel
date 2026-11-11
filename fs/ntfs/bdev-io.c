@@ -71,6 +71,69 @@ int ntfs_bdev_read(struct block_device *bdev, char *data, loff_t start, size_t s
 	return error;
 }
 
+static int ntfs_bdev_check_range(loff_t start, size_t size, loff_t *end)
+{
+	if (start < 0 || size > S64_MAX - start)
+		return -EINVAL;
+	*end = start + size;
+	if (size && (u64)(*end - 1) >> PAGE_SHIFT > ULONG_MAX)
+		return -EFBIG;
+	return 0;
+}
+
+/*
+ * Read through the block-device page cache so that replay observes earlier
+ * writes that have not yet reached the device.
+ */
+int ntfs_bdev_read_cached(struct super_block *sb, void *buf, loff_t start,
+		size_t size)
+{
+	struct address_space *mapping = sb->s_bdev->bd_mapping;
+	u8 *dst = buf;
+	pgoff_t idx, last;
+	loff_t offset, end;
+	size_t buf_off = 0;
+	u32 from, to;
+	struct folio *folio;
+	int err;
+
+	err = ntfs_bdev_check_range(start, size, &end);
+	if (err || !size)
+		return err;
+	idx = start >> PAGE_SHIFT;
+	last = (end - 1) >> PAGE_SHIFT;
+	from = start & ~PAGE_MASK;
+
+	for (;; idx++, from = 0) {
+		u32 len;
+
+		offset = (loff_t)idx << PAGE_SHIFT;
+		to = min_t(loff_t, end - offset, PAGE_SIZE);
+		len = to - from;
+retry:
+		folio = read_mapping_folio(mapping, idx, NULL);
+		if (IS_ERR(folio)) {
+			ntfs_error(sb, "Unable to read %lu page", idx);
+			return PTR_ERR(folio);
+		}
+		folio_lock(folio);
+		if (unlikely(folio->mapping != mapping ||
+			     !folio_test_uptodate(folio))) {
+			folio_unlock(folio);
+			folio_put(folio);
+			goto retry;
+		}
+		memcpy_from_folio(dst + buf_off, folio,
+				offset - folio_pos(folio) + from, len);
+		buf_off += len;
+		folio_unlock(folio);
+		folio_put(folio);
+		if (idx == last)
+			break;
+	}
+	return 0;
+}
+
 /*
  * ntfs_bdev_write - Update block device contents via page cache
  * @sb:		super block of the mounted NTFS filesystem
@@ -92,14 +155,11 @@ int ntfs_bdev_write(struct super_block *sb, void *buf, loff_t start, size_t size
 	size_t buf_off = 0;
 	u32 from, to;
 	struct folio *folio;
+	int err;
 
-	if (start < 0 || size > S64_MAX - start)
-		return -EINVAL;
-	if (!size)
-		return 0;
-	end = start + size;
-	if ((u64)(end - 1) >> PAGE_SHIFT > ULONG_MAX)
-		return -EFBIG;
+	err = ntfs_bdev_check_range(start, size, &end);
+	if (err || !size)
+		return err;
 	idx = start >> PAGE_SHIFT;
 	last = (end - 1) >> PAGE_SHIFT;
 	from = start & ~PAGE_MASK;

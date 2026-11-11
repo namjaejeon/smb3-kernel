@@ -300,6 +300,7 @@ struct folio *ntfs_read_metadata_folio(struct address_space *mapping,
 
 /* From fs/ntfs/bdev-io.c */
 int ntfs_bdev_read(struct block_device *bdev, char *data, loff_t start, size_t size);
+int ntfs_bdev_read_cached(struct super_block *sb, void *buf, loff_t start, size_t size);
 int ntfs_bdev_write(struct super_block *sb, void *buf, loff_t start, size_t size);
 
 #endif /* _LINUX_NTFS_H */
