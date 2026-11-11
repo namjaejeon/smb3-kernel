@@ -285,6 +285,38 @@ int ntfs_log_build_operation_payload(
 	return 0;
 }
 
+int ntfs_log_build_checkpoint_dump_payload(u16 operation,
+		const struct ntfs_log_payload *dump,
+		struct ntfs_log_payload *payload)
+{
+	struct ntfs_log_rec_hdr *lrh;
+	u32 header_len = struct_size(lrh, page_lcns, 1);
+	u32 payload_len;
+	void *data;
+
+	if (!dump || !dump->data || !dump->len || !payload)
+		return -EINVAL;
+	if (check_add_overflow(header_len, dump->len, &payload_len) ||
+	    check_add_overflow(payload_len, 7U, &payload_len))
+		return -EOVERFLOW;
+	/* Include padding in the carrier length, not the checkpoint dump size. */
+	payload_len &= ~7U;
+	data = kvzalloc(payload_len, GFP_NOFS);
+	if (!data)
+		return -ENOMEM;
+
+	lrh = data;
+	lrh->redo_op = cpu_to_le16(operation);
+	lrh->undo_op = cpu_to_le16(Noop);
+	lrh->redo_off = cpu_to_le16(header_len);
+	lrh->redo_len = cpu_to_le16(min_t(u32, dump->len, U16_MAX));
+	lrh->undo_off = cpu_to_le16(header_len);
+	memcpy((u8 *)data + header_len, dump->data, dump->len);
+	payload->data = data;
+	payload->len = payload_len;
+	return 0;
+}
+
 void ntfs_log_free_payload(struct ntfs_log_payload *payload)
 {
 	if (!payload)

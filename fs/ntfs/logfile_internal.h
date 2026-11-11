@@ -171,6 +171,16 @@ struct ntfs_logfile_layout {
 	u16 client_idx;
 };
 
+int ntfs_log_read_client_record(struct inode *log_vi,
+		const struct ntfs_logfile_layout *layout, u64 lsn,
+		struct ntfs_lfs_record_hdr *hdr, void **payload, u32 *payload_len);
+int ntfs_log_next_lsn(struct inode *log_vi,
+		const struct ntfs_logfile_layout *layout, u64 lsn,
+		const struct ntfs_lfs_record_hdr *hdr, u64 *next_lsn);
+int ntfs_log_checkpoint_dump_data(const struct ntfs_lfs_record_hdr *hdr,
+		const void *payload, u32 payload_len, u16 expected_op,
+		u32 expected_len, const void **data, u32 *data_len);
+
 static_assert(sizeof(struct ntfs_lfs_record_hdr) == 0x30);
 static_assert(sizeof(struct ntfs_log_rec_hdr) == 0x20);
 static_assert(sizeof(struct ntfs_record_page_hdr) == 0x28);
@@ -277,6 +287,9 @@ int ntfs_log_build_record_pages(const struct ntfs_logfile_layout *layout,
 void ntfs_log_free_record_pages(struct ntfs_log_record_pages *pages);
 int ntfs_log_build_operation_payload(
 		const struct ntfs_log_operation_desc *desc,
+		struct ntfs_log_payload *payload);
+int ntfs_log_build_checkpoint_dump_payload(u16 operation,
+		const struct ntfs_log_payload *dump,
 		struct ntfs_log_payload *payload);
 void ntfs_log_free_payload(struct ntfs_log_payload *payload);
 int ntfs_log_build_restart_page_v1(const struct ntfs_logfile_layout *layout,
