@@ -5529,6 +5529,8 @@ int ntfs_attr_rm(struct ntfs_inode *ni)
 		if (ret < 0)
 			ntfs_error(sb,
 				"Failed to free cluster allocation. Leaving inconstant metadata.\n");
+		else
+			ret = 0;
 		ntfs_attr_put_search_ctx(ctx);
 	}
 
