@@ -3722,21 +3722,72 @@ put_err_out:
 	return err;
 }
 
+static s64 ntfs_mapping_pread(struct address_space *mapping, s64 pos,
+		s64 count, u8 *buf, bool metadata)
+{
+	struct folio *folio;
+	s64 total = 0;
+	size_t len, offset;
+
+	while (count) {
+		if (metadata)
+			folio = ntfs_read_metadata_folio(mapping,
+						 pos >> PAGE_SHIFT);
+		else
+			folio = read_mapping_folio(mapping, pos >> PAGE_SHIFT,
+						   NULL);
+		if (IS_ERR(folio))
+			return PTR_ERR(folio);
+
+		offset = offset_in_folio(folio, pos);
+		len = min_t(size_t, count, folio_size(folio) - offset);
+
+		folio_lock(folio);
+		memcpy_from_folio(buf, folio, offset, len);
+		folio_unlock(folio);
+		folio_put(folio);
+
+		total += len;
+		buf += len;
+		pos += len;
+		count -= len;
+	}
+
+	return total;
+}
+
+/*
+ * Read from an inode's page-cache mapping, clamping the read to EOF.
+ * The caller is responsible for serializing size and mapping changes.
+ */
+s64 ntfs_inode_mapping_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
+{
+	s64 isize;
+
+	if (pos < 0 || count < 0)
+		return -EINVAL;
+	isize = i_size_read(vi);
+	if (pos > isize)
+		return -EINVAL;
+	if (count > isize - pos)
+		count = isize - pos;
+
+	return ntfs_mapping_pread(vi->i_mapping, pos, count, buf, true);
+}
+
 s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 {
-	struct address_space *mapping = vi->i_mapping;
-	struct folio *folio;
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_inode *base_ni = ni->ext.base_ntfs_ino;
 	struct ntfs_inode *mrec_ni = ntfs_inode_is_named_stream(ni) ?
 			base_ni : ni;
-	s64 isize;
-	u32 attr_len, total = 0, offset;
-	pgoff_t index;
+	s64 isize, ret;
 	int err = 0;
 	bool claimed = false;
 
 	WARN_ON(!NInoAttr(ni));
+	if (count < 0)
+		return -EINVAL;
 	if (!count)
 		return 0;
 
@@ -3790,39 +3841,15 @@ s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf)
 	}
 	mutex_unlock(&mrec_ni->mrec_lock);
 
-	index = pos >> PAGE_SHIFT;
-	do {
-		/*
-		 * Update @index and get the next folio.  The contents of a named
-		 * stream are user data, so a fatal signal may still stop that read.
-		 */
-		if (ntfs_inode_is_named_stream(ni))
-			folio = read_mapping_folio(mapping, index, NULL);
-		else
-			folio = ntfs_read_metadata_folio(mapping, index);
-		if (IS_ERR(folio)) {
-			err = PTR_ERR(folio);
-			break;
-		}
-
-		offset = offset_in_folio(folio, pos);
-		attr_len = min_t(size_t, (size_t)count, folio_size(folio) - offset);
-
-		folio_lock(folio);
-		memcpy_from_folio(buf, folio, offset, attr_len);
-		folio_unlock(folio);
-		folio_put(folio);
-
-		total += attr_len;
-		buf += attr_len;
-		pos += attr_len;
-		count -= attr_len;
-		index++;
-	} while (count);
+	ret = ntfs_mapping_pread(vi->i_mapping, pos, count, buf,
+				 !ntfs_inode_is_named_stream(ni));
+	if (claimed)
+		ntfs_stream_put(vi);
+	return ret;
 out:
 	if (claimed)
 		ntfs_stream_put(vi);
-	return err ? (s64)err : total;
+	return err;
 }
 
 static inline int ntfs_enlarge_attribute(struct inode *vi, s64 pos, s64 count,

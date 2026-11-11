@@ -366,6 +366,7 @@ int ntfs_inode_add_attrlist(struct ntfs_inode *ni);
 int ntfs_inode_free_empty_extents(struct ntfs_inode *ni);
 void ntfs_destroy_ext_inode(struct ntfs_inode *ni);
 int ntfs_inode_free_space(struct ntfs_inode *ni, int size);
+s64 ntfs_inode_mapping_pread(struct inode *vi, s64 pos, s64 count, u8 *buf);
 s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf);
 s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf,
 		bool sync);
