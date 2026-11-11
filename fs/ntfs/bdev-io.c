@@ -80,41 +80,74 @@ int ntfs_bdev_read(struct block_device *bdev, char *data, loff_t start, size_t s
  *
  * Writes @size bytes from @buf to the block device (sb->s_bdev) starting
  * at byte offset @start. The write is performed entirely through the page
- * cache of the block device's address space.
+ * cache of the block device's address space. Full-page overwrites do not
+ * need to read the old contents. Partial writes keep the remaining bytes.
  */
 int ntfs_bdev_write(struct super_block *sb, void *buf, loff_t start, size_t size)
 {
-	pgoff_t idx, idx_end;
-	loff_t offset, end = start + size;
-	u32 from, to, buf_off = 0;
+	struct address_space *mapping = sb->s_bdev->bd_mapping;
+	const u8 *src = buf;
+	pgoff_t idx, last;
+	loff_t offset, end;
+	size_t buf_off = 0;
+	u32 from, to;
 	struct folio *folio;
 
+	if (start < 0 || size > S64_MAX - start)
+		return -EINVAL;
+	if (!size)
+		return 0;
+	end = start + size;
+	if ((u64)(end - 1) >> PAGE_SHIFT > ULONG_MAX)
+		return -EFBIG;
 	idx = start >> PAGE_SHIFT;
-	idx_end = end >> PAGE_SHIFT;
+	last = (end - 1) >> PAGE_SHIFT;
 	from = start & ~PAGE_MASK;
 
-	if (idx == idx_end)
-		idx_end++;
-
-	for (; idx < idx_end; idx++, from = 0) {
+	for (;; idx++, from = 0) {
 		u32 len;
 
-		folio = ntfs_read_metadata_folio(sb->s_bdev->bd_mapping, idx);
-		if (IS_ERR(folio)) {
-			ntfs_error(sb, "Unable to read %ld page", idx);
-			return PTR_ERR(folio);
-		}
-
 		offset = (loff_t)idx << PAGE_SHIFT;
-		to = min_t(u32, end - offset, PAGE_SIZE);
+		to = min_t(loff_t, end - offset, PAGE_SIZE);
 		len = to - from;
 
-		memcpy_to_folio(folio, from, buf + buf_off, len);
+retry:
+		if (len == PAGE_SIZE) {
+			folio = filemap_grab_folio(mapping, idx);
+			if (IS_ERR(folio))
+				goto error;
+			/* Never mark unwritten parts of a large folio uptodate. */
+			if (folio_size(folio) == PAGE_SIZE ||
+			    folio_test_uptodate(folio))
+				goto copy;
+			folio_unlock(folio);
+			folio_put(folio);
+		}
+		folio = ntfs_read_metadata_folio(mapping, idx);
+		if (IS_ERR(folio))
+			goto error;
+		folio_lock(folio);
+		if (unlikely(folio->mapping != mapping ||
+			     !folio_test_uptodate(folio))) {
+			folio_unlock(folio);
+			folio_put(folio);
+			goto retry;
+		}
+copy:
+		folio_wait_writeback(folio);
+		memcpy_to_folio(folio, offset - folio_pos(folio) + from,
+				src + buf_off, len);
 		buf_off += len;
 		folio_mark_uptodate(folio);
 		folio_mark_dirty(folio);
+		folio_unlock(folio);
 		folio_put(folio);
+		if (idx == last)
+			break;
 	}
 
 	return 0;
+error:
+	ntfs_error(sb, "Unable to get %lu page", idx);
+	return PTR_ERR(folio);
 }
