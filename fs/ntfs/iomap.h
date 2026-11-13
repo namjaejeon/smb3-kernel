@@ -12,6 +12,7 @@
 #include "volume.h"
 #include "inode.h"
 
+bool ntfs_iomap_can_share_delalloc(struct ntfs_inode *ni);
 DECLARE_IOMAP_ITER_NEXT(ntfs_write_iomap_next);
 DECLARE_IOMAP_ITER_NEXT(ntfs_read_iomap_next);
 DECLARE_IOMAP_ITER_NEXT(ntfs_seek_iomap_next);

@@ -31,6 +31,7 @@
 #include "iomap.h"
 #include "bitmap.h"
 #include "volume.h"
+#include "logfile.h"
 #include "mft.h"
 #include "stream.h"
 
@@ -143,6 +144,23 @@ int ntfs_file_release(struct inode *vi, struct file *filp)
 		return ntfs_trim_prealloc(vi);
 
 	return 0;
+}
+
+int ntfs_fsync_write_and_wait_range(struct file *filp, loff_t start,
+		loff_t end)
+{
+	struct ntfs_volume *vol = NTFS_I(filp->f_mapping->host)->vol;
+	int err;
+
+	err = file_write_and_wait_range(filp, start, end);
+	if (err != -EAGAIN || !vol->journal)
+		return err;
+
+	err = ntfs_log_reclaim(vol);
+	if (err)
+		return err;
+
+	return file_write_and_wait_range(filp, start, end);
 }
 
 /*
@@ -910,7 +928,7 @@ ssize_t ntfs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	if (NInoNonResident(ni) && !NInoCompressed(ni) &&
 	    end > old_init_size) {
-		ret = ntfs_extend_initialized_size(vi, pos, end);
+		ret = ntfs_extend_initialized_size(vi, pos, end, true);
 		if (ret < 0)
 			goto out;
 	}
@@ -1049,7 +1067,7 @@ int ntfs_file_mmap_prepare(struct vm_area_desc *desc)
 			   from + desc->end - desc->start);
 
 		if (NTFS_I(inode)->initialized_size < to) {
-			err = ntfs_extend_initialized_size(inode, to, to);
+			err = ntfs_extend_initialized_size(inode, to, to, true);
 			if (err)
 				return err;
 		}

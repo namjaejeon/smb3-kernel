@@ -371,6 +371,15 @@ static int ntfs_zero_range(struct inode *inode, loff_t offset, loff_t length)
 				NULL);
 }
 
+bool ntfs_iomap_can_share_delalloc(struct ntfs_inode *ni)
+{
+	return ni->vol->journal && !NInoAttr(ni) &&
+		ni->type == AT_DATA && ni->name == AT_UNNAMED &&
+		ni->mft_no >= FILE_first_user &&
+		!NInoCompressed(ni) && !NInoEncrypted(ni) &&
+		ni->vol->cluster_size <= PAGE_SIZE;
+}
+
 static int ntfs_write_simple_iomap_begin_non_resident(struct inode *inode, loff_t offset,
 						      loff_t length, struct iomap *iomap)
 {

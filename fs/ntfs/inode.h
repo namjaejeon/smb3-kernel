@@ -10,6 +10,11 @@
 #ifndef _LINUX_NTFS_INODE_H
 #define _LINUX_NTFS_INODE_H
 
+#include <linux/spinlock.h>
+#include <linux/wait.h>
+
+#define NTFS_MNT_IDMAP_CONST const
+
 #include "debug.h"
 
 enum ntfs_inode_mutex_lock_class {
@@ -51,9 +56,10 @@ enum ntfs_inode_mutex_lock_class {
  *   is resident (file and fake inode) or there is no $I30 index allocation
  *   attribute (small directory). In the latter case runlist.rl is always
  *   NULL.
- * @data_size: Copy from the attribute record.
- * @initialized_size: Copy from the attribute record.
+ * @data_size: Logical size, possibly ahead of the attribute record.
+ * @initialized_size: Initialized size, possibly ahead of the attribute record.
  * @allocated_size: Copy from the attribute record.
+ * @zeroed_size: End of initialized or prezeroed data, possibly beyond EOF.
  * @i_crtime: File Creation time.
  * @mrec: MFT record
  * @mrec_lock: Lock for serializing access to the mft record belonging to
@@ -116,6 +122,12 @@ struct ntfs_inode {
 	s64 initialized_size;
 	s64 allocated_size;
 	s64 zeroed_size;
+	spinlock_t ordered_lock;
+	wait_queue_head_t ordered_wait;
+	struct ntfs_ordered_io *ordered_io;
+	struct task_struct *ordered_owner;
+	unsigned int ordered_writeback_users;
+	bool ordered_active;
 	struct timespec64 i_crtime;
 	void *mrec;
 	struct mutex mrec_lock;
@@ -185,6 +197,10 @@ struct ntfs_inode {
  * NI_HasEA			ntfs inode has EA attribute.
  * NI_RunlistDirty		runlist need to be updated.
  * NI_StreamUnlinked		Named stream is unlinked but still open.
+ * NI_EverMapped		File has had a userspace mapping.
+ * NI_GapAppend			Buffered gap append is publishing its size.
+ * NI_PendingEmptyEof		Empty file's delayed data has no persisted EOF yet.
+ * NI_EmptyBufferedWrite	A buffered write is growing an empty file.
  */
 enum {
 	NI_Dirty,
@@ -207,6 +223,10 @@ enum {
 	NI_HasEA,
 	NI_RunlistDirty,
 	NI_StreamUnlinked,
+	NI_EverMapped,
+	NI_GapAppend,
+	NI_PendingEmptyEof,
+	NI_EmptyBufferedWrite,
 };
 
 /*
@@ -268,6 +288,20 @@ NINO_FNS(BeingDeleted)
 NINO_FNS(HasEA)
 NINO_FNS(RunlistDirty)
 NINO_FNS(StreamUnlinked)
+NINO_FNS(EverMapped)
+NINO_FNS(GapAppend)
+NINO_FNS(PendingEmptyEof)
+NINO_FNS(EmptyBufferedWrite)
+
+static inline s64 ntfs_inode_recorded_data_size(struct ntfs_inode *ni)
+{
+	return NInoPendingEmptyEof(ni) ? 0 : ni->data_size;
+}
+
+static inline s64 ntfs_inode_recorded_initialized_size(struct ntfs_inode *ni)
+{
+	return NInoPendingEmptyEof(ni) ? 0 : ni->initialized_size;
+}
 
 /*
  * The full structure containing a ntfs_inode and a vfs struct inode. Used for
@@ -336,10 +370,21 @@ struct inode *ntfs_attr_iget(struct inode *base_vi, __le32 type,
 struct inode *ntfs_index_iget(struct inode *base_vi, __le16 *name,
 		u32 name_len);
 struct inode *ntfs_alloc_big_inode(struct super_block *sb);
+void ntfs_destroy_big_inode(struct inode *inode);
 void ntfs_free_big_inode(struct inode *inode);
 int ntfs_drop_big_inode(struct inode *inode);
 void ntfs_evict_big_inode(struct inode *vi);
+bool ntfs_deleted_attribute_reclaimable(__le32 type, u8 name_len);
+int ntfs_reclaim_deleted_attribute(struct inode *vi);
+int ntfs_reclaim_deleted_attributes(struct ntfs_inode *ni, bool recovery);
+int ntfs_recover_unlinked_inodes(struct ntfs_volume *vol);
 void __ntfs_init_inode(struct super_block *sb, struct ntfs_inode *ni);
+
+bool ntfs_ordered_append_enter(struct ntfs_inode *ni);
+void ntfs_ordered_append_exit(struct ntfs_inode *ni);
+bool ntfs_ordered_writeback_enter(struct ntfs_inode *ni,
+		struct ntfs_ordered_io **ordered);
+void ntfs_ordered_writeback_exit(struct ntfs_inode *ni);
 
 static inline void ntfs_init_big_inode(struct inode *vi)
 {
@@ -355,6 +400,8 @@ void ntfs_clear_extent_inode(struct ntfs_inode *ni);
 int ntfs_read_inode_mount(struct inode *vi);
 int ntfs_show_options(struct seq_file *sf, struct dentry *root);
 int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size);
+int ntfs_extend_vfs(struct inode *vi, loff_t new_size);
+int ntfs_extend_delalloc_vfs(struct inode *vi, loff_t new_size);
 
 int ntfs_setattr(const struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct iattr *attr);
@@ -373,16 +420,25 @@ s64 ntfs_inode_mapping_pread(struct inode *vi, s64 pos, s64 count, u8 *buf);
 s64 ntfs_inode_attr_pread(struct inode *vi, s64 pos, s64 count, u8 *buf);
 s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf,
 		bool sync);
+s64 ntfs_inode_attr_pwrite_existing(struct inode *vi, s64 pos, s64 count,
+		u8 *buf, bool sync);
 int ntfs_inode_close(struct ntfs_inode *ni);
 
-static inline void ntfs_commit_inode(struct inode *vi)
+static inline int ntfs_commit_inode(struct inode *vi)
 {
-	__ntfs_write_inode(vi, 1);
+	return __ntfs_write_inode(vi, 1);
 }
 
 int ntfs_inode_sync_filename(struct ntfs_inode *ni);
+int ntfs_write_and_wait_range(struct inode *vi, loff_t start, loff_t end);
 int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
-		const loff_t new_size);
+		const loff_t new_size, bool sync_before_write);
+int ntfs_extend_initialized_size_locked(struct inode *vi, const loff_t offset,
+		const loff_t new_size, bool sync_before_write);
+int ntfs_set_initialized_size_journaled(struct ntfs_inode *ni,
+		loff_t new_size);
+int ntfs_set_initialized_size_fault(struct ntfs_inode *ni,
+		loff_t new_size, bool ordered_data);
 void ntfs_set_vfs_operations(struct inode *inode, mode_t mode, dev_t dev);
 struct folio *ntfs_get_locked_folio(struct address_space *mapping,
 		pgoff_t index, pgoff_t end_index, struct file_ra_state *ra);

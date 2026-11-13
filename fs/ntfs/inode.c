@@ -22,6 +22,13 @@
 #include "object_id.h"
 #include "stream.h"
 
+/* Existing-attribute writes are enabled with inode transaction integration. */
+s64 ntfs_inode_attr_pwrite_existing(struct inode *vi, s64 pos, s64 count,
+		u8 *buf, bool sync)
+{
+	return -EOPNOTSUPP;
+}
+
 /*
  * ntfs_test_inode - compare two (possibly fake) inodes for equality
  * @vi:		vfs inode which to test
@@ -2641,7 +2648,7 @@ out:
 }
 
 int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
-				 const loff_t new_size)
+				 const loff_t new_size, bool sync_before_write)
 {
 	int err;
 
