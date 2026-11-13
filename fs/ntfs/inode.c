@@ -793,6 +793,13 @@ static int ntfs_read_locked_inode(struct inode *vi)
 	if (vi->i_ino != FILE_MFT)
 		ntfs_init_big_inode(vi);
 
+	/* Replay may instantiate an inode before its EA updates are complete. */
+	if (NVolReplaying(vol)) {
+		spin_lock(&vi->i_lock);
+		inode_state_set(vi, I_DONTCACHE);
+		spin_unlock(&vi->i_lock);
+	}
+
 	m = map_mft_record(ni);
 	if (IS_ERR(m)) {
 		err = PTR_ERR(m);
@@ -954,9 +961,11 @@ skip_attr_list_load:
 	if (!err) {
 		NInoSetHasEA(ni);
 		ntfs_ea_get_wsl_inode(vi, &dev, flags, &has_lxmod);
-		err = ntfs_ea_get_linuxflags(vi);
-		if (err)
-			goto unm_err_out;
+		if (!NVolReplaying(vol)) {
+			err = ntfs_ea_get_linuxflags(vi);
+			if (err)
+				goto unm_err_out;
+		}
 	} else if (err != -ENOENT) {
 		goto unm_err_out;
 	}
