@@ -9,10 +9,13 @@
 #include <linux/exportfs.h>
 #include <linux/iversion.h>
 #include <linux/namei.h>
+#include <linux/posix_acl.h>
 
 #include "ntfs.h"
+#include "attrlist.h"
 #include "time.h"
 #include "index.h"
+#include "logfile.h"
 #include "reparse.h"
 #include "object_id.h"
 #include "ea.h"
@@ -41,6 +44,238 @@ static const __le16 nul_name_le[3] = {
 static const __le16 prn_name_le[3] = {
 	cpu_to_le16('P'), cpu_to_le16('R'), cpu_to_le16('N')
 };
+
+struct ntfs_index_size_snapshot {
+	s64 data_size;
+	s64 initialized_size;
+	s64 allocated_size;
+	s64 zeroed_size;
+	loff_t i_size;
+};
+
+struct ntfs_mft_snapshot {
+	struct ntfs_inode *ni;
+	struct mft_record *mrec;
+	struct mft_record *before;
+	struct ntfs_index_size_snapshot index_size;
+	unsigned int nlink;
+	bool restore_index_size;
+};
+
+static void ntfs_index_size_snapshot(struct ntfs_inode *ni,
+		struct ntfs_index_size_snapshot *snapshot)
+{
+	snapshot->data_size = ni->data_size;
+	snapshot->initialized_size = ni->initialized_size;
+	snapshot->allocated_size = ni->allocated_size;
+	snapshot->zeroed_size = ni->zeroed_size;
+	snapshot->i_size = i_size_read(VFS_I(ni));
+}
+
+static void ntfs_index_size_restore(struct ntfs_inode *ni,
+		const struct ntfs_index_size_snapshot *snapshot)
+{
+	ni->data_size = snapshot->data_size;
+	ni->initialized_size = snapshot->initialized_size;
+	ni->allocated_size = snapshot->allocated_size;
+	ni->zeroed_size = snapshot->zeroed_size;
+	i_size_write(VFS_I(ni), snapshot->i_size);
+}
+
+static int ntfs_mft_snapshot_take(struct ntfs_mft_snapshot *snapshots,
+		unsigned int *count, unsigned int capacity, struct ntfs_inode *ni,
+		bool restore_index_size)
+{
+	struct ntfs_mft_snapshot *snapshot;
+	unsigned int i;
+
+	for (i = 0; i < *count; i++) {
+		if (snapshots[i].ni != ni)
+			continue;
+		if (restore_index_size && !snapshots[i].restore_index_size) {
+			ntfs_index_size_snapshot(ni, &snapshots[i].index_size);
+			snapshots[i].restore_index_size = true;
+		}
+		return 0;
+	}
+	if (*count >= capacity)
+		return -E2BIG;
+
+	snapshot = &snapshots[*count];
+	snapshot->mrec = map_mft_record(ni);
+	if (IS_ERR(snapshot->mrec)) {
+		int err = PTR_ERR(snapshot->mrec);
+
+		snapshot->mrec = NULL;
+		return err;
+	}
+	snapshot->before = kmemdup(snapshot->mrec, ni->vol->mft_record_size,
+			GFP_NOFS);
+	if (!snapshot->before) {
+		unmap_mft_record(ni);
+		snapshot->mrec = NULL;
+		return -ENOMEM;
+	}
+	snapshot->ni = ni;
+	snapshot->nlink = VFS_I(ni)->i_nlink;
+	snapshot->restore_index_size = restore_index_size;
+	if (restore_index_size)
+		ntfs_index_size_snapshot(ni, &snapshot->index_size);
+	(*count)++;
+	return 0;
+}
+
+static void ntfs_mft_snapshots_restore(struct ntfs_mft_snapshot *snapshots,
+		unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		struct ntfs_mft_snapshot *snapshot = &snapshots[i];
+
+		memcpy(snapshot->mrec, snapshot->before,
+				snapshot->ni->vol->mft_record_size);
+		set_nlink(VFS_I(snapshot->ni), snapshot->nlink);
+		if (snapshot->restore_index_size)
+			ntfs_index_size_restore(snapshot->ni,
+					&snapshot->index_size);
+		mark_mft_record_dirty(snapshot->ni);
+	}
+}
+
+static void ntfs_mft_snapshots_release(struct ntfs_mft_snapshot *snapshots,
+		unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		kfree(snapshots[i].before);
+		unmap_mft_record(snapshots[i].ni);
+	}
+}
+
+static int ntfs_mft_set_link_count(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, struct mft_record *mrec, u16 count)
+{
+	struct mft_record *after;
+	u64 lsn = 0;
+	int err;
+
+	if (handle && mrec->link_count == cpu_to_le16(count))
+		return 0;
+	if (handle) {
+		after = kmemdup(mrec, ni->vol->mft_record_size, GFP_NOFS);
+		if (!after)
+			return -ENOMEM;
+		after->link_count = cpu_to_le16(count);
+		err = ntfs_attr_mft_register_home_undo(handle, ni, mrec);
+		if (!err)
+			err = ntfs_log_mft_record_update(handle, ni->mft_no,
+					mrec, after, &lsn);
+		kfree(after);
+		if (err)
+			return err;
+	}
+	mrec->link_count = cpu_to_le16(count);
+	if (lsn)
+		mrec->lsn = cpu_to_le64(lsn);
+	mark_mft_record_dirty(ni);
+	return 0;
+}
+
+static int ntfs_filename_log_credits(struct ntfs_volume *vol,
+		u16 name_len, unsigned int entries, bool may_remove)
+{
+	u32 fn_len, attr_len, entry_len;
+	unsigned int attr_credits, per_entry;
+	int allocation_credits, index_credits, snapshot_credits;
+	int node_remove_credits, remove_credits, reparent_credits, split_credits;
+
+	if (!entries || name_len > NTFS_MAX_NAME_LEN)
+		return -EINVAL;
+	fn_len = sizeof(struct file_name_attr) +
+		name_len * sizeof(__le16);
+	attr_len = offsetof(struct attr_record, data.resident.reserved) +
+		sizeof_field(struct attr_record, data.resident.reserved) +
+		ALIGN(fn_len, 8);
+	entry_len = ALIGN(sizeof(struct index_entry_header) + fn_len, 8);
+	if (attr_len > U16_MAX || entry_len > U16_MAX)
+		return -E2BIG;
+
+	if (vol->mft_record_size > U16_MAX)
+		return -E2BIG;
+	snapshot_credits = ntfs_log_mft_attribute_credits(vol,
+			vol->mft_record_size, vol->mft_record_size);
+	if (snapshot_credits < 0)
+		return snapshot_credits;
+	/* One update for the filename and one for the base link count. */
+	if (check_mul_overflow((unsigned int)snapshot_credits, 2U,
+			&attr_credits))
+		return -EOVERFLOW;
+	index_credits = ntfs_log_index_root_credits(vol, entry_len);
+	if (index_credits < 0)
+		return index_credits;
+	allocation_credits = ntfs_log_index_allocation_credits(vol,
+			vol->index_record_size, entry_len);
+	if (allocation_credits < 0 && allocation_credits != -EOPNOTSUPP)
+		return allocation_credits;
+	if (allocation_credits >= 0)
+		index_credits = max(index_credits, allocation_credits);
+	reparent_credits = ntfs_index_root_reparent_log_credits(vol,
+			vol->index_record_size);
+	if (reparent_credits < 0 && reparent_credits != -EOPNOTSUPP)
+		return reparent_credits;
+	if (reparent_credits >= 0)
+		index_credits = max(index_credits, reparent_credits);
+	split_credits = ntfs_index_leaf_split_log_credits(vol,
+			vol->index_record_size);
+	if (split_credits < 0 && split_credits != -EOPNOTSUPP)
+		return split_credits;
+	if (split_credits >= 0)
+		index_credits = max(index_credits, split_credits);
+	if (may_remove) {
+		remove_credits = ntfs_index_leaf_remove_log_credits(vol,
+								    vol->index_record_size);
+		if (remove_credits < 0 && remove_credits != -EOPNOTSUPP)
+			return remove_credits;
+		if (remove_credits >= 0)
+			index_credits = max(index_credits, remove_credits);
+		node_remove_credits = ntfs_index_node_remove_log_credits(vol,
+									 vol->index_record_size);
+		if (node_remove_credits < 0 &&
+		    node_remove_credits != -EOPNOTSUPP)
+			return node_remove_credits;
+		if (node_remove_credits >= 0)
+			index_credits = max(index_credits, node_remove_credits);
+	}
+	if (check_add_overflow((unsigned int)attr_credits,
+			(unsigned int)index_credits, &per_entry) ||
+	    check_mul_overflow(per_entry, entries, &per_entry) ||
+	    per_entry > INT_MAX)
+		return -EOVERFLOW;
+	return per_entry;
+}
+
+static int ntfs_filename_attrlist_extra_credits(struct ntfs_volume *vol,
+		unsigned int entries)
+{
+	unsigned int credits;
+	int extent_credits;
+	int list_credits;
+
+	if (!vol || !entries)
+		return -EINVAL;
+	extent_credits = ntfs_attrlist_extent_log_credits(vol);
+	if (extent_credits < 0)
+		return extent_credits;
+	list_credits = ntfs_attrlist_nonresident_log_credits(vol);
+	if (list_credits < 0)
+		return list_credits;
+	if (check_mul_overflow((unsigned int)max(extent_credits,
+			list_credits), entries, &credits) || credits > INT_MAX)
+		return -EOVERFLOW;
+	return credits;
+}
 
 static inline int ntfs_check_bad_char(const __le16 *wc, unsigned int wc_len)
 {
@@ -350,7 +585,8 @@ err_out:
 	}
 }
 
-static int ntfs_sd_add_everyone(struct ntfs_inode *ni)
+static int ntfs_sd_add_everyone(struct ntfs_log_handle *log_handle,
+		struct ntfs_inode *ni)
 {
 	struct security_descriptor_relative *sd;
 	struct ntfs_acl *acl;
@@ -405,8 +641,13 @@ static int ntfs_sd_add_everyone(struct ntfs_inode *ni)
 	ace->sid.sub_authority[0] = 0;
 	ace->sid.identifier_authority.value[5] = 1;
 
-	ret = ntfs_attr_add(ni, AT_SECURITY_DESCRIPTOR, AT_UNNAMED, 0, (u8 *)sd,
-			sd_len);
+	if (log_handle)
+		ret = ntfs_attr_add_transacted(log_handle, ni,
+				AT_SECURITY_DESCRIPTOR, AT_UNNAMED, 0, (u8 *)sd,
+				sd_len);
+	else
+		ret = ntfs_attr_add(ni, AT_SECURITY_DESCRIPTOR, AT_UNNAMED, 0,
+				(u8 *)sd, sd_len);
 	if (ret)
 		ntfs_error(ni->vol->sb, "Failed to add SECURITY_DESCRIPTOR\n");
 
@@ -420,18 +661,34 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 {
 	struct ntfs_inode *dir_ni = NTFS_I(dir);
 	struct ntfs_volume *vol = dir_ni->vol;
+	struct ntfs_log_handle *log_handle = NULL;
 	struct ntfs_inode *ni;
 	bool rollback_data = false, rollback_sd = false, rollback_reparse = false;
+	bool created_data = false;
+	bool created_ea = false;
+	bool journal_create = false;
+	bool system_index_locked = false;
+	bool mft_allocation_aborted = false;
+	bool mft_allocation_pending = false;
+	bool needs_reparse;
+	bool reparse_present = false;
+	char *converted_target = NULL;
+	char *native_target = NULL;
 	struct file_name_attr *fn = NULL;
 	struct standard_information *si = NULL;
 	int err = 0, fn_len, si_len;
+	unsigned int journal_credits;
 	struct inode *vi;
-	struct mft_record *ni_mrec, *dni_mrec;
+	struct mft_record *ni_mrec = NULL, *dni_mrec;
 	struct super_block *sb = dir_ni->vol->sb;
 	struct inode *rollback_data_vi = NULL, *rollback_sd_vi = NULL;
 	__le64 parent_mft_ref;
 	u64 child_mft_ref;
 	__le16 ea_size;
+#ifdef CONFIG_NTFS_FS_POSIX_ACL
+	struct posix_acl *default_acl = NULL, *acl = NULL;
+	bool init_acl = false;
+#endif
 
 	vi = new_inode(vol->sb);
 	if (!vi)
@@ -468,14 +725,17 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 	inode_init_owner(idmap, vi, dir, mode);
 
 	mode = vi->i_mode;
+	needs_reparse = S_ISLNK(mode) || S_ISBLK(mode) || S_ISCHR(mode) ||
+		S_ISSOCK(mode) || S_ISFIFO(mode);
 
 #ifdef CONFIG_NTFS_FS_POSIX_ACL
 	if (!S_ISLNK(mode) && (sb->s_flags & SB_POSIXACL)) {
-		err = ntfs_init_acl(idmap, vi, dir);
+		err = posix_acl_create(dir, &vi->i_mode, &default_acl, &acl);
 		if (err) {
 			iput(vi);
 			return ERR_PTR(err);
 		}
+		init_acl = true;
 	} else
 #endif
 	{
@@ -504,12 +764,115 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 	inode_set_ctime_to_ts(dir, ni->i_crtime);
 	mark_inode_dirty(dir);
 
-	err = ntfs_mft_record_alloc(dir_ni->vol, mode, &ni, NULL,
-			&ni_mrec, -1);
-	if (err) {
-		iput(vi);
-		return ERR_PTR(err);
+	if (vol->journal) {
+		int credits = ntfs_log_mft_record_credits(vol);
+		int extra_credits;
+		int filename_credits;
+		int mft_credits;
+		int reparse_credits = 0;
+		unsigned int records = needs_reparse ? 6 : 5;
+
+		if (credits < 0 || check_mul_overflow((unsigned int)credits,
+				records,
+				&journal_credits)) {
+			err = credits < 0 ? credits : -EOVERFLOW;
+			goto free_unhashed_record;
+		}
+		extra_credits = ntfs_attrlist_extent_log_credits(vol);
+		if (extra_credits < 0 || check_add_overflow(journal_credits,
+				(unsigned int)extra_credits, &journal_credits)) {
+			err = extra_credits < 0 ? extra_credits : -EOVERFLOW;
+			goto free_unhashed_record;
+		}
+		mft_credits = ntfs_mft_record_alloc_credits(vol);
+		if (mft_credits < 0 || check_add_overflow(journal_credits,
+				(unsigned int)mft_credits, &journal_credits)) {
+			err = mft_credits < 0 ? mft_credits : -EOVERFLOW;
+			goto free_unhashed_record;
+		}
+		if (needs_reparse) {
+			reparse_credits = S_ISLNK(mode) ?
+				(NVolSymlinkNative(vol) ?
+					ntfs_reparse_native_symlink_log_credits(ni,
+							target_len) :
+					ntfs_reparse_wsl_symlink_log_credits(ni,
+							target_len)) :
+				ntfs_reparse_wsl_not_symlink_log_credits(ni);
+			if (reparse_credits < 0 ||
+			    check_add_overflow(journal_credits,
+					(unsigned int)reparse_credits,
+					&journal_credits)) {
+				err = reparse_credits < 0 ? reparse_credits :
+					-EOVERFLOW;
+				goto free_unhashed_record;
+			}
+		}
+		filename_credits = ntfs_filename_log_credits(vol, name_len, 1,
+							     false);
+		if (filename_credits < 0 ||
+		    check_add_overflow(journal_credits,
+				(unsigned int)filename_credits,
+				&journal_credits)) {
+			err = filename_credits < 0 ? filename_credits : -EOVERFLOW;
+			goto free_unhashed_record;
+		}
+		if (NInoAttrList(dir_ni)) {
+			extra_credits = ntfs_index_attrlist_log_credits(vol, 1);
+			if (extra_credits < 0 ||
+			    check_add_overflow(journal_credits,
+					(unsigned int)extra_credits,
+					&journal_credits)) {
+				err = extra_credits < 0 ? extra_credits :
+					-EOVERFLOW;
+				goto free_unhashed_record;
+			}
+		}
+#ifdef CONFIG_NTFS_FS_POSIX_ACL
+		extra_credits = ntfs_acl_create_log_credits(vol, default_acl, acl);
+		if (extra_credits < 0 ||
+		    check_add_overflow(journal_credits,
+				(unsigned int)extra_credits, &journal_credits)) {
+			err = extra_credits < 0 ? extra_credits : -EOVERFLOW;
+			goto free_unhashed_record;
+		}
+#endif
+		log_handle = ntfs_log_begin(vol, journal_credits);
+		if (IS_ERR(log_handle)) {
+			err = PTR_ERR(log_handle);
+			ntfs_error(sb,
+				"Create journal begin failed (credits %u, error %d).",
+				journal_credits, err);
+			log_handle = NULL;
+			goto free_unhashed_record;
+		}
+		journal_create = true;
+		if (needs_reparse) {
+			mutex_lock(&vol->system_index_lock);
+			system_index_locked = true;
+		}
 	}
+
+	if (log_handle)
+		err = ntfs_mft_base_record_alloc_transacted(log_handle, vol, mode,
+				&ni, &ni_mrec);
+	else
+		err = ntfs_mft_record_alloc(vol, mode, &ni, NULL, &ni_mrec, -1);
+	if (err) {
+		if (log_handle)
+			ntfs_error(sb,
+				"Create transacted MFT allocation failed (credits %u, error %d).",
+				journal_credits, err);
+		if (log_handle) {
+			int abort_err = ntfs_log_abort(log_handle);
+
+			log_handle = NULL;
+			if (abort_err)
+				err = abort_err;
+		}
+		goto free_unhashed_record;
+	}
+	if (log_handle)
+		mft_allocation_pending = true;
 
 	/*
 	 * Prevent iget and writeback from finding this inode.
@@ -526,8 +889,20 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 
 	mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
 	mutex_lock_nested(&dir_ni->mrec_lock, NTFS_INODE_MUTEX_PARENT);
+	if (!ni_mrec) {
+		ni_mrec = map_mft_record(ni);
+		if (IS_ERR(ni_mrec)) {
+			err = PTR_ERR(ni_mrec);
+			ni_mrec = NULL;
+			ntfs_error(sb,
+				"Create failed to map new MFT record (error %d).", err);
+			goto err_out;
+		}
+	}
 	if (NInoBeingDeleted(dir_ni)) {
 		err = -ENOENT;
+		ntfs_error(sb, "Create parent inode is being deleted (error %d).",
+			err);
 		goto err_out;
 	}
 
@@ -559,19 +934,33 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 
 	if (!S_ISREG(mode) && !S_ISDIR(mode))
 		si->file_attributes = FILE_ATTR_SYSTEM;
+	if (needs_reparse) {
+		si->file_attributes |= FILE_ATTR_REPARSE_POINT;
+		if (!S_ISLNK(mode))
+			si->file_attributes |= FILE_ATTRIBUTE_RECALL_ON_OPEN;
+	}
 
 	/* Add STANDARD_INFORMATION to inode. */
-	err = ntfs_attr_add(ni, AT_STANDARD_INFORMATION, AT_UNNAMED, 0, (u8 *)si,
-			si_len);
+	if (log_handle)
+		err = ntfs_attr_add_transacted(log_handle, ni,
+				AT_STANDARD_INFORMATION, AT_UNNAMED, 0, (u8 *)si,
+				si_len);
+	else
+		err = ntfs_attr_add(ni, AT_STANDARD_INFORMATION, AT_UNNAMED, 0,
+				(u8 *)si, si_len);
 	if (err) {
 		ntfs_error(sb, "Failed to add STANDARD_INFORMATION attribute.\n");
 		goto err_out;
 	}
 
-	err = ntfs_sd_add_everyone(ni);
-	if (err)
+	err = ntfs_sd_add_everyone(log_handle, ni);
+	if (err) {
+		ntfs_error(sb,
+			"Create failed to add SECURITY_DESCRIPTOR (error %d).", err);
 		goto err_out;
-	rollback_sd = true;
+	}
+	if (!log_handle)
+		rollback_sd = true;
 
 	if (S_ISDIR(mode)) {
 		struct index_root *ir = NULL;
@@ -604,52 +993,159 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 		ie->flags = INDEX_ENTRY_END;
 
 		/* Add struct index_root attribute to inode. */
-		err = ntfs_attr_add(ni, AT_INDEX_ROOT, I30, 4, (u8 *)ir, ir_len);
+		if (log_handle)
+			err = ntfs_attr_add_transacted(log_handle, ni,
+					AT_INDEX_ROOT, I30, 4, (u8 *)ir, ir_len);
+		else
+			err = ntfs_attr_add(ni, AT_INDEX_ROOT, I30, 4,
+					(u8 *)ir, ir_len);
 		if (err) {
 			kfree(ir);
-			ntfs_error(vi->i_sb, "Failed to add struct index_root attribute.\n");
+			ntfs_error(vi->i_sb,
+				"Create failed to add INDEX_ROOT attribute (error %d).",
+				err);
 			goto err_out;
 		}
 		kfree(ir);
 		err = ntfs_attr_open(ni, AT_INDEX_ROOT, I30, 4);
-		if (err)
+		if (err) {
+			ntfs_error(sb,
+				"Create failed to open INDEX_ROOT attribute (error %d).",
+				err);
 			goto err_out;
+		}
 	} else {
 		/* Add DATA attribute to inode. */
-		err = ntfs_attr_add(ni, AT_DATA, AT_UNNAMED, 0, NULL, 0);
+		if (log_handle)
+			err = ntfs_attr_add_transacted(log_handle, ni, AT_DATA,
+					AT_UNNAMED, 0, NULL, 0);
+		else
+			err = ntfs_attr_add(ni, AT_DATA, AT_UNNAMED, 0, NULL, 0);
 		if (err) {
-			ntfs_error(dir_ni->vol->sb, "Failed to add DATA attribute.\n");
+			ntfs_error(dir_ni->vol->sb,
+				"Create failed to add DATA attribute (error %d).", err);
 			goto err_out;
 		}
-		rollback_data = true;
+		created_data = true;
+		if (!log_handle)
+			rollback_data = true;
 
 		err = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
-		if (err)
+		if (err) {
+			ntfs_error(sb,
+				"Create failed to open DATA attribute (error %d).", err);
 			goto err_out;
+		}
+	}
+	if (log_handle && needs_reparse) {
+		struct reparse_point rp = {};
 
+		err = ntfs_attr_add_transacted(log_handle, ni, AT_REPARSE_POINT,
+				AT_UNNAMED, 0, (u8 *)&rp, sizeof(rp));
+		if (err) {
+			ntfs_error(sb,
+				"Create failed to add REPARSE_POINT attribute (error %d).",
+				err);
+			goto err_out;
+		}
+	}
+	if (log_handle) {
+		err = ntfs_ea_add_wsl_transacted(log_handle, vi, dev, &ea_size,
+				NTFS_EA_UID | NTFS_EA_GID | NTFS_EA_MODE);
+		if (err) {
+			ntfs_error(sb,
+				"Create failed to add initial WSL EA attributes (error %d).",
+				err);
+			goto err_out;
+		}
+		created_ea = true;
+	}
+
+	if (needs_reparse) {
+		int reparse_err;
+
+		if (journal_create) {
+			unmap_mft_record(ni);
+			ni_mrec = NULL;
+			mutex_unlock(&dir_ni->mrec_lock);
+			mutex_unlock(&ni->mrec_lock);
+		}
 		if (S_ISLNK(mode)) {
-			if (NVolSymlinkNative(vol))
-				err = ntfs_reparse_set_native_symlink(ni, target, target_len);
-			else
-				err = ntfs_reparse_set_wsl_symlink(ni, target, target_len);
-			if (!err)
-				rollback_reparse = true;
-		} else if (S_ISBLK(mode) || S_ISCHR(mode) || S_ISSOCK(mode) ||
-			   S_ISFIFO(mode)) {
-			si->file_attributes = FILE_ATTRIBUTE_RECALL_ON_OPEN;
+			if (journal_create) {
+				if (NVolSymlinkNative(vol))
+					reparse_err =
+						ntfs_reparse_set_native_symlink_transacted(
+							log_handle, ni, target,
+							target_len, &native_target);
+				else
+					reparse_err =
+						ntfs_reparse_set_wsl_symlink_transacted(
+							log_handle, ni, target,
+							target_len,
+							&converted_target);
+			} else if (NVolSymlinkNative(vol)) {
+				reparse_err = ntfs_reparse_set_native_symlink(ni,
+						target, target_len);
+			} else {
+				reparse_err = ntfs_reparse_set_wsl_symlink(ni,
+						target, target_len);
+			}
+		} else {
 			ni->flags = FILE_ATTRIBUTE_RECALL_ON_OPEN;
-			err = ntfs_reparse_set_wsl_not_symlink(ni, mode);
-			if (!err)
+			if (journal_create)
+				reparse_err =
+					ntfs_reparse_set_wsl_not_symlink_transacted(
+						log_handle, ni, mode);
+			else
+				reparse_err = ntfs_reparse_set_wsl_not_symlink(ni,
+						mode);
+		}
+		if (journal_create) {
+			mutex_lock_nested(&ni->mrec_lock,
+					NTFS_INODE_MUTEX_NORMAL);
+			mutex_lock_nested(&dir_ni->mrec_lock,
+					NTFS_INODE_MUTEX_PARENT);
+			ni_mrec = map_mft_record(ni);
+			if (IS_ERR(ni_mrec)) {
+				err = PTR_ERR(ni_mrec);
+				ni_mrec = NULL;
+				ntfs_error(sb,
+					"Create failed to remap new MFT record (error %d).",
+					err);
+				goto err_out;
+			}
+		}
+		err = reparse_err;
+		if (!err) {
+			reparse_present = true;
+			ni->flags |= FILE_ATTR_REPARSE_POINT;
+			if (!journal_create)
 				rollback_reparse = true;
 		}
+	}
+	if (err) {
+		ntfs_error(sb, "Create reparse setup failed (error %d).", err);
+		goto err_out;
+	}
+
+	if (!journal_create) {
+		err = ntfs_ea_set_wsl_inode(vi, dev, &ea_size,
+				NTFS_EA_UID | NTFS_EA_GID | NTFS_EA_MODE);
+		if (err) {
+			ntfs_error(sb,
+				"Create failed to set initial WSL EA attributes (error %d).",
+				err);
+			goto err_out;
+		}
+	}
+
+#ifdef CONFIG_NTFS_FS_POSIX_ACL
+	if (init_acl) {
+		err = ntfs_init_acl(log_handle, vi, default_acl, acl, &ea_size);
 		if (err)
 			goto err_out;
 	}
-
-	err = ntfs_ea_set_wsl_inode(vi, dev, &ea_size,
-			NTFS_EA_UID | NTFS_EA_GID | NTFS_EA_MODE);
-	if (err)
-		goto err_out;
+#endif
 
 	/* Create FILE_NAME attribute. */
 	fn_len = sizeof(struct file_name_attr) + name_len * sizeof(__le16);
@@ -668,12 +1164,12 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 		fn->file_attributes = FILE_ATTR_DUP_FILE_NAME_INDEX_PRESENT;
 		fn->allocated_size = fn->data_size = 0;
 	} else {
-		fn->data_size = cpu_to_le64(ni->data_size);
+		fn->data_size = cpu_to_le64(ntfs_inode_recorded_data_size(ni));
 		fn->allocated_size = cpu_to_le64(ni->allocated_size);
 	}
 	if (!S_ISREG(mode) && !S_ISDIR(mode)) {
 		fn->file_attributes = FILE_ATTR_SYSTEM;
-		if (rollback_reparse)
+		if (reparse_present)
 			fn->file_attributes |= FILE_ATTR_REPARSE_POINT;
 	}
 	if (NVolHideDotFiles(vol) && name_len > 0 && name[0] == cpu_to_le16('.'))
@@ -681,30 +1177,69 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 	fn->creation_time = fn->last_data_change_time = utc2ntfs(ni->i_crtime);
 	fn->last_mft_change_time = fn->last_access_time = fn->creation_time;
 	memcpy(fn->file_name, name, name_len * sizeof(__le16));
-
 	/* Add FILE_NAME attribute to inode. */
-	err = ntfs_attr_add(ni, AT_FILE_NAME, AT_UNNAMED, 0, (u8 *)fn, fn_len);
+	if (log_handle)
+		err = ntfs_attr_add_transacted(log_handle, ni, AT_FILE_NAME,
+				AT_UNNAMED, 0, (u8 *)fn, fn_len);
+	else
+		err = ntfs_attr_add(ni, AT_FILE_NAME, AT_UNNAMED, 0,
+				(u8 *)fn, fn_len);
 	if (err) {
-		ntfs_error(sb, "Failed to add FILE_NAME attribute.\n");
+		ntfs_error(sb,
+			"Create failed to add FILE_NAME attribute (error %d).", err);
 		goto err_out;
 	}
 
 	child_mft_ref = MK_MREF(ni->mft_no,
 				le16_to_cpu(ni_mrec->sequence_number));
-	/* Set hard links count and directory flag. */
-	ni_mrec->link_count = cpu_to_le16(1);
-	mark_mft_record_dirty(ni);
+	err = ntfs_mft_set_link_count(log_handle, ni, ni_mrec, 1);
+	if (err)
+		goto err_out;
 
 	/* Add FILE_NAME attribute to index. */
-	err = ntfs_index_add_filename(dir_ni, fn, child_mft_ref);
+	if (log_handle)
+		err = ntfs_index_add_filename_transacted(log_handle, dir_ni, fn,
+				child_mft_ref);
+	else
+		err = ntfs_index_add_filename(dir_ni, fn, child_mft_ref);
 	if (err) {
-		ntfs_debug("Failed to add entry to the index");
+		ntfs_error(sb,
+			"Create failed to add FILE_NAME index entry (error %d).", err);
 		goto err_out;
 	}
+	if (log_handle) {
+		unmap_mft_record(ni);
+		ni_mrec = NULL;
+		err = ntfs_log_commit(log_handle);
+		log_handle = NULL;
+		if (err) {
+			ntfs_error(sb,
+				"Create transaction commit failed (error %d).", err);
+			mft_allocation_aborted = true;
+			mft_allocation_pending = false;
+			goto err_out;
+		}
+		mft_allocation_pending = false;
+		rollback_sd = true;
+		rollback_data = created_data;
+		if (created_ea)
+			NInoSetHasEA(ni);
+		if (converted_target) {
+			ni->target = converted_target;
+			converted_target = NULL;
+		}
+		if (native_target) {
+			ni->target = native_target;
+			native_target = NULL;
+		}
+	}
 
-	unmap_mft_record(ni);
+	if (ni_mrec)
+		unmap_mft_record(ni);
 	mutex_unlock(&dir_ni->mrec_lock);
 	mutex_unlock(&ni->mrec_lock);
+	if (system_index_locked)
+		mutex_unlock(&vol->system_index_lock);
 
 	ni->flags = fn->file_attributes |
 		    (ni->flags & FILE_ATTRIBUTE_RECALL_ON_OPEN);
@@ -716,10 +1251,37 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 	/* Done! */
 	kfree(fn);
 	kfree(si);
+#ifdef CONFIG_NTFS_FS_POSIX_ACL
+	posix_acl_release(default_acl);
+	posix_acl_release(acl);
+#endif
 	ntfs_debug("Done.\n");
 	return ni;
 
 err_out:
+	if (log_handle) {
+		int abort_err;
+
+		if (mft_allocation_pending && ni_mrec) {
+			unmap_mft_record(ni);
+			ni_mrec = NULL;
+		}
+		abort_err = ntfs_log_abort(log_handle);
+		log_handle = NULL;
+		if (mft_allocation_pending) {
+			mft_allocation_aborted = true;
+			mft_allocation_pending = false;
+		}
+		if (abort_err) {
+			ntfs_error(sb,
+				"Failed to abort create transaction (error %i).",
+				abort_err);
+			NVolSetErrors(vol);
+			err = abort_err;
+		}
+	}
+	kfree(converted_target);
+	kfree(native_target);
 	if (rollback_sd) {
 		int rollback_err;
 
@@ -740,6 +1302,33 @@ err_out:
 			ntfs_error(sb, "Failed to roll back DATA attribute.\n");
 	}
 
+	if (rollback_reparse && vol->journal) {
+		int cleanup_err;
+
+		if (ni_mrec) {
+			unmap_mft_record(ni);
+			ni_mrec = NULL;
+		}
+		mutex_unlock(&dir_ni->mrec_lock);
+		mutex_unlock(&ni->mrec_lock);
+		cleanup_err = ntfs_delete_reparse_index(ni);
+		if (cleanup_err < 0) {
+			ntfs_error(sb,
+				"Failed to roll back reparse index (error %i).",
+				cleanup_err);
+			NVolSetErrors(vol);
+		}
+		mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
+		mutex_lock_nested(&dir_ni->mrec_lock, NTFS_INODE_MUTEX_PARENT);
+		ni_mrec = map_mft_record(ni);
+		if (IS_ERR(ni_mrec)) {
+			ntfs_error(sb,
+				"Failed to remap new inode during create rollback.");
+			NVolSetErrors(vol);
+			ni_mrec = NULL;
+		}
+		rollback_reparse = false;
+	}
 	if (rollback_reparse)
 		ntfs_delete_reparse_index(ni);
 	/*
@@ -747,7 +1336,7 @@ err_out:
 	 * ntfs_create implementation, but for any case if something will be
 	 * changed in the future).
 	 */
-	while (ni->nr_extents != 0) {
+	while (!mft_allocation_aborted && ni->nr_extents != 0) {
 		int err2;
 
 		err2 = ntfs_mft_record_free(ni->vol, *(ni->ext.extent_ntfs_inos));
@@ -756,22 +1345,39 @@ err_out:
 				"Failed to free extent MFT record. Leaving inconsistent metadata.\n");
 		ntfs_inode_close(*(ni->ext.extent_ntfs_inos));
 	}
-	if (ntfs_mft_record_free(ni->vol, ni))
+	if (!mft_allocation_aborted && ntfs_mft_record_free(ni->vol, ni))
 		ntfs_error(sb,
 			"Failed to free MFT record. Leaving inconsistent metadata. Run chkdsk.\n");
-	unmap_mft_record(ni);
+	if (ni_mrec)
+		unmap_mft_record(ni);
 	kfree(fn);
 	kfree(si);
 
 	mutex_unlock(&dir_ni->mrec_lock);
 	mutex_unlock(&ni->mrec_lock);
+	if (system_index_locked)
+		mutex_unlock(&vol->system_index_lock);
 
 	if (rollback_data_vi)
 		iput(rollback_data_vi);
 	if (rollback_sd_vi)
 		iput(rollback_sd_vi);
+#ifdef CONFIG_NTFS_FS_POSIX_ACL
+	posix_acl_release(default_acl);
+	posix_acl_release(acl);
+#endif
 	remove_inode_hash(vi);
 	discard_new_inode(vi);
+	return ERR_PTR(err);
+
+free_unhashed_record:
+	if (system_index_locked)
+		mutex_unlock(&vol->system_index_lock);
+#ifdef CONFIG_NTFS_FS_POSIX_ACL
+	posix_acl_release(default_acl);
+	posix_acl_release(acl);
+#endif
+	iput(vi);
 	return ERR_PTR(err);
 }
 
@@ -828,8 +1434,13 @@ out_free_stream_names:
 	ni = __ntfs_create(idmap, dir, uname, uname_len, S_IFREG | mode, 0,
 			NULL, 0);
 	kmem_cache_free(ntfs_name_cache, uname);
-	if (IS_ERR(ni))
-		return PTR_ERR(ni);
+	if (IS_ERR(ni)) {
+		err = PTR_ERR(ni);
+		ntfs_error(dir->i_sb,
+			"Create failed for inode name length %u (error %d).",
+			dentry->d_name.len, err);
+		return err;
+	}
 
 	d_instantiate_new(dentry, VFS_I(ni));
 
@@ -871,6 +1482,8 @@ static int ntfs_test_inode_attr(struct inode *vi, void *data)
 
 	if (ni->mft_no != mft_no)
 		return 0;
+	if (!READ_ONCE(vi->i_nlink))
+		return 0;
 	if (NInoAttr(ni) || ni->nr_extents == -1)
 		return 1;
 	return 0;
@@ -898,32 +1511,288 @@ static void ntfs_cleanup_deleted_inode(struct ntfs_inode *ni)
 	}
 }
 
+static void ntfs_delete_metadata_post_commit(struct ntfs_inode *ni)
+{
+	NInoSetBeingDeleted(ni);
+	ntfs_delete_reparse_index(ni);
+	ntfs_delete_object_id_index(ni);
+}
+
+struct ntfs_deleted_attribute {
+	struct ntfs_deleted_attribute *next;
+	__le32 type;
+	u8 name_len;
+	__le16 name[];
+};
+
+int ntfs_reclaim_deleted_attributes(struct ntfs_inode *ni, bool recovery)
+{
+	struct ntfs_deleted_attribute *attributes = NULL;
+	struct ntfs_deleted_attribute **attributes_tail = &attributes;
+	struct ntfs_attr_search_ctx *ctx;
+	struct ntfs_deleted_attribute *entry;
+	struct ntfs_deleted_attribute *next;
+	struct inode *attr_vi;
+	struct ntfs_attr na;
+	struct attr_record *attr;
+	__le16 *name;
+	size_t name_bytes;
+	u32 attr_len;
+	u16 name_off;
+	int err;
+	int first_err = 0;
+	bool enumeration_error = false;
+
+	if (!ni->vol->journal || !NInoBeingDeleted(ni))
+		return 0;
+	mutex_lock(&ni->mrec_lock);
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx) {
+		err = -ENOMEM;
+		goto out_unlock;
+	}
+	while (!(err = ntfs_attrs_walk(ctx))) {
+		attr = ctx->attr;
+		if (!attr->non_resident ||
+		    !ntfs_deleted_attribute_reclaimable(attr->type,
+			    attr->name_length) ||
+		    le64_to_cpu(attr->data.non_resident.lowest_vcn))
+			continue;
+		attr_len = le32_to_cpu(attr->length);
+		name_off = le16_to_cpu(attr->name_offset);
+		name_bytes = attr->name_length * sizeof(__le16);
+		if (name_off > attr_len || name_bytes > attr_len - name_off) {
+			err = -EIO;
+			break;
+		}
+		entry = kmalloc(struct_size(entry, name, attr->name_length),
+				GFP_NOFS);
+		if (!entry) {
+			err = -ENOMEM;
+			break;
+		}
+		entry->next = NULL;
+		entry->type = attr->type;
+		entry->name_len = attr->name_length;
+		memcpy(entry->name, (u8 *)attr + name_off, name_bytes);
+		*attributes_tail = entry;
+		attributes_tail = &entry->next;
+	}
+	ntfs_attr_put_search_ctx(ctx);
+out_unlock:
+	mutex_unlock(&ni->mrec_lock);
+	if (err != -ENOENT) {
+		first_err = err;
+		enumeration_error = true;
+	}
+
+	for (entry = attributes; entry; entry = next) {
+		next = entry->next;
+		name = entry->name_len ? entry->name : AT_UNNAMED;
+		na = (struct ntfs_attr) {
+			.mft_no = ni->mft_no,
+			.name = name,
+			.name_len = entry->name_len,
+			.type = entry->type,
+		};
+		attr_vi = ilookup5(ni->vol->sb, ni->mft_no, ntfs_test_inode,
+				&na);
+		if (!attr_vi) {
+			if (entry->type == AT_INDEX_ALLOCATION) {
+				mutex_lock(&ni->mrec_lock);
+				attr_vi = ntfs_index_iget(VFS_I(ni), name,
+						entry->name_len);
+				mutex_unlock(&ni->mrec_lock);
+			} else {
+				attr_vi = ntfs_attr_iget(VFS_I(ni), entry->type,
+						name, entry->name_len);
+			}
+		}
+		if (IS_ERR(attr_vi)) {
+			err = PTR_ERR(attr_vi);
+			if (err != -ENOENT && !first_err)
+				first_err = err;
+		} else {
+			struct ntfs_inode *attr_ni = NTFS_I(attr_vi);
+			bool stream_open = ntfs_inode_is_named_stream(attr_ni) &&
+					atomic_read(&attr_ni->stream_open_count) > 0;
+
+			if (recovery &&
+			    (stream_open || atomic_read(&attr_vi->i_count) != 1)) {
+				if (!first_err)
+					first_err = -EBUSY;
+			} else {
+				if (ntfs_inode_is_named_stream(attr_ni)) {
+					if (stream_open)
+						NInoSetStreamUnlinked(attr_ni);
+					remove_inode_hash(attr_vi);
+				}
+				clear_nlink(attr_vi);
+				if (!stream_open &&
+				    atomic_read(&attr_vi->i_count) == 1) {
+					err = ntfs_reclaim_deleted_attribute(
+							attr_vi);
+					if (err && !first_err)
+						first_err = err;
+				}
+			}
+			iput(attr_vi);
+		}
+		kfree(entry);
+	}
+	if (first_err) {
+		if (enumeration_error)
+			ntfs_warning(ni->vol->sb,
+				"Failed to enumerate deleted attributes (error %d).",
+				first_err);
+		else
+			ntfs_warning(ni->vol->sb,
+				"Failed to reclaim deleted attributes (error %d).",
+				first_err);
+	}
+	return first_err;
+}
+
+static void ntfs_delete_attr_inodes_post_commit(struct ntfs_inode *ni)
+{
+	ntfs_reclaim_deleted_attributes(ni, false);
+	ntfs_cleanup_deleted_inode(ni);
+}
+
+static int ntfs_has_system_index_entry(struct ntfs_inode *ni)
+{
+	struct ntfs_attr_search_ctx *ctx;
+	struct mft_record *mrec;
+	int err;
+
+	if (ni->flags & FILE_ATTR_REPARSE_POINT)
+		return 1;
+	mrec = map_mft_record(ni);
+	if (IS_ERR(mrec))
+		return PTR_ERR(mrec);
+	ctx = ntfs_attr_get_search_ctx(ni, mrec);
+	if (!ctx) {
+		err = -ENOMEM;
+		goto out_unmap;
+	}
+	err = ntfs_attr_lookup(AT_OBJECT_ID, AT_UNNAMED, 0, CASE_SENSITIVE,
+			0, NULL, 0, ctx);
+	ntfs_attr_put_search_ctx(ctx);
+	if (!err)
+		err = 1;
+	else if (err == -ENOENT)
+		err = 0;
+out_unmap:
+	unmap_mft_record(ni);
+	return err;
+}
+
+static int ntfs_prepare_system_index_removals(struct ntfs_inode *ni,
+		struct ntfs_system_index_ctx *reparse,
+		struct ntfs_system_index_ctx *object_id)
+{
+	int err;
+
+	err = ntfs_prepare_reparse_index_remove(ni, reparse);
+	if (err)
+		return err;
+	return ntfs_prepare_object_id_index_remove(ni, object_id);
+}
+
+static int ntfs_system_index_remove_log_credits(struct ntfs_inode *ni)
+{
+	int credits;
+	int extra_credits;
+
+	credits = ntfs_reparse_index_remove_log_credits(ni);
+	if (credits < 0)
+		return credits;
+	extra_credits = ntfs_object_id_index_remove_log_credits(ni);
+	if (extra_credits < 0 || check_add_overflow(credits, extra_credits,
+			&credits))
+		return extra_credits < 0 ? extra_credits : -EOVERFLOW;
+	return credits;
+}
+
+static int ntfs_delete_transaction_credits(struct ntfs_inode *ni,
+		struct ntfs_inode *dir_ni)
+{
+	int credits;
+	int extra_credits;
+
+	credits = ntfs_filename_log_credits(ni->vol, NTFS_MAX_NAME_LEN, 2,
+					    true);
+	if (credits < 0)
+		return credits;
+	if (NInoAttrList(ni)) {
+		extra_credits = ntfs_filename_attrlist_extra_credits(ni->vol, 2);
+		if (extra_credits < 0 || check_add_overflow(credits,
+				extra_credits, &credits))
+			return extra_credits < 0 ? extra_credits : -EOVERFLOW;
+	}
+	if (NInoAttrList(dir_ni)) {
+		extra_credits = ntfs_index_attrlist_log_credits(ni->vol, 2);
+		if (extra_credits < 0 || check_add_overflow(credits,
+				extra_credits, &credits))
+			return extra_credits < 0 ? extra_credits : -EOVERFLOW;
+	}
+	extra_credits = ntfs_system_index_remove_log_credits(ni);
+	if (extra_credits < 0 || check_add_overflow(credits, extra_credits,
+			&credits))
+		return extra_credits < 0 ? extra_credits : -EOVERFLOW;
+	return credits;
+}
+
 /*
  * ntfs_delete - delete file or directory from ntfs volume
+ * @log_handle: caller-owned transaction handle, or NULL
  * @ni:         ntfs inode for object to delte
  * @dir_ni:     ntfs inode for directory in which delete object
  * @name:       unicode name of the object to delete
  * @name_len:   length of the name in unicode characters
  * @need_lock:  whether mrec lock is needed or not
+ * @link_count_zero_out: deferred deletion result for caller transaction
  *
  * Delete the specified name from the directory index @dir_ni and decrement
  * the link count of the target inode @ni.
  *
  * Return 0 on success and -errno on error.
  */
-static int ntfs_delete(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
-		__le16 *name, u8 name_len, bool need_lock)
+static int ntfs_delete(struct ntfs_log_handle *log_handle,
+		struct ntfs_inode *ni, struct ntfs_inode *dir_ni, __le16 *name,
+		u8 name_len, bool need_lock, bool *link_count_zero_out)
 {
 	struct ntfs_attr_search_ctx *actx = NULL;
 	struct file_name_attr *fn = NULL;
+	struct mft_record *ni_before = NULL, *dir_before = NULL;
+	struct mft_record *dir_mrec = NULL;
+	struct ntfs_index_size_snapshot dir_size_before;
 	bool looking_for_dos_name = false, looking_for_win32_name = false;
 	bool case_sensitive_match = true;
 	bool link_count_zero = false;
 	int err = 0;
 	struct mft_record *ni_mrec;
 	struct super_block *sb;
+	bool own_transaction = false;
+	bool external_transaction = log_handle != NULL;
+	unsigned int nlink_before = 0;
+	u16 next_link_count;
 
 	ntfs_debug("Entering.\n");
+	if (link_count_zero_out)
+		*link_count_zero_out = false;
+	if (external_transaction && (need_lock || !link_count_zero_out))
+		return -EINVAL;
+	if (need_lock && ni->vol->journal) {
+		int credits = ntfs_delete_transaction_credits(ni, dir_ni);
+
+		if (credits < 0)
+			return credits;
+		log_handle = ntfs_log_begin(ni->vol, credits);
+		if (IS_ERR(log_handle))
+			return PTR_ERR(log_handle);
+		own_transaction = true;
+	}
 
 	if (need_lock == true) {
 		mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
@@ -945,11 +1814,30 @@ static int ntfs_delete(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 	actx = ntfs_attr_get_search_ctx(ni, NULL);
 	if (!actx) {
 		ntfs_error(sb, "%s, Failed to get search context", __func__);
-		if (need_lock) {
-			mutex_unlock(&dir_ni->mrec_lock);
-			mutex_unlock(&ni->mrec_lock);
+		err = -ENOMEM;
+		goto err_out;
+	}
+	if (own_transaction) {
+		ni_mrec = actx->base_mrec ? actx->base_mrec : actx->mrec;
+		ni_before = kmemdup(ni_mrec, ni->vol->mft_record_size, GFP_NOFS);
+		if (!ni_before) {
+			err = -ENOMEM;
+			goto err_out;
 		}
-		return -ENOMEM;
+		dir_mrec = map_mft_record(dir_ni);
+		if (IS_ERR(dir_mrec)) {
+			err = PTR_ERR(dir_mrec);
+			dir_mrec = NULL;
+			goto err_out;
+		}
+		dir_before = kmemdup(dir_mrec, ni->vol->mft_record_size,
+				GFP_NOFS);
+		if (!dir_before) {
+			err = -ENOMEM;
+			goto err_out;
+		}
+		ntfs_index_size_snapshot(dir_ni, &dir_size_before);
+		nlink_before = VFS_I(ni)->i_nlink;
 	}
 search:
 	while ((err = ntfs_attr_lookup(AT_FILE_NAME, AT_UNNAMED, 0, CASE_SENSITIVE,
@@ -1021,25 +1909,49 @@ search:
 	if (err)
 		goto err_out;
 
-	err = ntfs_index_remove(dir_ni, fn, le32_to_cpu(actx->attr->data.resident.value_length));
-	if (err)
-		goto err_out;
-
-	err = ntfs_attr_record_rm(actx);
+	if (log_handle)
+		err = ntfs_index_remove_transacted(log_handle, dir_ni, fn,
+				le32_to_cpu(actx->attr->data.resident.value_length));
+	else
+		err = ntfs_index_remove(dir_ni, fn,
+				le32_to_cpu(actx->attr->data.resident.value_length));
 	if (err)
 		goto err_out;
 
 	ni_mrec = actx->base_mrec ? actx->base_mrec : actx->mrec;
-	ni_mrec->link_count = cpu_to_le16(le16_to_cpu(ni_mrec->link_count) - 1);
+	next_link_count = le16_to_cpu(ni_mrec->link_count) - 1;
+	if (log_handle)
+		err = ntfs_attr_record_rm_transacted(log_handle, actx);
+	else
+		err = ntfs_attr_record_rm(actx);
+	if (err)
+		goto err_out;
+
+	ni_mrec = actx->base_mrec ? actx->base_mrec : actx->mrec;
+	err = ntfs_mft_set_link_count(log_handle, ni, ni_mrec,
+			next_link_count);
+	if (err)
+		goto err_out;
 	if (!S_ISDIR(VFS_I(ni)->i_mode))
 		drop_nlink(VFS_I(ni));
 
-	mark_mft_record_dirty(ni);
 	if (looking_for_dos_name) {
 		looking_for_dos_name = false;
 		looking_for_win32_name = true;
 		ntfs_attr_reinit_search_ctx(actx);
 		goto search;
+	}
+	if (own_transaction) {
+		err = ntfs_log_commit(log_handle);
+		log_handle = NULL;
+		if (err)
+			goto err_out;
+		unmap_mft_record(dir_ni);
+		dir_mrec = NULL;
+		kfree(ni_before);
+		ni_before = NULL;
+		kfree(dir_before);
+		dir_before = NULL;
 	}
 
 	/*
@@ -1055,28 +1967,184 @@ search:
 	 * non-resident attributes and mark all MFT record as not in use.
 	 */
 	if (ni_mrec->link_count == 0) {
-		NInoSetBeingDeleted(ni);
-		ntfs_delete_reparse_index(ni);
-		ntfs_delete_object_id_index(ni);
 		link_count_zero = true;
+		if (!external_transaction)
+			NInoSetBeingDeleted(ni);
+		if (link_count_zero_out)
+			*link_count_zero_out = true;
 	}
 
 	ntfs_attr_put_search_ctx(actx);
 	if (need_lock == true) {
 		mutex_unlock(&dir_ni->mrec_lock);
 		mutex_unlock(&ni->mrec_lock);
-		if (link_count_zero)
-			ntfs_cleanup_deleted_inode(ni);
 	}
 
+	if (link_count_zero && !external_transaction) {
+		ntfs_delete_metadata_post_commit(ni);
+		if (need_lock)
+			ntfs_delete_attr_inodes_post_commit(ni);
+	}
 	ntfs_debug("Done.\n");
 	return 0;
 err_out:
-	ntfs_attr_put_search_ctx(actx);
+	if (ni_before && actx) {
+		ni_mrec = actx->base_mrec ? actx->base_mrec : actx->mrec;
+		memcpy(ni_mrec, ni_before, ni->vol->mft_record_size);
+		set_nlink(VFS_I(ni), nlink_before);
+		mark_mft_record_dirty(ni);
+	}
+	if (dir_before && dir_mrec) {
+		memcpy(dir_mrec, dir_before, ni->vol->mft_record_size);
+		ntfs_index_size_restore(dir_ni, &dir_size_before);
+		mark_mft_record_dirty(dir_ni);
+	}
+	if (own_transaction && log_handle) {
+		int abort_err = ntfs_log_abort(log_handle);
+
+		log_handle = NULL;
+		if (abort_err) {
+			ntfs_error(sb,
+				"Failed to abort unlink transaction (error %i).",
+				abort_err);
+			NVolSetErrors(ni->vol);
+			err = abort_err;
+		}
+	}
+	if (dir_mrec)
+		unmap_mft_record(dir_ni);
+	kfree(ni_before);
+	kfree(dir_before);
+	if (actx)
+		ntfs_attr_put_search_ctx(actx);
 	if (need_lock) {
 		mutex_unlock(&dir_ni->mrec_lock);
 		mutex_unlock(&ni->mrec_lock);
 	}
+	return err;
+}
+
+static int ntfs_delete_vfs(struct ntfs_inode *ni,
+		struct ntfs_inode *dir_ni, __le16 *name, u8 name_len)
+{
+	struct ntfs_log_handle *handle;
+	struct ntfs_mft_snapshot snapshots[2] = {};
+	struct ntfs_system_index_ctx reparse = {}, object_id = {};
+	unsigned int snapshot_count = 0;
+	bool link_count_zero = false;
+	bool system_index_locked = false;
+	bool retry = false;
+	bool had_reparse;
+	int abort_err;
+	int credits;
+	int err;
+
+	if (!ni->vol->journal)
+		return ntfs_delete(NULL, ni, dir_ni, name, name_len, true, NULL);
+retry:
+	mutex_lock(&ni->mrec_lock);
+	err = ntfs_has_system_index_entry(ni);
+	mutex_unlock(&ni->mrec_lock);
+	if (err < 0)
+		return err;
+	system_index_locked = err > 0;
+	credits = ntfs_delete_transaction_credits(ni, dir_ni);
+	if (credits < 0)
+		return credits;
+	handle = ntfs_log_begin(ni->vol, credits);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	if (system_index_locked) {
+		mutex_lock(&ni->vol->system_index_lock);
+		err = ntfs_prepare_system_index_removals(ni, &reparse,
+				&object_id);
+		if (err)
+			goto abort_unlocked;
+	}
+	mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
+	mutex_lock_nested(&dir_ni->mrec_lock, NTFS_INODE_MUTEX_PARENT);
+	if (!system_index_locked) {
+		err = ntfs_has_system_index_entry(ni);
+		if (err > 0) {
+			retry = true;
+			err = -EAGAIN;
+		}
+		if (err)
+			goto rollback;
+	}
+	had_reparse = ni->flags & FILE_ATTR_REPARSE_POINT;
+	err = ntfs_mft_snapshot_take(snapshots, &snapshot_count,
+			ARRAY_SIZE(snapshots), ni, false);
+	if (!err)
+		err = ntfs_mft_snapshot_take(snapshots, &snapshot_count,
+				ARRAY_SIZE(snapshots), dir_ni, true);
+	if (!err)
+		err = ntfs_delete(handle, ni, dir_ni, name, name_len, false,
+				&link_count_zero);
+	if (!err && link_count_zero && system_index_locked) {
+		err = ntfs_delete_reparse_index_transacted(handle, ni, &reparse);
+		if (!err)
+			err = ntfs_delete_object_id_index_transacted(handle, ni,
+					&object_id);
+	}
+	if (err)
+		goto rollback;
+	err = ntfs_log_commit(handle);
+	handle = NULL;
+	if (err)
+		goto rollback;
+	ntfs_mft_snapshots_release(snapshots, snapshot_count);
+	snapshot_count = 0;
+	if (link_count_zero) {
+		NInoSetBeingDeleted(ni);
+		if (had_reparse) {
+			ni->flags &= ~FILE_ATTR_REPARSE_POINT;
+			NInoSetFileNameDirty(ni);
+			mark_mft_record_dirty(ni);
+		}
+	}
+	mutex_unlock(&dir_ni->mrec_lock);
+	mutex_unlock(&ni->mrec_lock);
+	if (system_index_locked)
+		mutex_unlock(&ni->vol->system_index_lock);
+	ntfs_system_index_ctx_put(&object_id);
+	ntfs_system_index_ctx_put(&reparse);
+	if (link_count_zero)
+		ntfs_delete_attr_inodes_post_commit(ni);
+	return 0;
+
+rollback:
+	if (snapshot_count)
+		ntfs_mft_snapshots_restore(snapshots, snapshot_count);
+	if (handle) {
+		abort_err = ntfs_log_abort(handle);
+		if (abort_err) {
+			err = abort_err;
+			retry = false;
+		}
+	}
+	ntfs_mft_snapshots_release(snapshots, snapshot_count);
+	mutex_unlock(&dir_ni->mrec_lock);
+	mutex_unlock(&ni->mrec_lock);
+	if (system_index_locked)
+		mutex_unlock(&ni->vol->system_index_lock);
+	ntfs_system_index_ctx_put(&object_id);
+	ntfs_system_index_ctx_put(&reparse);
+	if (retry) {
+		retry = false;
+		snapshot_count = 0;
+		link_count_zero = false;
+		goto retry;
+	}
+	return err;
+
+abort_unlocked:
+	abort_err = ntfs_log_abort(handle);
+	if (abort_err)
+		err = abort_err;
+	mutex_unlock(&ni->vol->system_index_lock);
+	ntfs_system_index_ctx_put(&object_id);
+	ntfs_system_index_ctx_put(&reparse);
 	return err;
 }
 
@@ -1114,7 +2182,7 @@ static int ntfs_unlink(struct inode *dir, struct dentry *dentry)
 
 	ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
 
-	err = ntfs_delete(ni, NTFS_I(dir), uname, uname_len, true);
+	err = ntfs_delete_vfs(ni, NTFS_I(dir), uname, uname_len);
 	if (err)
 		goto out;
 
@@ -1207,7 +2275,7 @@ static int ntfs_rmdir(struct inode *dir, struct dentry *dentry)
 
 	ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
 
-	err = ntfs_delete(ni, NTFS_I(dir), uname, uname_len, true);
+	err = ntfs_delete_vfs(ni, NTFS_I(dir), uname, uname_len);
 	if (err)
 		goto out;
 
@@ -1219,6 +2287,8 @@ out:
 
 /*
  * __ntfs_link - create hard link for file or directory
+ * @log_handle:	reserved transaction handle, or NULL
+ * @finish_transaction: commit or abort @log_handle in this helper
  * @ni:		ntfs inode for object to create hard link
  * @dir_ni:	ntfs inode for directory in which new link should be placed
  * @name:	unicode name of the new link
@@ -1229,21 +2299,27 @@ out:
  *
  * Return 0 on success and -errno on error.
  */
-static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
-		__le16 *name, u8 name_len)
+static int __ntfs_link(struct ntfs_log_handle *log_handle,
+		struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
+		__le16 *name, u8 name_len, bool finish_transaction)
 {
 	struct super_block *sb;
 	struct inode *vi = VFS_I(ni);
 	struct file_name_attr *fn = NULL;
+	struct mft_record *ni_before = NULL, *dir_before = NULL;
+	struct ntfs_index_size_snapshot dir_size_before;
+	unsigned int nlink_before = 0;
 	int fn_len, err = 0;
 	struct mft_record *dir_mrec = NULL, *ni_mrec = NULL;
+	u16 next_link_count;
 
 	ntfs_debug("Entering.\n");
 
 	sb = dir_ni->vol->sb;
-	if (NInoBeingDeleted(dir_ni) || NInoBeingDeleted(ni))
-		return -ENOENT;
-
+	if (NInoBeingDeleted(dir_ni) || NInoBeingDeleted(ni)) {
+		err = -ENOENT;
+		goto err_out;
+	}
 	ni_mrec = map_mft_record(ni);
 	if (IS_ERR(ni_mrec)) {
 		err = -EIO;
@@ -1254,6 +2330,7 @@ static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 		err = -ENOENT;
 		goto err_out;
 	}
+	next_link_count = le16_to_cpu(ni_mrec->link_count) + 1;
 
 	/* Create FILE_NAME attribute. */
 	fn_len = sizeof(struct file_name_attr) + name_len * sizeof(__le16);
@@ -1267,12 +2344,12 @@ static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 	dir_mrec = map_mft_record(dir_ni);
 	if (IS_ERR(dir_mrec)) {
 		err = -EIO;
+		dir_mrec = NULL;
 		goto err_out;
 	}
 
 	fn->parent_directory = MK_LE_MREF(dir_ni->mft_no,
 			le16_to_cpu(dir_mrec->sequence_number));
-	unmap_mft_record(dir_ni);
 	fn->file_name_length = name_len;
 	fn->file_name_type = FILE_NAME_POSIX;
 	fn->file_attributes = ni->flags;
@@ -1285,7 +2362,7 @@ static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 				cpu_to_le64(ni->itype.compressed.size);
 		else
 			fn->allocated_size = cpu_to_le64(ni->allocated_size);
-		fn->data_size = cpu_to_le64(ni->data_size);
+		fn->data_size = cpu_to_le64(ntfs_inode_recorded_data_size(ni));
 	}
 	if (NVolHideDotFiles(dir_ni->vol) && name_len > 0 && name[0] == cpu_to_le16('.'))
 		fn->file_attributes |= FILE_ATTR_HIDDEN;
@@ -1295,6 +2372,50 @@ static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 	fn->last_mft_change_time = utc2ntfs(inode_get_ctime(vi));
 	fn->last_access_time = utc2ntfs(inode_get_atime(vi));
 	memcpy(fn->file_name, name, name_len * sizeof(__le16));
+	if (log_handle && finish_transaction) {
+		ni_before = kmemdup(ni_mrec, ni->vol->mft_record_size, GFP_NOFS);
+		if (!ni_before) {
+			err = -ENOMEM;
+			goto err_out;
+		}
+		dir_before = kmemdup(dir_mrec, ni->vol->mft_record_size,
+				GFP_NOFS);
+		if (!dir_before) {
+			err = -ENOMEM;
+			goto err_out;
+		}
+		ntfs_index_size_snapshot(dir_ni, &dir_size_before);
+		nlink_before = vi->i_nlink;
+	}
+	if (log_handle) {
+		err = ntfs_attr_add_transacted(log_handle, ni, AT_FILE_NAME,
+				AT_UNNAMED, 0, (u8 *)fn, fn_len);
+		if (err) {
+			ntfs_error(sb, "Failed to add FILE_NAME attribute.\n");
+			goto err_out;
+		}
+		err = ntfs_mft_set_link_count(log_handle, ni, ni_mrec,
+				next_link_count);
+		if (err)
+			goto err_out;
+		if (!S_ISDIR(vi->i_mode))
+			inc_nlink(vi);
+
+		err = ntfs_index_add_filename_transacted(log_handle, dir_ni, fn,
+				MK_MREF(ni->mft_no,
+					le16_to_cpu(ni_mrec->sequence_number)));
+		if (err) {
+			ntfs_error(sb, "Failed to add filename to the index");
+			goto err_out;
+		}
+		if (finish_transaction) {
+			err = ntfs_log_commit(log_handle);
+			log_handle = NULL;
+			if (err)
+				goto err_out;
+		}
+		goto done;
+	}
 
 	/* Add FILE_NAME attribute to index. */
 	err = ntfs_index_add_filename(dir_ni, fn, MK_MREF(ni->mft_no,
@@ -1319,7 +2440,11 @@ static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 
 	/* Done! */
 	mark_mft_record_dirty(ni);
+done:
 	kfree(fn);
+	kfree(ni_before);
+	kfree(dir_before);
+	unmap_mft_record(dir_ni);
 	unmap_mft_record(ni);
 
 	ntfs_debug("Done.\n");
@@ -1328,7 +2453,33 @@ static int __ntfs_link(struct ntfs_inode *ni, struct ntfs_inode *dir_ni,
 rollback_failed:
 	ntfs_error(sb, "Rollback failed. Leaving inconsistent metadata.\n");
 err_out:
+	if (ni_before && ni_mrec) {
+		memcpy(ni_mrec, ni_before, ni->vol->mft_record_size);
+		set_nlink(vi, nlink_before);
+		mark_mft_record_dirty(ni);
+	}
+	if (dir_before && dir_mrec) {
+		memcpy(dir_mrec, dir_before, ni->vol->mft_record_size);
+		ntfs_index_size_restore(dir_ni, &dir_size_before);
+		mark_mft_record_dirty(dir_ni);
+	}
+	if (log_handle && finish_transaction) {
+		int abort_err = ntfs_log_abort(log_handle);
+
+		log_handle = NULL;
+		if (abort_err) {
+			ntfs_error(sb,
+				"Failed to abort hard-link transaction (error %i).",
+				abort_err);
+			NVolSetErrors(ni->vol);
+			err = abort_err;
+		}
+	}
 	kfree(fn);
+	kfree(ni_before);
+	kfree(dir_before);
+	if (dir_mrec)
+		unmap_mft_record(dir_ni);
 	if (!IS_ERR_OR_NULL(ni_mrec))
 		unmap_mft_record(ni);
 	return err;
@@ -1339,8 +2490,13 @@ static int ntfs_rename(const struct mnt_idmap *idmap, struct inode *old_dir,
 		struct dentry *new_dentry, unsigned int flags)
 {
 	struct inode *old_inode, *new_inode = NULL;
+	struct ntfs_log_handle *log_handle = NULL;
+	struct ntfs_mft_snapshot snapshots[4] = {};
+	struct ntfs_system_index_ctx reparse = {}, object_id = {};
+	unsigned int snapshot_count = 0;
 	int err = 0;
 	int is_dir;
+	int has_system_index = 0;
 	struct super_block *sb = old_dir->i_sb;
 	__le16 *uname_new = NULL;
 	__le16 *uname_old = NULL;
@@ -1350,6 +2506,11 @@ static int ntfs_rename(const struct mnt_idmap *idmap, struct inode *old_dir,
 	struct ntfs_inode *old_ni, *new_ni = NULL;
 	struct ntfs_inode *old_dir_ni = NTFS_I(old_dir), *new_dir_ni = NTFS_I(new_dir);
 	bool new_dir_first = false;
+	bool new_link_count_zero = false, old_link_count_zero = false;
+	bool delete_new_attrs = false, delete_old_attrs = false;
+	bool new_had_reparse = false;
+	bool system_index_locked = false;
+	bool retry = false;
 
 	if (NVolShutdown(old_dir_ni->vol))
 		return -EIO;
@@ -1399,6 +2560,83 @@ static int ntfs_rename(const struct mnt_idmap *idmap, struct inode *old_dir,
 					  old_dentry->d_parent);
 
 	ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+retry_transaction:
+	has_system_index = 0;
+	if (vol->journal && new_ni && new_ni != old_ni) {
+		mutex_lock(&new_ni->mrec_lock);
+		has_system_index = ntfs_has_system_index_entry(new_ni);
+		mutex_unlock(&new_ni->mrec_lock);
+		if (has_system_index < 0) {
+			err = has_system_index;
+			goto out;
+		}
+	}
+	if (vol->journal) {
+		unsigned int entries = new_inode ? 5 : 3;
+		unsigned int directory_entries = 0;
+		int credits;
+		int extra_credits;
+
+		credits = ntfs_filename_log_credits(vol, NTFS_MAX_NAME_LEN,
+				entries, true);
+		if (credits < 0) {
+			err = credits;
+			goto out;
+		}
+		if (NInoAttrList(old_ni)) {
+			extra_credits = ntfs_filename_attrlist_extra_credits(vol, 3);
+			if (extra_credits < 0 || check_add_overflow(credits,
+					extra_credits, &credits)) {
+				err = extra_credits < 0 ? extra_credits : -EOVERFLOW;
+				goto out;
+			}
+		}
+		if (new_inode && NInoAttrList(NTFS_I(new_inode))) {
+			extra_credits = ntfs_filename_attrlist_extra_credits(vol, 2);
+			if (extra_credits < 0 || check_add_overflow(credits,
+					extra_credits, &credits)) {
+				err = extra_credits < 0 ? extra_credits : -EOVERFLOW;
+				goto out;
+			}
+		}
+		if (NInoAttrList(old_dir_ni))
+			directory_entries++;
+		if (NInoAttrList(new_dir_ni))
+			directory_entries += new_inode ? 2 : 1;
+		if (directory_entries) {
+			extra_credits = ntfs_index_attrlist_log_credits(vol,
+					directory_entries);
+			if (extra_credits < 0 || check_add_overflow(credits,
+					extra_credits, &credits)) {
+				err = extra_credits < 0 ? extra_credits : -EOVERFLOW;
+				goto out;
+			}
+		}
+		if (new_inode && NTFS_I(new_inode) != old_ni) {
+			extra_credits = ntfs_system_index_remove_log_credits(
+					NTFS_I(new_inode));
+			if (extra_credits < 0 || check_add_overflow(credits,
+					extra_credits, &credits)) {
+				err = extra_credits < 0 ? extra_credits :
+					-EOVERFLOW;
+				goto out;
+			}
+		}
+		log_handle = ntfs_log_begin(vol, credits);
+		if (IS_ERR(log_handle)) {
+			err = PTR_ERR(log_handle);
+			log_handle = NULL;
+			goto out;
+		}
+		if (has_system_index) {
+			mutex_lock(&vol->system_index_lock);
+			system_index_locked = true;
+			err = ntfs_prepare_system_index_removals(new_ni, &reparse,
+					&object_id);
+			if (err)
+				goto abort_before_inode_locks;
+		}
+	}
 
 	mutex_lock_nested(&old_ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
 	if (new_ni)
@@ -1418,8 +2656,20 @@ static int ntfs_rename(const struct mnt_idmap *idmap, struct inode *old_dir,
 	    (new_ni && NInoBeingDeleted(new_ni)) ||
 	    (old_dir != new_dir && NInoBeingDeleted(new_dir_ni))) {
 		err = -ENOENT;
-		goto err_out;
+		goto rollback;
 	}
+	if (log_handle && new_ni && new_ni != old_ni &&
+	    !system_index_locked) {
+		err = ntfs_has_system_index_entry(new_ni);
+		if (err > 0) {
+			retry = true;
+			err = -EAGAIN;
+		}
+		if (err)
+			goto rollback;
+	}
+	if (new_ni)
+		new_had_reparse = new_ni->flags & FILE_ATTR_REPARSE_POINT;
 
 	is_dir = S_ISDIR(old_inode->i_mode);
 
@@ -1430,34 +2680,96 @@ static int ntfs_rename(const struct mnt_idmap *idmap, struct inode *old_dir,
 			ni_mrec = map_mft_record(NTFS_I(new_inode));
 			if (IS_ERR(ni_mrec)) {
 				err = -EIO;
-				goto err_out;
+				goto rollback;
 			}
 			err = ntfs_check_empty_dir(NTFS_I(new_inode), ni_mrec);
 			unmap_mft_record(NTFS_I(new_inode));
 			if (err)
-				goto err_out;
+				goto rollback;
 		}
-
-		err = ntfs_delete(new_ni, new_dir_ni, uname_new, new_name_len, false);
+	}
+	if (NInoBeingDeleted(old_ni) || NInoBeingDeleted(old_dir_ni)) {
+		err = -ENOENT;
+		goto rollback;
+	}
+	if (log_handle) {
+		err = ntfs_mft_snapshot_take(snapshots, &snapshot_count,
+				ARRAY_SIZE(snapshots), old_ni, false);
 		if (err)
-			goto err_out;
+			goto rollback;
+		err = ntfs_mft_snapshot_take(snapshots, &snapshot_count,
+				ARRAY_SIZE(snapshots), old_dir_ni, true);
+		if (err)
+			goto rollback;
+		err = ntfs_mft_snapshot_take(snapshots, &snapshot_count,
+				ARRAY_SIZE(snapshots), new_dir_ni, true);
+		if (err)
+			goto rollback;
+		if (new_ni) {
+			err = ntfs_mft_snapshot_take(snapshots, &snapshot_count,
+					ARRAY_SIZE(snapshots), new_ni, false);
+			if (err)
+				goto rollback;
+		}
 	}
 
-	err = __ntfs_link(old_ni, new_dir_ni, uname_new, new_name_len);
-	if (err)
-		goto err_out;
+	if (new_inode) {
+		err = ntfs_delete(log_handle, new_ni, new_dir_ni, uname_new,
+				new_name_len, false, &new_link_count_zero);
+		if (err)
+			goto rollback;
+	}
 
-	err = ntfs_delete(old_ni, old_dir_ni, uname_old, old_name_len, false);
+	err = __ntfs_link(log_handle, old_ni, new_dir_ni, uname_new,
+			new_name_len, false);
+	if (err)
+		goto rollback;
+
+	err = ntfs_delete(log_handle, old_ni, old_dir_ni, uname_old,
+			old_name_len, false, &old_link_count_zero);
 	if (err) {
 		int err2;
 
 		ntfs_error(sb, "Failed to delete old ntfs inode(%llu) in old dir, err : %d\n",
 				old_ni->mft_no, err);
-		err2 = ntfs_delete(old_ni, new_dir_ni, uname_new, new_name_len, false);
+		if (log_handle)
+			goto rollback;
+		err2 = ntfs_delete(NULL, old_ni, new_dir_ni, uname_new,
+				new_name_len, false, NULL);
 		if (err2)
 			ntfs_error(sb, "Failed to delete old ntfs inode in new dir, err : %d\n",
 					err2);
 		goto err_out;
+	}
+	if (log_handle) {
+		if (new_link_count_zero && new_ni != old_ni &&
+		    system_index_locked) {
+			err = ntfs_delete_reparse_index_transacted(log_handle,
+					new_ni, &reparse);
+			if (!err)
+				err = ntfs_delete_object_id_index_transacted(
+						log_handle, new_ni, &object_id);
+			if (err)
+				goto rollback;
+		}
+		err = ntfs_log_commit(log_handle);
+		log_handle = NULL;
+		if (err)
+			goto rollback;
+		ntfs_mft_snapshots_release(snapshots, snapshot_count);
+		snapshot_count = 0;
+		if (new_link_count_zero)
+			delete_new_attrs = true;
+		if (old_link_count_zero)
+			delete_old_attrs = true;
+		if (new_link_count_zero && new_ni != old_ni) {
+			NInoSetBeingDeleted(new_ni);
+			if (new_had_reparse) {
+				new_ni->flags &= ~FILE_ATTR_REPARSE_POINT;
+				NInoSetFileNameDirty(new_ni);
+				mark_mft_record_dirty(new_ni);
+			}
+		}
 	}
 
 	simple_rename_timestamp(old_dir, old_dentry, new_dir, new_dentry);
@@ -1470,6 +2782,28 @@ static int ntfs_rename(const struct mnt_idmap *idmap, struct inode *old_dir,
 
 	inode_inc_iversion(new_dir);
 
+	ntfs_mft_snapshots_release(snapshots, snapshot_count);
+	snapshot_count = 0;
+	goto err_out;
+
+rollback:
+	if (snapshot_count)
+		ntfs_mft_snapshots_restore(snapshots, snapshot_count);
+	if (log_handle) {
+		int abort_err = ntfs_log_abort(log_handle);
+
+		log_handle = NULL;
+		if (abort_err) {
+			ntfs_error(sb,
+				"Failed to abort rename transaction (error %i).",
+				abort_err);
+			NVolSetErrors(vol);
+			err = abort_err;
+			retry = false;
+		}
+	}
+	ntfs_mft_snapshots_release(snapshots, snapshot_count);
+	snapshot_count = 0;
 err_out:
 	if (old_dir == new_dir) {
 		mutex_unlock(&old_dir_ni->mrec_lock);
@@ -1483,8 +2817,48 @@ err_out:
 	if (new_ni)
 		mutex_unlock(&new_ni->mrec_lock);
 	mutex_unlock(&old_ni->mrec_lock);
+	if (system_index_locked) {
+		mutex_unlock(&vol->system_index_lock);
+		system_index_locked = false;
+	}
+	ntfs_system_index_ctx_put(&object_id);
+	ntfs_system_index_ctx_put(&reparse);
+	if (retry) {
+		retry = false;
+		goto retry_transaction;
+	}
+	if (delete_new_attrs) {
+		if (new_ni == old_ni)
+			ntfs_delete_metadata_post_commit(new_ni);
+		ntfs_delete_attr_inodes_post_commit(new_ni);
+	}
+	if (delete_old_attrs) {
+		ntfs_delete_metadata_post_commit(old_ni);
+		ntfs_delete_attr_inodes_post_commit(old_ni);
+	}
 	if (new_ni)
 		ntfs_cleanup_deleted_inode(new_ni);
+	if (old_link_count_zero)
+		ntfs_cleanup_deleted_inode(old_ni);
+	goto out;
+
+abort_before_inode_locks:
+	{
+		int abort_err = ntfs_log_abort(log_handle);
+
+		log_handle = NULL;
+		if (abort_err) {
+			ntfs_error(sb,
+				"Failed to abort rename transaction (error %i).",
+				abort_err);
+			NVolSetErrors(vol);
+			err = abort_err;
+		}
+	}
+	mutex_unlock(&vol->system_index_lock);
+	ntfs_system_index_ctx_put(&object_id);
+	ntfs_system_index_ctx_put(&reparse);
+out:
 	if (uname_new)
 		kmem_cache_free(ntfs_name_cache, uname_new);
 	if (uname_old)
@@ -1608,6 +2982,7 @@ static int ntfs_link(struct dentry *old_dentry, struct inode *dir,
 	__le16 *uname = NULL;
 	int uname_len;
 	int err;
+	struct ntfs_log_handle *log_handle = NULL;
 	struct ntfs_inode *ni = NTFS_I(vi), *dir_ni = NTFS_I(dir);
 
 	if (NVolShutdown(vol))
@@ -1629,11 +3004,49 @@ static int ntfs_link(struct dentry *old_dentry, struct inode *dir,
 	}
 
 	ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+	if (vol->journal) {
+		int credits;
+		int extra_credits;
+
+		credits = ntfs_filename_log_credits(vol, uname_len, 1, false);
+		if (credits < 0) {
+			err = credits;
+			goto out;
+		}
+		if (NInoAttrList(ni)) {
+			extra_credits = ntfs_filename_attrlist_extra_credits(vol, 1);
+			if (extra_credits < 0) {
+				err = extra_credits;
+				goto out;
+			}
+			if (check_add_overflow(credits, extra_credits, &credits)) {
+				err = -EOVERFLOW;
+				goto out;
+			}
+		}
+		if (NInoAttrList(dir_ni)) {
+			extra_credits = ntfs_index_attrlist_log_credits(vol, 1);
+			if (extra_credits < 0) {
+				err = extra_credits;
+				goto out;
+			}
+			if (check_add_overflow(credits, extra_credits, &credits)) {
+				err = -EOVERFLOW;
+				goto out;
+			}
+		}
+		log_handle = ntfs_log_begin(vol, credits);
+		if (IS_ERR(log_handle)) {
+			err = PTR_ERR(log_handle);
+			goto out;
+		}
+	}
 
 	ihold(vi);
 	mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
 	mutex_lock_nested(&dir_ni->mrec_lock, NTFS_INODE_MUTEX_PARENT);
-	err = __ntfs_link(NTFS_I(vi), NTFS_I(dir), uname, uname_len);
+	err = __ntfs_link(log_handle, NTFS_I(vi), NTFS_I(dir), uname,
+			uname_len, true);
 	if (err) {
 		mutex_unlock(&dir_ni->mrec_lock);
 		mutex_unlock(&ni->mrec_lock);

@@ -25,6 +25,11 @@ int ntfs_ea_set_wsl_inode(struct inode *inode, dev_t rdev, __le16 *ea_size,
 		unsigned int flags);
 int ntfs_ea_get_linuxflags(struct inode *inode);
 int ntfs_ea_set_linuxflags(struct inode *inode, u32 linuxflags);
+int ntfs_ea_set_wsl_inode_journaled(struct inode *inode, dev_t rdev,
+		__le16 *ea_size, unsigned int flags);
+int ntfs_ea_add_wsl_transacted(struct ntfs_log_handle *handle,
+		struct inode *inode, dev_t rdev, __le16 *ea_size,
+		unsigned int flags);
 ssize_t ntfs_listxattr(struct dentry *dentry, char *buffer, size_t size);
 
 #ifdef CONFIG_NTFS_FS_POSIX_ACL
@@ -32,8 +37,11 @@ struct posix_acl *ntfs_get_acl(const struct mnt_idmap *idmap, struct dentry *den
 			       int type);
 int ntfs_set_acl(const struct mnt_idmap *idmap, struct dentry *dentry,
 		 struct posix_acl *acl, int type);
-int ntfs_init_acl(const struct mnt_idmap *idmap, struct inode *inode,
-		  struct inode *dir);
+int ntfs_acl_create_log_credits(struct ntfs_volume *vol,
+		const struct posix_acl *default_acl, const struct posix_acl *acl);
+int ntfs_init_acl(struct ntfs_log_handle *handle, struct inode *inode,
+		struct posix_acl *default_acl, struct posix_acl *acl,
+		__le16 *ea_size);
 #else
 #define ntfs_get_acl NULL
 #define ntfs_set_acl NULL

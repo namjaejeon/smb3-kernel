@@ -3453,8 +3453,7 @@ static int ntfs_reclaim_unlinked_inode_attributes(struct ntfs_inode *ni)
 			return err;
 	}
 
-	/* Deleted-attribute reclaim is added with namespace integration. */
-	return -EOPNOTSUPP;
+	return ntfs_reclaim_deleted_attributes(ni, true);
 }
 
 static int ntfs_recover_unlinked_inode(struct ntfs_volume *vol, u64 mft_no,

@@ -13,6 +13,7 @@
 #include "dir.h"
 #include "mft.h"
 #include "ntfs.h"
+#include "logfile.h"
 #include "index.h"
 #include "reparse.h"
 
@@ -1178,7 +1179,7 @@ static int ntfs_dir_fsync(struct file *filp, loff_t start, loff_t end,
 	mutex_unlock(&ni->mrec_lock);
 	ntfs_attr_put_search_ctx(ctx);
 
-	err = file_write_and_wait_range(filp, start, end);
+	err = ntfs_fsync_write_and_wait_range(filp, start, end);
 	if (err)
 		return err;
 	inode_lock(vi);
@@ -1198,14 +1199,19 @@ static int ntfs_dir_fsync(struct file *filp, loff_t start, loff_t end,
 	write_inode_now(vi, !datasync);
 
 	write_inode_now(vol->mftbmp_ino, 1);
-	down_write(&vol->lcnbmp_lock);
-	write_inode_now(vol->lcnbmp_ino, 1);
-	up_write(&vol->lcnbmp_lock);
+	/* Journaled allocation updates are covered by the log flush below. */
+	if (!vol->journal) {
+		down_write(&vol->lcnbmp_lock);
+		write_inode_now(vol->lcnbmp_ino, 1);
+		up_write(&vol->lcnbmp_lock);
+	}
 	write_inode_now(vol->mft_ino, 1);
 
 	err = sync_blockdev(vi->i_sb->s_bdev);
 	if (unlikely(err && !ret))
 		ret = err;
+	if (!ret)
+		ret = ntfs_log_flush(vol);
 	if (!ret)
 		ret = blkdev_issue_flush(vi->i_sb->s_bdev);
 	if (likely(!ret))
