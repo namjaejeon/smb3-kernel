@@ -2826,19 +2826,6 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 	return __get_nr_free_clusters(vol, false);
 }
 
-s64 ntfs_available_clusters_count(struct ntfs_volume *vol, s64 nr_clusters)
-{
-	s64 free_clusters;
-
-	if (!NVolFreeClusterKnown(vol))
-		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
-	free_clusters = atomic64_read(&vol->free_clusters) -
-		atomic64_read(&vol->dirty_clusters);
-	if (free_clusters <= 0)
-		return -ENOSPC;
-	return min(free_clusters, nr_clusters);
-}
-
 /*
  * @nr_clusters is the number of clusters requested for allocation.
  *

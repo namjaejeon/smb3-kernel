@@ -11,6 +11,7 @@
 #include <linux/writeback.h>
 
 #include "attrib.h"
+#include "logfile.h"
 #include "mft.h"
 #include "ntfs.h"
 #include "debug.h"
@@ -256,19 +257,75 @@ static int ntfs_writepages(struct address_space *mapping,
 {
 	struct inode *inode = mapping->host;
 	struct ntfs_inode *ni = NTFS_I(inode);
-	struct iomap_writepage_ctx wpc = {
-		.inode		= mapping->host,
-		.wbc		= wbc,
-		.ops		= &ntfs_writeback_ops,
+	struct ntfs_writepage_ctx ntfs_wpc = {
+		.wpc = {
+			.inode	= mapping->host,
+			.wbc	= wbc,
+			.ops	= &ntfs_writeback_ops,
+		},
 	};
+	struct iomap_writepage_ctx *wpc = &ntfs_wpc.wpc;
+	bool deferred = false;
 	bool need_iput = false;
+	bool bitmap_locked = false;
+	bool metadata_deferred = false;
+	bool journal_metadata = NInoAttr(ni) || inode == ni->vol->lcnbmp_ino;
+	bool ordered_wb_user = false;
 	int ret;
 
 	if (NVolShutdown(ni->vol))
 		return -EIO;
 
-	if (!NInoNonResident(ni))
-		return 0;
+	if (ni->vol->journal) {
+		while (!ntfs_ordered_writeback_enter(ni, &ntfs_wpc.ordered)) {
+			if (wbc->sync_mode != WB_SYNC_ALL)
+				return 0;
+			/* The owner has already acquired its journal transaction. */
+			wait_event(ni->ordered_wait,
+					!READ_ONCE(ni->ordered_active));
+			if (NVolShutdown(ni->vol))
+				return -EIO;
+		}
+		ordered_wb_user = true;
+	}
+
+	if (!NInoNonResident(ni)) {
+		ret = 0;
+		goto out_bitmap;
+	}
+
+	/*
+	 * $Bitmap is a base inode, not an attribute inode.  Serialize its
+	 * writeback with allocation so the WAL check covers the submitted bits.
+	 * Avoid waiting here: a caller may already hold the bitmap lock.
+	 */
+	if (inode == ni->vol->lcnbmp_ino && ni->vol->journal) {
+		if (!down_read_trylock(&ni->vol->lcnbmp_lock)) {
+			metadata_deferred = true;
+			ret = wbc->sync_mode == WB_SYNC_ALL ? -EAGAIN : 0;
+			goto out_bitmap;
+		}
+		bitmap_locked = true;
+	}
+
+	/*
+	 * Journaled metadata streams stay dirty until their WAL batch commits.
+	 * Do this before iomap starts clearing folio dirty ranges: returning from
+	 * inside ->map_blocks would otherwise lose the deferred dirty state.
+	 * Ordinary file data is allowed to reach disk before metadata commit, as
+	 * required by ordered-data semantics.
+	 */
+	if (journal_metadata) {
+		int err = ntfs_log_writeback_inode(inode,
+				wbc->sync_mode == WB_SYNC_ALL);
+
+		if (err) {
+			metadata_deferred = err == -EAGAIN;
+			ret = err == -EAGAIN && wbc->sync_mode == WB_SYNC_NONE ?
+				0 : err;
+			goto out_bitmap;
+		}
+	}
 
 	/*
 	 * EFS-encrypted files are not supported.
@@ -276,7 +333,8 @@ static int ntfs_writepages(struct address_space *mapping,
 	 */
 	if (NInoEncrypted(ni)) {
 		ntfs_debug("Encrypted I/O not supported");
-		return -EOPNOTSUPP;
+		ret = -EOPNOTSUPP;
+		goto out_bitmap;
 	}
 
 	/*
@@ -287,11 +345,70 @@ static int ntfs_writepages(struct address_space *mapping,
 	    igrab(inode))
 		need_iput = true;
 
-	ret = iomap_writepages(&wpc);
+	if (ni->vol->journal) {
+		struct folio *folio = NULL;
+		int error = 0;
+		int first_error = 0;
 
+		while ((folio = writeback_iter(mapping, wbc, folio, &error))) {
+			/* A metadata writer may have advanced the WAL since entry. */
+			error = journal_metadata ?
+				ntfs_log_writeback_inode(inode, false) : 0;
+			if (!error)
+				error = ntfs_writeback_prepare_folio(inode, folio);
+			if (error) {
+				folio_redirty_for_writepage(wbc, folio);
+				iomap_dirty_folio(mapping, folio);
+				if (error == -EAGAIN) {
+					deferred = true;
+					metadata_deferred = journal_metadata;
+				}
+			} else {
+				error = iomap_writeback_folio(wpc, folio);
+				if (error == -EAGAIN) {
+					folio_redirty_for_writepage(wbc, folio);
+					iomap_dirty_folio(mapping, folio);
+					deferred = true;
+					metadata_deferred = journal_metadata;
+				}
+			}
+			if (error && error != -EAGAIN && !first_error)
+				first_error = error;
+			folio_unlock(folio);
+		}
+		if (wpc->wb_ctx) {
+			int submit_err = wpc->ops->writeback_submit(wpc,
+					first_error ? first_error : 0);
+
+			if (submit_err && !first_error)
+				first_error = submit_err;
+		}
+		ret = first_error ? first_error :
+			(deferred && wbc->sync_mode == WB_SYNC_ALL ? -EAGAIN : error);
+		if (deferred && ret == -EAGAIN && wbc->sync_mode == WB_SYNC_NONE)
+			ret = 0;
+	} else {
+		ret = iomap_writepages(wpc);
+	}
+	if (ret && (ret != -EAGAIN || !deferred))
+		ntfs_error(inode->i_sb,
+			"%s: writeback returned %d for inode %llu.",
+			__func__, ret, (unsigned long long)ni->mft_no);
+
+out_bitmap:
+	if (ordered_wb_user)
+		ntfs_ordered_writeback_exit(ni);
+	if (bitmap_locked)
+		up_read(&ni->vol->lcnbmp_lock);
+	if (ret && journal_metadata && ni->vol->journal) {
+		metadata_deferred = true;
+		if (ret != -EAGAIN && ret != -ENOMEM)
+			NVolSetErrors(ni->vol);
+	}
+	if (metadata_deferred)
+		ntfs_log_inode_writeback_deferred(ni->vol);
 	if (need_iput)
 		iput(inode);
-
 	return ret;
 }
 
