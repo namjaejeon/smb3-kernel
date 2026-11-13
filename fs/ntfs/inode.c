@@ -4977,7 +4977,8 @@ static int __ntfs_inode_sync_filename(struct ntfs_log_handle *parent,
 		fnx->last_access_time = fn->last_access_time;
 		if (handle) {
 			if (memcmp(ictx->entry, new_ie, entry_len)) {
-				err = -EOPNOTSUPP;
+				err = ntfs_index_entry_update_transacted(handle, ictx,
+						new_ie);
 				if (err)
 					goto out_link;
 			}

@@ -13,6 +13,8 @@
 #include "attrib.h"
 #include "mft.h"
 
+struct ntfs_log_handle;
+
 #define  VCN_INDEX_ROOT_PARENT  ((s64)-2)
 
 #define MAX_PARENT_VCN	32
@@ -89,6 +91,16 @@ struct ntfs_index_context {
 	bool sync_write;
 };
 
+struct ntfs_system_index_ctx {
+	struct inode *attr;
+	struct ntfs_index_context *index;
+};
+
+enum ntfs_system_index {
+	NTFS_SYSTEM_INDEX_REPARSE,
+	NTFS_SYSTEM_INDEX_OBJECT_ID,
+};
+
 int ntfs_index_root_inconsistent(struct ntfs_volume *vol,
 				 const struct attr_record *a,
 				 const struct index_root *ir, u64 inum);
@@ -103,12 +115,57 @@ int ntfs_index_entries_inconsistent(const struct ntfs_volume *vol,
 struct ntfs_index_context *ntfs_index_ctx_get(struct ntfs_inode *ni, __le16 *name,
 		u32 name_len);
 void ntfs_index_ctx_put(struct ntfs_index_context *ictx);
+void ntfs_system_index_ctx_put(struct ntfs_system_index_ctx *ctx);
 int ntfs_index_lookup(const void *key, const u32 key_len,
 		struct ntfs_index_context *ictx);
+int ntfs_index_check_unlinked(struct ntfs_index_context *icx, u64 mft_no,
+		enum ntfs_system_index index);
+int ntfs_index_bitmap_log_credits(struct ntfs_volume *vol);
+int ntfs_index_bitmap_modify_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_index_context *icx, s64 vcn, bool set);
+s64 ntfs_index_bitmap_get_free_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_index_context *icx);
+int ntfs_index_block_initialize_log_credits(struct ntfs_volume *vol,
+		u32 block_size);
+int ntfs_index_allocation_extend_log_credits(struct ntfs_volume *vol,
+		s64 old_allocated_size, s64 new_size);
+/* Caller keeps the base MFT before-image until transaction commit. */
+int ntfs_index_allocation_extend_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_index_context *icx, s64 new_size);
+int ntfs_index_block_initialize_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_index_context *icx, struct index_block *ib);
+int ntfs_index_block_allocation_log_credits(struct ntfs_volume *vol,
+		u32 block_size);
+int ntfs_index_root_reparent_log_credits(struct ntfs_volume *vol,
+		u32 block_size);
+int ntfs_index_leaf_split_log_credits(struct ntfs_volume *vol,
+		u32 block_size);
+int ntfs_index_leaf_remove_log_credits(struct ntfs_volume *vol,
+		u32 block_size);
+int ntfs_index_node_remove_log_credits(struct ntfs_volume *vol,
+		u32 block_size);
+int ntfs_index_attrlist_log_credits(struct ntfs_volume *vol,
+		unsigned int entries);
+/* The caller must keep the parent MFT before-image until commit. */
+int ntfs_index_block_allocate_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_index_context *icx, u8 node_type,
+		struct index_block **block_out);
 
 void ntfs_index_entry_mark_dirty(struct ntfs_index_context *ictx);
 int ntfs_index_add_filename(struct ntfs_inode *ni, struct file_name_attr *fn, u64 mref);
+/* Supports resident roots, initial root reparent, and recursive leaf splits. */
+int ntfs_index_add_filename_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, struct file_name_attr *fn, u64 mref);
+int ntfs_index_entry_add_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_index_context *icx, struct index_entry *ie);
+int ntfs_index_entry_remove_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_index_context *icx);
+int ntfs_index_entry_update_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_index_context *icx, const struct index_entry *new_ie);
 int ntfs_index_remove(struct ntfs_inode *ni, const void *key, const u32 keylen);
+/* Supports empty-block retirement and in-place internal successor replacement. */
+int ntfs_index_remove_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, const void *key, const u32 keylen);
 struct ntfs_inode *ntfs_ia_open(struct ntfs_index_context *icx, struct ntfs_inode *ni);
 struct index_entry *ntfs_index_walk_down(struct index_entry *ie, struct ntfs_index_context *ictx);
 struct index_entry *ntfs_index_next(struct index_entry *ie, struct ntfs_index_context *ictx);
