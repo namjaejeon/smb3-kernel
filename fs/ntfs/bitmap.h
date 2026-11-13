@@ -12,11 +12,20 @@
 
 #include "volume.h"
 
+struct ntfs_log_handle;
+
 int ntfs_trim_fs(struct ntfs_volume *vol, struct fstrim_range *range);
 int ntfs_bitmap_check_used(struct ntfs_volume *vol, s64 start, s64 count,
 		bool repair, s64 *free_bits);
 int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 		const s64 count, const u8 value, const bool is_rollback);
+int ntfs_bitmap_validate_run(struct inode *vi, s64 start_bit, s64 count,
+		u8 value);
+int ntfs_bitmap_validate_run_with_mismatch(struct inode *vi, s64 start_bit,
+		s64 count, u8 value, s64 *first_mismatch);
+/* The caller must abort @handle if this helper returns an error. */
+int ntfs_bitmap_set_bits_in_run_transacted(struct ntfs_log_handle *handle,
+		struct inode *vi, s64 start_bit, s64 count, u8 value);
 
 /*
  * ntfs_bitmap_set_bits_in_run - set a run of bits in a bitmap to a value

@@ -14,10 +14,254 @@
  */
 
 #include <linux/blkdev.h>
+#include <linux/sort.h>
 
 #include "lcnalloc.h"
 #include "bitmap.h"
+#include "logfile.h"
 #include "ntfs.h"
+
+struct ntfs_cluster_alloc_undo {
+	struct ntfs_volume *vol;
+	struct runlist_element rl[];
+};
+
+struct ntfs_cluster_free_undo {
+	struct ntfs_volume *vol;
+	unsigned int nr_runs;
+	unsigned int nr_logged;
+	struct runlist_element rl[];
+};
+
+#define NTFS_CLUSTER_FREE_MAX_RUNS	1024
+
+static int ntfs_cluster_free_run_compare(const void *left, const void *right)
+{
+	const struct runlist_element *a = left;
+	const struct runlist_element *b = right;
+
+	if (a->lcn < b->lcn)
+		return -1;
+	if (a->lcn > b->lcn)
+		return 1;
+	if (a->length < b->length)
+		return -1;
+	return a->length > b->length;
+}
+
+static int ntfs_cluster_free_from_rl_nolock_core(struct ntfs_volume *vol,
+		const struct runlist_element *rl, bool is_rollback);
+
+static int ntfs_cluster_alloc_home_restore(void *data)
+{
+	if (!data)
+		return -EINVAL;
+	/*
+	 * Keep allocated bits reserved until the transaction's compensation
+	 * records are durable. The abort callback releases them afterward.
+	 */
+	return 0;
+}
+
+static int ntfs_cluster_alloc_home_abort(void *data)
+{
+	struct ntfs_cluster_alloc_undo *undo = data;
+	unsigned int memalloc_flags;
+	s64 first_mismatch = -1;
+	const struct runlist_element *rl;
+	int err = 0;
+
+	if (!undo || !undo->vol)
+		return -EINVAL;
+	memalloc_flags = memalloc_nofs_save();
+	down_write(&undo->vol->lcnbmp_lock);
+	for (rl = undo->rl; rl->length; rl++) {
+		err = ntfs_bitmap_validate_run_with_mismatch(
+				undo->vol->lcnbmp_ino, rl->lcn, rl->length, 1,
+				&first_mismatch);
+		if (err) {
+			if (first_mismatch >= 0)
+				ntfs_error(undo->vol->sb,
+					   "Aborted cluster-allocation bitmap validation failed for LCN %lld, length %lld (first mismatched LCN %lld, error %d).",
+					   (long long)rl->lcn,
+					   (long long)rl->length,
+					   (long long)first_mismatch, err);
+			else
+				ntfs_error(undo->vol->sb,
+					   "Aborted cluster-allocation bitmap validation failed for LCN %lld, length %lld (error %d).",
+					   (long long)rl->lcn,
+					   (long long)rl->length, err);
+			goto out_unlock;
+		}
+	}
+	err = ntfs_cluster_free_from_rl_nolock_core(undo->vol, undo->rl,
+			true);
+out_unlock:
+	up_write(&undo->vol->lcnbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	return err;
+}
+
+static void ntfs_cluster_alloc_home_release(void *data)
+{
+	kfree(data);
+}
+
+static int ntfs_cluster_register_alloc_undo(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, const struct runlist_element *rl,
+		int nr_runs)
+{
+	struct ntfs_cluster_alloc_undo *undo;
+	size_t bytes;
+	int err;
+
+	if (!handle || !vol || !rl || nr_runs <= 0)
+		return -EINVAL;
+	bytes = struct_size(undo, rl, nr_runs + 1);
+	undo = kmalloc(bytes, GFP_NOFS);
+	if (!undo)
+		return -ENOMEM;
+	undo->vol = vol;
+	memcpy(undo->rl, rl, (nr_runs + 1) * sizeof(*rl));
+	err = ntfs_log_register_home_undo_with_abort(handle,
+			ntfs_cluster_alloc_home_restore,
+			ntfs_cluster_alloc_home_abort,
+			ntfs_cluster_alloc_home_release, undo);
+	if (err)
+		ntfs_cluster_alloc_home_release(undo);
+	return err;
+}
+
+static int ntfs_cluster_free_home_restore(void *data)
+{
+	if (!data)
+		return -EINVAL;
+	/*
+	 * Freed bits stay allocated in the home bitmap until commit, so abort
+	 * has no bitmap state to restore.
+	 */
+	return 0;
+}
+
+static int ntfs_cluster_free_home_commit(void *data)
+{
+	struct ntfs_cluster_free_undo *undo = data;
+	unsigned int memalloc_flags;
+	s64 freed = 0;
+	s64 first_mismatch = -1;
+	unsigned int i;
+	int err = 0;
+
+	if (!undo || !undo->vol)
+		return -EINVAL;
+	if (undo->nr_logged != undo->nr_runs) {
+		ntfs_error(undo->vol->sb,
+			   "Committed cluster-free transaction logged %u of %u runs.",
+			   undo->nr_logged, undo->nr_runs);
+		return -EIO;
+	}
+	memalloc_flags = memalloc_nofs_save();
+	down_write(&undo->vol->lcnbmp_lock);
+	for (i = 0; i < undo->nr_logged; i++) {
+		err = ntfs_bitmap_validate_run_with_mismatch(
+				undo->vol->lcnbmp_ino, undo->rl[i].lcn,
+				undo->rl[i].length, 1, &first_mismatch);
+		if (err) {
+			ntfs_error(undo->vol->sb,
+				   "Committed cluster-free bitmap validation failed for LCN %lld, length %lld (first mismatched LCN %lld, error %d).",
+				   (long long)undo->rl[i].lcn,
+				   (long long)undo->rl[i].length,
+				   (long long)first_mismatch, err);
+			goto out_unlock;
+		}
+	}
+	for (i = 0; i < undo->nr_logged; i++) {
+		err = __ntfs_bitmap_set_bits_in_run(undo->vol->lcnbmp_ino,
+				undo->rl[i].lcn, undo->rl[i].length, 0, true);
+		if (err) {
+			ntfs_error(undo->vol->sb,
+				   "Failed to apply committed cluster free for LCN %lld, length %lld (error %d).",
+				   (long long)undo->rl[i].lcn,
+				   (long long)undo->rl[i].length, err);
+			goto out_unlock;
+		}
+		freed += undo->rl[i].length;
+	}
+	ntfs_inc_free_clusters(undo->vol, freed);
+out_unlock:
+	up_write(&undo->vol->lcnbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	return err;
+}
+
+static void ntfs_cluster_free_home_release(void *data)
+{
+	kvfree(data);
+}
+
+static int ntfs_cluster_register_free_undo(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, const struct runlist_element *rl,
+		unsigned int nr_runs, struct ntfs_cluster_free_undo **undo_out)
+{
+	struct ntfs_cluster_free_undo *undo;
+	size_t bytes;
+	u64 units = 0;
+	unsigned int i;
+	int err;
+
+	if (!handle || !vol || !rl || !nr_runs || !undo_out)
+		return -EINVAL;
+	bytes = struct_size(undo, rl, nr_runs);
+	undo = kvmalloc(bytes, GFP_NOFS);
+	if (!undo)
+		return -ENOMEM;
+	undo->vol = vol;
+	undo->nr_runs = nr_runs;
+	undo->nr_logged = 0;
+	memcpy(undo->rl, rl, nr_runs * sizeof(*rl));
+	sort(undo->rl, nr_runs, sizeof(*undo->rl),
+			ntfs_cluster_free_run_compare, NULL);
+	for (i = 0; i < nr_runs; i++) {
+		if (undo->rl[i].length <= 0 ||
+		    check_add_overflow(units, (u64)undo->rl[i].length, &units)) {
+			ntfs_error(vol->sb, "Invalid cluster-free run length.");
+			ntfs_cluster_free_home_release(undo);
+			return -EIO;
+		}
+	}
+	for (i = 1; i < nr_runs; i++) {
+		s64 previous_end;
+
+		if (check_add_overflow(undo->rl[i - 1].lcn,
+				undo->rl[i - 1].length, &previous_end)) {
+			ntfs_error(vol->sb,
+				   "Invalid cluster-free run at LCN %lld, length %lld.",
+				   (long long)undo->rl[i - 1].lcn,
+				   (long long)undo->rl[i - 1].length);
+			ntfs_cluster_free_home_release(undo);
+			return -EIO;
+		}
+		if (undo->rl[i].lcn < previous_end) {
+			ntfs_error(vol->sb,
+				   "Overlapping cluster-free runs at LCN %lld (previous run ends at %lld).",
+				   (long long)undo->rl[i].lcn,
+				   (long long)previous_end);
+			ntfs_cluster_free_home_release(undo);
+			return -EIO;
+		}
+	}
+	err = ntfs_log_register_deferred_free(handle,
+			ntfs_cluster_free_home_restore,
+			ntfs_cluster_free_home_commit,
+			ntfs_cluster_free_home_release, undo,
+			NTFS_LOG_DEFERRED_CLUSTERS, units, bytes);
+	if (err) {
+		ntfs_cluster_free_home_release(undo);
+		return err;
+	}
+	*undo_out = undo;
+	return 0;
+}
 
 /*
  * ntfs_cluster_free_from_rl_nolock - free clusters from runlist
@@ -33,8 +277,8 @@
  * Locking: - The volume lcn bitmap must be locked for writing on entry and is
  *	      left locked on return.
  */
-int ntfs_cluster_free_from_rl_nolock(struct ntfs_volume *vol,
-		const struct runlist_element *rl)
+static int ntfs_cluster_free_from_rl_nolock_core(struct ntfs_volume *vol,
+		const struct runlist_element *rl, bool is_rollback)
 {
 	struct inode *lcnbmp_vi = vol->lcnbmp_ino;
 	int ret = 0;
@@ -52,80 +296,95 @@ int ntfs_cluster_free_from_rl_nolock(struct ntfs_volume *vol,
 
 		if (rl->lcn < 0)
 			continue;
-		err = ntfs_bitmap_clear_run(lcnbmp_vi, rl->lcn, rl->length);
-		if (likely(!err))
+		err = __ntfs_bitmap_set_bits_in_run(lcnbmp_vi, rl->lcn,
+				rl->length, 0, is_rollback);
+		if (unlikely(err)) {
+			if (!ret || ret == -ENOMEM)
+				ret = err;
+		} else {
 			nr_freed += rl->length;
-		else if (!ret || ret == -ENOMEM)
-			ret = err;
+		}
 	}
 	ntfs_inc_free_clusters(vol, nr_freed);
 	ntfs_debug("Done.");
 	return ret;
 }
 
-static s64 max_empty_bit_range(unsigned char *buf, int size)
+int ntfs_cluster_free_from_rl_nolock(struct ntfs_volume *vol,
+		const struct runlist_element *rl)
 {
-	int i, j, run = 0;
+	if (!vol)
+		return -EINVAL;
+	if (vol->journal)
+		return -EOPNOTSUPP;
+	return ntfs_cluster_free_from_rl_nolock_core(vol, rl, false);
+}
+
+static s64 max_empty_bit_range(const unsigned char *buf, int start, int end)
+{
+	int pos = start, run = 0;
 	int max_range = 0;
 	s64 start_pos = -1;
 
 	ntfs_debug("Entering\n");
 
-	i = 0;
-	while (i < size) {
-		switch (*buf) {
-		case 0:
-			do {
-				buf++;
-				run += 8;
-				i++;
-			} while ((i < size) && !*buf);
-			break;
-		case 255:
+	while (pos < end) {
+		int bits = min_t(int, 8 - (pos & 7), end - pos);
+		unsigned int mask = ((1U << bits) - 1) << (pos & 7);
+		unsigned int used = buf[pos >> 3] & mask;
+
+		if (!used) {
+			run += bits;
+			pos += bits;
+		} else if (used == mask) {
 			if (run > max_range) {
 				max_range = run;
-				start_pos = (s64)i * 8 - run;
+				start_pos = pos - run;
 			}
 			run = 0;
-			do {
-				buf++;
-				i++;
-			} while ((i < size) && (*buf == 255));
-			break;
-		default:
-			for (j = 0; j < 8; j++) {
-				int bit = *buf & (1 << j);
+			pos += bits;
+		} else {
+			int last = pos + bits;
 
-				if (bit) {
+			while (pos < last) {
+				if (buf[pos >> 3] & (1U << (pos & 7))) {
 					if (run > max_range) {
 						max_range = run;
-						start_pos = (s64)i * 8 + (j - run);
+						start_pos = pos - run;
 					}
 					run = 0;
-				} else
+				} else {
 					run++;
+				}
+				pos++;
 			}
-			i++;
-			buf++;
 		}
 	}
 
 	if (run > max_range)
-		start_pos = (s64)i * 8 - run;
+		start_pos = end - run;
 
 	return start_pos;
 }
 
 /*
- * ntfs_cluster_alloc - allocate clusters on an ntfs volume
+ * ntfs_cluster_alloc_core - allocate clusters on an ntfs volume
+ *
+ * @log_handle: caller-owned journal transaction or NULL
  * @vol:		mounted ntfs volume on which to allocate clusters
  * @start_vcn:		vcn of the first allocated cluster
  * @count:		number of clusters to allocate
+ * @min_count:		minimum number of clusters accepted for a partial allocation
  * @start_lcn:		starting lcn at which to allocate the clusters or -1 if none
  * @zone:		zone from which to allocate (MFT_ZONE or DATA_ZONE)
  * @is_extension:	if true, the caller is extending an attribute
  * @is_contig:		if true, require contiguous allocation
  * @is_dealloc:		if true, the allocation is for deallocation purposes
+ * @max_runs:		maximum runs for partial allocation, or zero for no limit
+ *
+ * A transactional caller may set @min_count below @count to accept a shorter
+ * allocation after the selected zones are exhausted.  If fewer than
+ * @min_count clusters are found, the caller must abort the handle.
  *
  * Allocate @count clusters preferably starting at cluster @start_lcn or at the
  * current allocator position if @start_lcn is -1, on the mounted ntfs volume
@@ -180,27 +439,32 @@ static s64 max_empty_bit_range(unsigned char *buf, int size)
  * Return: Runlist describing the allocated cluster(s) on success, error pointer
  *         on failure.
  */
-struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 start_vcn,
-		const s64 count, const s64 start_lcn,
+static struct runlist_element *ntfs_cluster_alloc_core(
+		struct ntfs_log_handle *log_handle, struct ntfs_volume *vol,
+		const s64 start_vcn,
+		const s64 count, const s64 min_count, const s64 start_lcn,
 		const int zone,
 		const bool is_extension,
 		const bool is_contig,
-		const bool is_dealloc)
+		const bool is_dealloc,
+		const unsigned int max_runs)
 {
 	s64 zone_start, zone_end, bmp_pos, bmp_initial_pos, last_read_pos, lcn;
 	s64 prev_lcn = 0, prev_run_len = 0, mft_zone_size;
-	s64 clusters, free_clusters;
+	s64 clusters, free_clusters, allocation_count;
 	loff_t i_size;
 	struct inode *lcnbmp_vi;
 	struct runlist_element *rl = NULL;
 	struct address_space *mapping;
 	struct folio *folio = NULL;
 	u8 *buf = NULL, *byte;
-	int err = 0, rlpos, rlsize, buf_size, pg_off;
+	int err = 0, rlpos, rlsize, buf_size, pg_off, buf_first;
+	int run_len, run_limit, run_off;
 	u8 pass, done_zones, search_zone, need_writeback = 0, bit;
 	unsigned int memalloc_flags;
 	u8 has_guess, used_zone_pos;
 	pgoff_t index;
+	bool exhausted = false;
 
 	ntfs_debug("Entering for start_vcn 0x%llx, count 0x%llx, start_lcn 0x%llx, zone %s_ZONE.",
 			start_vcn, count, start_lcn,
@@ -212,22 +476,41 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 		return ERR_PTR(-EINVAL);
 
 	/* Return NULL if @count is zero. */
-	if (count < 0 || !count)
+	if (count <= 0 || min_count <= 0 || min_count > count ||
+	    (max_runs && (!log_handle || min_count > max_runs)))
 		return ERR_PTR(-EINVAL);
 
 	memalloc_flags = memalloc_nofs_save();
 
 	if (!NVolFreeClusterKnown(vol))
 		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
-	free_clusters = atomic64_read(&vol->free_clusters);
+	if (READ_ONCE(vol->journal)) {
+		s64 available = atomic64_read(&vol->free_clusters);
+
+		if (!is_dealloc)
+			available -= atomic64_read(&vol->dirty_clusters);
+		err = ntfs_log_reclaim_deferred(vol,
+				NTFS_LOG_DEFERRED_CLUSTERS, available, min_count,
+				is_contig);
+		if (err)
+			goto out_memalloc;
+	}
 
 	/* Take the lcnbmp lock for writing. */
 	down_write(&vol->lcnbmp_lock);
+	free_clusters = atomic64_read(&vol->free_clusters);
 	if (is_dealloc == false)
 		free_clusters -= atomic64_read(&vol->dirty_clusters);
 
-	if (free_clusters < count) {
+	if (free_clusters < min_count) {
 		err = -ENOSPC;
+		ntfs_error(vol->sb,
+			"Cluster allocation reports no space (free clusters %lld, dirty clusters %lld, requested %lld, minimum %lld, total clusters %lld, zone %s).",
+			(long long)atomic64_read(&vol->free_clusters),
+			(long long)atomic64_read(&vol->dirty_clusters),
+			(long long)count, (long long)min_count,
+			(long long)vol->nr_clusters,
+			zone == MFT_ZONE ? "MFT" : "DATA");
 		goto out_restore;
 	}
 
@@ -295,7 +578,8 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 	bmp_pos = bmp_initial_pos = zone_start;
 
 	/* Loop until all clusters are allocated, i.e. clusters == 0. */
-	clusters = count;
+	allocation_count = min_t(s64, count, free_clusters);
+	clusters = allocation_count;
 	rlpos = rlsize = 0;
 	mapping = lcnbmp_vi->i_mapping;
 	/*
@@ -335,6 +619,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 			buf_size = i_size - last_read_pos;
 		buf_size <<= 3;
 		lcn = bmp_pos & 7;
+		buf_first = lcn;
 		bmp_pos &= ~(s64)7;
 
 		if (vol->lcn_empty_bits_per_page[index] == 0)
@@ -348,6 +633,7 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 		}
 
 		folio_lock(folio);
+		folio_wait_writeback(folio);
 		buf = kmap_local_folio(folio, 0) + pg_off;
 		ntfs_debug("Before inner while loop: buf_size %i, lcn 0x%llx, bmp_pos 0x%llx, need_writeback %i.",
 				buf_size, lcn, bmp_pos, need_writeback);
@@ -366,15 +652,27 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 						goto done;
 
 					has_guess = 0;
-					break;
+					if (!used_zone_pos)
+						break;
+					/* Other free runs can share this page. */
+					continue;
 				}
 			} else {
-				lcn = max_empty_bit_range(buf, buf_size >> 3);
+				int end = min_t(s64, buf_size, zone_end - bmp_pos);
+
+				lcn = max_empty_bit_range(buf, buf_first, end);
 				if (lcn < 0)
 					break;
 				has_guess = 1;
 				continue;
 			}
+			/* Zone wraps and skipped bitmap pages can break a run. */
+			if (is_contig && rlpos &&
+			    prev_lcn + prev_run_len != lcn + bmp_pos)
+				goto out;
+			if (max_runs && (unsigned int)rlpos >= max_runs &&
+			    prev_lcn + prev_run_len != lcn + bmp_pos)
+				goto out;
 			/*
 			 * A contiguous request gets a single run.  The scan can
 			 * move on without testing the clusters after the run
@@ -410,27 +708,53 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 				ntfs_debug("Reallocated memory, rlsize 0x%x.",
 						rlsize);
 			}
-			/* Allocate the bitmap bit. */
-			*byte |= bit;
+			/*
+			 * The bitmap page and allocation lock keep this range free
+			 * until it is logged and marked.  Log one page-bounded run
+			 * instead of issuing an operation for every cluster.
+			 */
+			run_len = 1;
+			if (log_handle) {
+				run_limit = min_t(s64, buf_size - lcn,
+						zone_end - bmp_pos - lcn);
+				run_limit = min_t(s64, run_limit, clusters);
+				while (run_len < run_limit) {
+					s64 next = lcn + run_len;
+
+					if (buf[next >> 3] & (1U << (next & 7)))
+						break;
+					run_len++;
+				}
+				err = ntfs_log_bitmap_update(log_handle, lcnbmp_vi,
+						lcn + bmp_pos, run_len, 1);
+				if (err)
+					goto out;
+			}
+			for (run_off = 0; run_off < run_len; run_off++) {
+				s64 next = lcn + run_off;
+
+				buf[next >> 3] |= 1U << (next & 7);
+			}
 			/* We need to write this bitmap page to disk. */
 			need_writeback = 1;
 			ntfs_debug("*byte 0x%x, need_writeback is set.",
 					(unsigned int)*byte);
-			ntfs_dec_free_clusters(vol, 1);
-			ntfs_set_lcn_empty_bits(vol, index, 1, 1);
+			ntfs_dec_free_clusters(vol, run_len);
+			ntfs_set_lcn_empty_bits(vol, index, 1, run_len);
 
 			/*
 			 * Coalesce with previous run if adjacent LCNs.
 			 * Otherwise, append a new run.
 			 */
 			ntfs_debug("Adding run (lcn 0x%llx, len 0x%llx), prev_lcn 0x%llx, lcn 0x%llx, bmp_pos 0x%llx, prev_run_len 0x%llx, rlpos %i.",
-					lcn + bmp_pos, 1ULL, prev_lcn,
+					lcn + bmp_pos, (unsigned long long)run_len, prev_lcn,
 					lcn, bmp_pos, prev_run_len, rlpos);
 			if (prev_lcn == lcn + bmp_pos - prev_run_len && rlpos) {
 				ntfs_debug("Coalescing to run (lcn 0x%llx, len 0x%llx).",
 						rl[rlpos - 1].lcn,
 						rl[rlpos - 1].length);
-				rl[rlpos - 1].length = ++prev_run_len;
+				prev_run_len += run_len;
+				rl[rlpos - 1].length = prev_run_len;
 				ntfs_debug("Run now (lcn 0x%llx, len 0x%llx), prev_run_len 0x%llx.",
 						rl[rlpos - 1].lcn,
 						rl[rlpos - 1].length,
@@ -446,12 +770,15 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol, const s64 st
 					rl[rlpos].vcn = start_vcn;
 				}
 				rl[rlpos].lcn = prev_lcn = lcn + bmp_pos;
-				rl[rlpos].length = prev_run_len = 1;
+				rl[rlpos].length = prev_run_len = run_len;
 				rlpos++;
 			}
 			/* Done? */
-			if (!--clusters) {
+			clusters -= run_len;
+			if (!clusters) {
 				s64 tc;
+
+				lcn += run_len - 1;
 done:
 				if (!used_zone_pos)
 					goto out;
@@ -512,7 +839,7 @@ done:
 				ntfs_debug("Finished.  Going to out.");
 				goto out;
 			}
-			lcn++;
+			lcn += run_len;
 		}
 
 		if (!used_zone_pos) {
@@ -719,7 +1046,18 @@ switch_to_data1_zone:		search_zone = 2;
 		if (zone == MFT_ZONE || mft_zone_size <= 0) {
 			ntfs_debug("No free clusters left, going to out.");
 			/* Really no more space left on device. */
+			exhausted = true;
 			err = -ENOSPC;
+			if (min_count == count)
+				ntfs_error(vol->sb,
+					"Cluster allocation exhausted all zones (free clusters %lld, dirty clusters %lld, requested %lld, total clusters %lld, zone %s).",
+					(long long)atomic64_read(
+							&vol->free_clusters),
+					(long long)atomic64_read(
+							&vol->dirty_clusters),
+					(long long)count,
+					(long long)vol->nr_clusters,
+					zone == MFT_ZONE ? "MFT" : "DATA");
 			goto out;
 		} /* zone == DATA_ZONE && mft_zone_size > 0 */
 		ntfs_debug("Shrinking mft zone.");
@@ -750,10 +1088,13 @@ switch_to_data1_zone:		search_zone = 2;
 out:
 	ntfs_debug("At out.");
 	/* Add runlist terminator element. */
-	if (likely(rl)) {
+	if (likely(rl && rlpos)) {
 		rl[rlpos].vcn = rl[rlpos - 1].vcn + rl[rlpos - 1].length;
 		rl[rlpos].lcn = is_extension ? LCN_ENOENT : LCN_RL_NOT_MAPPED;
 		rl[rlpos].length = 0;
+	} else if (rl) {
+		kvfree(rl);
+		rl = NULL;
 	}
 	if (!IS_ERR_OR_NULL(folio)) {
 		if (need_writeback) {
@@ -765,16 +1106,40 @@ out:
 		kunmap_local(buf);
 		folio_put(folio);
 	}
+	if (err == -ENOSPC && exhausted &&
+	    allocation_count - clusters >= min_count) {
+		ntfs_debug("Returning partial cluster allocation (requested %lld, allocated %lld, minimum %lld, zone %s).",
+				(long long)count,
+				(long long)(allocation_count - clusters),
+				(long long)min_count,
+				zone == MFT_ZONE ? "MFT" : "DATA");
+		err = 0;
+	} else if (err == -ENOSPC && exhausted && min_count < count) {
+		ntfs_error(vol->sb,
+			"Cluster allocation exhausted all zones below its minimum (free clusters %lld, dirty clusters %lld, requested %lld, allocated %lld, minimum %lld, total clusters %lld, zone %s).",
+			(long long)atomic64_read(&vol->free_clusters),
+			(long long)atomic64_read(&vol->dirty_clusters),
+			(long long)count, (long long)(allocation_count - clusters),
+			(long long)min_count, (long long)vol->nr_clusters,
+			zone == MFT_ZONE ? "MFT" : "DATA");
+	}
 	if (likely(!err)) {
 		if (!rl) {
 			err = -EIO;
 			goto out_restore;
 		}
-		if (is_dealloc == true)
+		if (log_handle) {
+			err = ntfs_cluster_register_alloc_undo(log_handle, vol, rl,
+					rlpos);
+			if (err)
+				goto rollback_alloc;
+		}
+		if (is_dealloc && !log_handle)
 			ntfs_release_dirty_clusters(vol, rl->length);
 		ntfs_debug("Done.");
 		goto out_restore;
 	}
+rollback_alloc:
 	if (err != -ENOSPC)
 		ntfs_error(vol->sb,
 			"Failed to allocate clusters, aborting (error %i).",
@@ -784,28 +1149,462 @@ out:
 
 		if (err == -ENOSPC)
 			ntfs_debug("Not enough space to complete allocation, err -ENOSPC, first free lcn 0x%llx, could allocate up to 0x%llx clusters.",
-					rl[0].lcn, count - clusters);
-		/* Deallocate all allocated clusters. */
-		ntfs_debug("Attempting rollback...");
-		err2 = ntfs_cluster_free_from_rl_nolock(vol, rl);
-		if (err2) {
-			ntfs_error(vol->sb,
-				"Failed to rollback (error %i). Leaving inconsistent metadata! Unmount and run chkdsk.",
-				err2);
-			NVolSetErrors(vol);
+					rl[0].lcn, allocation_count - clusters);
+		if (log_handle) {
+			/*
+			 * Keep partially allocated bits reserved until the
+			 * transaction's abort records are durable.  Clearing
+			 * them here lets another transaction reuse them before
+			 * this handle's CLR can be replayed.
+			 */
+			err2 = ntfs_cluster_register_alloc_undo(log_handle, vol,
+					rl, rlpos);
+			if (err2) {
+				ntfs_error(vol->sb,
+					"Failed to register partial cluster-allocation rollback (error %i). Leaving clusters reserved; unmount and run chkdsk.",
+					err2);
+				NVolSetErrors(vol);
+				err = err2;
+			}
+		} else {
+			/* No caller-owned transaction can replay this allocation. */
+			ntfs_debug("Attempting non-transacted allocation rollback...");
+			err2 = ntfs_cluster_free_from_rl_nolock_core(vol, rl,
+					true);
+			if (err2) {
+				ntfs_error(vol->sb,
+					"Failed to rollback (error %i). Leaving inconsistent metadata! Unmount and run chkdsk.",
+					err2);
+				NVolSetErrors(vol);
+			}
 		}
 		/* Free the runlist. */
 		kvfree(rl);
 	} else if (err == -ENOSPC)
 		ntfs_debug("No space left at all, err = -ENOSPC, first free lcn = 0x%llx.",
 				vol->data1_zone_pos);
-	atomic64_set(&vol->dirty_clusters, 0);
+	if (!log_handle)
+		atomic64_set(&vol->dirty_clusters, 0);
 
 out_restore:
 	up_write(&vol->lcnbmp_lock);
+out_memalloc:
 	memalloc_nofs_restore(memalloc_flags);
 
 	return err < 0 ? ERR_PTR(err) : rl;
+}
+
+int ntfs_cluster_alloc_log_credits(s64 count)
+{
+	if (count <= 0)
+		return -EINVAL;
+	/* One open-attribute record and one bitmap operation per chosen bit. */
+	if (count >= INT_MAX)
+		return -E2BIG;
+	return count + 1;
+}
+
+int ntfs_cluster_free_log_credits(s64 count)
+{
+	if (count < 0)
+		return -EINVAL;
+	if (!count)
+		return 0;
+	/* One open-attribute record and at most one bitmap record per cluster. */
+	if (count >= INT_MAX)
+		return -E2BIG;
+	return count + 1;
+}
+
+int ntfs_cluster_free_from_rl_log_credits(
+		const struct runlist_element *rl)
+{
+	u64 credits = 1;
+	unsigned int nr_runs = 0;
+	int run_credits;
+
+	if (!rl)
+		return -EINVAL;
+	if (!rl->length)
+		return 0;
+	while (rl[nr_runs].length) {
+		if (rl[nr_runs].lcn < 0 || rl[nr_runs].length <= 0 ||
+		    nr_runs >= INT_MAX)
+			return -EIO;
+		run_credits = ntfs_log_bitmap_update_credits(rl[nr_runs].lcn,
+				rl[nr_runs].length);
+		if (run_credits < 0)
+			return run_credits;
+		if (check_add_overflow(credits, (u64)run_credits - 1,
+				&credits) || credits > INT_MAX)
+			return -E2BIG;
+		nr_runs++;
+	}
+	return credits;
+}
+
+int ntfs_cluster_free_from_rl_preflight_with_mismatch(struct ntfs_volume *vol,
+		const struct runlist_element *rl, s64 *first_mismatch)
+{
+	unsigned int memalloc_flags;
+	unsigned int i;
+	int err = 0;
+
+	if (!vol || !rl || !first_mismatch)
+		return -EINVAL;
+	*first_mismatch = -1;
+	for (i = 0; rl[i].length; i++) {
+		if (rl[i].lcn < 0 || rl[i].length <= 0 ||
+		    rl[i].lcn > vol->nr_clusters - rl[i].length ||
+		    i >= INT_MAX) {
+			ntfs_error(vol->sb,
+				   "Invalid cluster-free run at index %u (LCN %lld, length %lld, volume clusters %lld).",
+				   i, (long long)rl[i].lcn,
+				   (long long)rl[i].length,
+				   (long long)vol->nr_clusters);
+			return -EIO;
+		}
+	}
+	memalloc_flags = memalloc_nofs_save();
+	down_read(&vol->lcnbmp_lock);
+	for (i = 0; rl[i].length; i++) {
+		err = ntfs_bitmap_validate_run_with_mismatch(vol->lcnbmp_ino,
+				rl[i].lcn, rl[i].length, 1, first_mismatch);
+		if (err) {
+			ntfs_error(vol->sb,
+				   "Cluster-free bitmap preflight failed for LCN %lld, length %lld (first mismatched LCN %lld, error %d).",
+				   (long long)rl[i].lcn,
+				   (long long)rl[i].length,
+				   (long long)*first_mismatch, err);
+			break;
+		}
+	}
+	up_read(&vol->lcnbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	return err;
+}
+
+int ntfs_cluster_free_from_rl_preflight(struct ntfs_volume *vol,
+		const struct runlist_element *rl)
+{
+	s64 first_mismatch;
+
+	return ntfs_cluster_free_from_rl_preflight_with_mismatch(vol, rl,
+			&first_mismatch);
+}
+
+struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
+		const s64 start_vcn, const s64 count, const s64 start_lcn,
+		const int zone, const bool is_extension, const bool is_contig,
+		const bool is_dealloc)
+{
+	return ntfs_cluster_alloc_core(NULL, vol, start_vcn, count, count,
+			start_lcn, zone, is_extension, is_contig, is_dealloc,
+			0);
+}
+
+struct runlist_element *ntfs_cluster_alloc_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		const s64 start_vcn, const s64 count, const s64 start_lcn,
+		const int zone, const bool is_extension, const bool is_contig,
+		const bool is_dealloc)
+{
+	if (!handle || is_dealloc)
+		return ERR_PTR(!handle ? -EINVAL : -EOPNOTSUPP);
+	return ntfs_cluster_alloc_core(handle, vol, start_vcn, count,
+			count, start_lcn, zone, is_extension, is_contig, false,
+			0);
+}
+
+struct runlist_element *ntfs_cluster_alloc_transacted_partial(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		const s64 start_vcn, const s64 count, const s64 min_count,
+		const s64 start_lcn, const int zone, const bool is_extension,
+		const bool is_contig, const bool is_dealloc,
+		const unsigned int max_runs)
+{
+	if (!handle)
+		return ERR_PTR(-EINVAL);
+	return ntfs_cluster_alloc_core(handle, vol, start_vcn, count,
+			min_count, start_lcn, zone, is_extension, is_contig,
+			is_dealloc, max_runs);
+}
+
+static int ntfs_cluster_free_from_rl_transaction(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		const struct runlist_element *rl, bool packed)
+{
+	struct ntfs_cluster_free_undo *undo;
+	struct runlist_element *free_rl = NULL;
+	unsigned int memalloc_flags;
+	unsigned int nr_entries = 0;
+	unsigned int nr_runs = 0;
+	unsigned int dst;
+	unsigned int i;
+	int err;
+
+	if (!handle || !vol || !rl)
+		return -EINVAL;
+	while (rl[nr_entries].length) {
+		if (rl[nr_entries].length <= 0 || nr_entries >= INT_MAX)
+			return -EIO;
+		if (rl[nr_entries].lcn != LCN_HOLE) {
+			if (rl[nr_entries].lcn < 0 ||
+			    rl[nr_entries].length > vol->nr_clusters ||
+			    rl[nr_entries].lcn >
+				vol->nr_clusters - rl[nr_entries].length)
+				return -EIO;
+			nr_runs++;
+		}
+		nr_entries++;
+	}
+	if (!nr_runs)
+		return 0;
+	/* Punch/collapse runlists include holes, which have no bitmap bits. */
+	if (nr_entries != nr_runs) {
+		free_rl = kvmalloc_array(nr_runs, sizeof(*free_rl), GFP_NOFS);
+		if (!free_rl)
+			return -ENOMEM;
+		for (i = 0, dst = 0; i < nr_entries; i++)
+			if (rl[i].lcn >= 0)
+				free_rl[dst++] = rl[i];
+		rl = free_rl;
+	}
+	err = ntfs_cluster_register_free_undo(handle, vol, rl, nr_runs,
+			&undo);
+	kvfree(free_rl);
+	if (err)
+		return err;
+
+	memalloc_flags = memalloc_nofs_save();
+	down_write(&vol->lcnbmp_lock);
+	for (i = 0; i < undo->nr_runs; i++) {
+		err = ntfs_bitmap_validate_run(vol->lcnbmp_ino,
+				undo->rl[i].lcn, undo->rl[i].length, 1);
+		if (err)
+			goto out_unlock;
+	}
+	if (packed) {
+		err = ntfs_log_bitmap_clear_runs(handle, vol->lcnbmp_ino,
+				undo->rl, undo->nr_runs);
+		if (!err)
+			undo->nr_logged = undo->nr_runs;
+	} else {
+		for (i = 0; i < undo->nr_runs; i++) {
+			err = ntfs_log_bitmap_update(handle, vol->lcnbmp_ino,
+					undo->rl[i].lcn, undo->rl[i].length, 0);
+			if (err)
+				break;
+			undo->nr_logged++;
+		}
+	}
+out_unlock:
+	up_write(&vol->lcnbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	return err;
+}
+
+int ntfs_cluster_free_from_rl_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, const struct runlist_element *rl)
+{
+	return ntfs_cluster_free_from_rl_transaction(handle, vol, rl, false);
+}
+
+int ntfs_cluster_free_from_rl_packed(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, const struct runlist_element *rl)
+{
+	return ntfs_cluster_free_from_rl_transaction(handle, vol, rl, true);
+}
+
+static int ntfs_cluster_free_batch(const struct runlist_element *rl,
+		size_t nr_runs, int limit,
+		struct runlist_element *batch, unsigned int *nr_batch)
+{
+	s64 clusters = 0;
+	unsigned int nr = 0;
+	int credits = 1;
+
+	if (limit < 2)
+		return -E2BIG;
+	while (nr < nr_runs && nr < NTFS_CLUSTER_FREE_MAX_RUNS) {
+		s64 length = rl[nr].length;
+		int extra;
+
+		for (;;) {
+			extra = ntfs_log_bitmap_update_credits(rl[nr].lcn,
+					length);
+			if (extra < 0 && extra != -E2BIG)
+				return extra;
+			if (extra >= 0 && extra - 1 <= limit - credits)
+				break;
+			if (nr)
+				goto done;
+			if (length == 1)
+				return extra < 0 ? extra : -E2BIG;
+			length >>= 1;
+		}
+		batch[nr] = rl[nr];
+		batch[nr].vcn = clusters;
+		batch[nr].length = length;
+		clusters += length;
+		credits += extra - 1;
+		nr++;
+		if (length != rl[nr - 1].length)
+			break;
+	}
+done:
+	batch[nr] = (struct runlist_element) {
+		.vcn = clusters,
+		.lcn = LCN_ENOENT,
+	};
+	*nr_batch = nr;
+	return credits;
+}
+
+int ntfs_cluster_free_from_rl(struct ntfs_volume *vol,
+		const struct runlist_element *rl)
+{
+	struct runlist_element *free_rl = NULL;
+	struct runlist_element *batch = NULL;
+	struct ntfs_log_handle *handle;
+	size_t nr_runs = 0;
+	size_t i, dst;
+	unsigned int memalloc_flags;
+	unsigned int nr_batch;
+	unsigned int j;
+	int limit;
+	int credits;
+	int err = 0;
+
+	if (!vol)
+		return -EINVAL;
+	if (!rl)
+		return 0;
+
+	memalloc_flags = memalloc_nofs_save();
+	if (!vol->journal) {
+		down_write(&vol->lcnbmp_lock);
+		err = ntfs_cluster_free_from_rl_nolock(vol, rl);
+		up_write(&vol->lcnbmp_lock);
+		goto out;
+	}
+
+	for (i = 0; rl[i].length; i++) {
+		if (rl[i].length < 0) {
+			err = -EIO;
+			goto out;
+		}
+		if (rl[i].lcn < 0)
+			continue;
+		if (rl[i].lcn >= vol->nr_clusters ||
+		    rl[i].length > vol->nr_clusters - rl[i].lcn) {
+			err = -EIO;
+			goto out;
+		}
+		if (nr_runs == INT_MAX) {
+			err = -E2BIG;
+			goto out;
+		}
+		nr_runs++;
+	}
+	if (!nr_runs)
+		goto out;
+	limit = ntfs_log_transaction_credits_limit(vol);
+	if (limit < 0) {
+		err = limit;
+		goto out;
+	}
+
+	free_rl = kvmalloc_array(nr_runs, sizeof(*free_rl), GFP_NOFS);
+	if (!free_rl) {
+		err = -ENOMEM;
+		goto out;
+	}
+	for (i = 0, dst = 0; rl[i].length; i++) {
+		if (rl[i].lcn < 0)
+			continue;
+		free_rl[dst] = rl[i];
+		free_rl[dst++].vcn = 0;
+	}
+	sort(free_rl, nr_runs, sizeof(*free_rl),
+			ntfs_cluster_free_run_compare, NULL);
+	for (i = 1; i < nr_runs; i++) {
+		s64 previous_end;
+
+		if (check_add_overflow(free_rl[i - 1].lcn,
+				free_rl[i - 1].length, &previous_end)) {
+			ntfs_error(vol->sb,
+				   "Invalid cluster-free run at LCN %lld, length %lld.",
+				   (long long)free_rl[i - 1].lcn,
+				   (long long)free_rl[i - 1].length);
+			err = -EIO;
+			goto out;
+		}
+		if (free_rl[i].lcn < previous_end) {
+			ntfs_error(vol->sb,
+				   "Overlapping cluster-free runs at LCN %lld (previous run ends at %lld).",
+				   (long long)free_rl[i].lcn,
+				   (long long)previous_end);
+			err = -EIO;
+			goto out;
+		}
+	}
+	for (i = 0, dst = 0; i < nr_runs; i++) {
+		if (dst && free_rl[dst - 1].lcn + free_rl[dst - 1].length ==
+				free_rl[i].lcn)
+			free_rl[dst - 1].length += free_rl[i].length;
+		else
+			free_rl[dst++] = free_rl[i];
+	}
+	nr_runs = dst;
+	batch = kvmalloc_array(min_t(size_t, nr_runs,
+			NTFS_CLUSTER_FREE_MAX_RUNS) + 1, sizeof(*batch), GFP_NOFS);
+	if (!batch) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < nr_runs; ) {
+		int abort_err;
+
+		credits = ntfs_cluster_free_batch(free_rl + i, nr_runs - i,
+				limit, batch, &nr_batch);
+		if (credits < 0) {
+			err = credits;
+			break;
+		}
+		handle = ntfs_log_begin_full_reservation(vol, credits);
+		if (IS_ERR(handle)) {
+			err = PTR_ERR(handle);
+			if (err == -ENOSPC && limit > 2) {
+				limit = max(2, limit / 2);
+				continue;
+			}
+			break;
+		}
+		err = ntfs_cluster_free_from_rl_transacted(handle, vol, batch);
+		if (err) {
+			abort_err = ntfs_log_abort(handle);
+			if (abort_err)
+				err = abort_err;
+			break;
+		}
+		err = ntfs_log_commit(handle);
+		if (err)
+			break;
+		for (j = 0; j < nr_batch; j++) {
+			free_rl[i].lcn += batch[j].length;
+			free_rl[i].length -= batch[j].length;
+			if (!free_rl[i].length)
+				i++;
+		}
+		cond_resched();
+	}
+out:
+	kvfree(batch);
+	kvfree(free_rl);
+	memalloc_nofs_restore(memalloc_flags);
+	return err;
 }
 
 /*

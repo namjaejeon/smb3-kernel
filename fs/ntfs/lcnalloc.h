@@ -27,12 +27,51 @@ enum {
 	LAST_ZONE	= 1,
 };
 
+int ntfs_cluster_alloc_log_credits(s64 count);
+int ntfs_cluster_free_log_credits(s64 count);
+int ntfs_cluster_free_from_rl_log_credits(
+		const struct runlist_element *rl);
+int ntfs_cluster_free_from_rl_preflight(struct ntfs_volume *vol,
+		const struct runlist_element *rl);
+int ntfs_cluster_free_from_rl_preflight_with_mismatch(struct ntfs_volume *vol,
+		const struct runlist_element *rl, s64 *first_mismatch);
 struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 		const s64 start_vcn, const s64 count, const s64 start_lcn,
 		const int zone,
 		const bool is_extension,
 		const bool is_contig,
 		const bool is_dealloc);
+/*
+ * A caller-owned transaction must be aborted after an allocation error.
+ * Partially allocated bits remain reserved until its abort is durable.
+ */
+struct runlist_element *ntfs_cluster_alloc_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		const s64 start_vcn, const s64 count, const s64 start_lcn,
+		const int zone, const bool is_extension, const bool is_contig,
+		const bool is_dealloc);
+/*
+ * Try to allocate @count clusters, accepting a shorter runlist if at least
+ * @min_count clusters are available.  A nonzero @max_runs bounds fragmentation
+ * and must be at least @min_count. Zero leaves it unlimited.  An error still
+ * requires aborting @handle because a partial allocation may have been logged.
+ * A DELALLOC caller owns the dirty-cluster charge until it commits or restores
+ * its runlist.
+ */
+struct runlist_element *ntfs_cluster_alloc_transacted_partial(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		const s64 start_vcn, const s64 count, const s64 min_count,
+		const s64 start_lcn, const int zone, const bool is_extension,
+		const bool is_contig, const bool is_dealloc,
+		const unsigned int max_runs);
+/*
+ * Cluster-free bitmap changes become visible to allocators only at commit.
+ * The caller must abort @handle if this helper returns an error.
+ */
+int ntfs_cluster_free_from_rl_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, const struct runlist_element *rl);
+int ntfs_cluster_free_from_rl_packed(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, const struct runlist_element *rl);
 s64 __ntfs_cluster_free(struct ntfs_inode *ni, const s64 start_vcn,
 		s64 count, struct ntfs_attr_search_ctx *ctx, const bool is_rollback);
 
@@ -112,23 +151,15 @@ int ntfs_cluster_free_from_rl_nolock(struct ntfs_volume *vol,
  *
  * Return 0 on success and -errno on error.
  *
- * Locking: - This function takes the volume lcn bitmap lock for writing and
- *	      modifies the bitmap contents.
+ * On journaled volumes each physical run is freed by its own transaction,
+ * with transaction reservation completed before the lcn bitmap lock is taken.
+ *
+ * Locking: - This function serializes bitmap changes with the volume lcn
+ *	      bitmap lock.
  *	    - The caller must have locked the runlist @rl for reading or
  *	      writing.
  */
-static inline int ntfs_cluster_free_from_rl(struct ntfs_volume *vol,
-		const struct runlist_element *rl)
-{
-	int ret;
-	unsigned int memalloc_flags;
-
-	memalloc_flags = memalloc_nofs_save();
-	down_write(&vol->lcnbmp_lock);
-	ret = ntfs_cluster_free_from_rl_nolock(vol, rl);
-	up_write(&vol->lcnbmp_lock);
-	memalloc_nofs_restore(memalloc_flags);
-	return ret;
-}
+int ntfs_cluster_free_from_rl(struct ntfs_volume *vol,
+		const struct runlist_element *rl);
 
 #endif /* defined _LINUX_NTFS_LCNALLOC_H */

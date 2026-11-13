@@ -13,6 +13,9 @@
 #include "ntfs.h"
 #include "dir.h"
 
+struct ntfs_log;
+struct ntfs_log_handle;
+
 extern __le16 AT_UNNAMED[];
 
 /*

@@ -8,8 +8,11 @@
 
 #include <linux/bitops.h>
 #include <linux/blkdev.h>
+#include <linux/slab.h>
 
+#include "attrib.h"
 #include "bitmap.h"
+#include "logfile.h"
 #include "ntfs.h"
 
 /*
@@ -156,6 +159,134 @@ out_free:
 	return ret;
 }
 
+static int ntfs_bitmap_validate_mapping(struct ntfs_inode *ni, u64 start_bit,
+		u64 end_bit)
+{
+	struct ntfs_volume *vol = ni->vol;
+	s64 end_vcn = ((end_bit - 1) >> 3) >> vol->cluster_size_bits;
+	s64 vcn = (start_bit >> 3) >> vol->cluster_size_bits;
+	int err = 0;
+
+	down_write(&ni->runlist.lock);
+	while (vcn <= end_vcn) {
+		struct runlist_element *rl;
+		s64 clusters;
+		s64 delta;
+		s64 lcn;
+
+		rl = ntfs_attr_find_vcn_nolock(ni, vcn, NULL);
+		if (IS_ERR(rl)) {
+			err = PTR_ERR(rl) == -ENOMEM ? -ENOMEM : -EIO;
+			break;
+		}
+		delta = vcn - rl->vcn;
+		if (rl->lcn < 0 || rl->length <= 0 || delta < 0 ||
+		    delta >= rl->length ||
+		    check_add_overflow(rl->lcn, delta, &lcn)) {
+			err = -EIO;
+			break;
+		}
+		clusters = min(end_vcn - vcn + 1, rl->length - delta);
+		if (clusters <= 0 || clusters > vol->nr_clusters ||
+		    lcn > vol->nr_clusters - clusters) {
+			err = -EIO;
+			break;
+		}
+		vcn += clusters;
+	}
+	up_write(&ni->runlist.lock);
+	return err;
+}
+
+static int ntfs_bitmap_validate_run_core(struct inode *vi, s64 start_bit,
+		s64 count, u8 value, s64 *first_mismatch)
+{
+	struct address_space *mapping;
+	struct ntfs_inode *ni;
+	unsigned long flags;
+	u64 bitmap_bits;
+	u64 bit_pos;
+	u64 end_bit;
+	u64 mismatch_bit;
+	s64 bitmap_bytes;
+	s64 remaining;
+
+	if (!vi || start_bit < 0 || count < 0 || value > 1 ||
+	    (count && start_bit > S64_MAX - count))
+		return -EINVAL;
+	if (!count)
+		return 0;
+	ni = NTFS_I(vi);
+	read_lock_irqsave(&ni->size_lock, flags);
+	bitmap_bytes = min_t(s64, i_size_read(vi), ni->initialized_size);
+	bitmap_bytes = min(bitmap_bytes, ni->allocated_size);
+	read_unlock_irqrestore(&ni->size_lock, flags);
+	if (bitmap_bytes < 0)
+		return -EIO;
+	if (check_mul_overflow((u64)bitmap_bytes, 8ULL, &bitmap_bits))
+		return -E2BIG;
+	end_bit = (u64)start_bit + count;
+	if (end_bit > bitmap_bits)
+		return -EIO;
+	if (NInoNonResident(ni)) {
+		int err = ntfs_bitmap_validate_mapping(ni, start_bit, end_bit);
+
+		if (err)
+			return err;
+	}
+	mapping = vi->i_mapping;
+	bit_pos = start_bit;
+	remaining = count;
+	while (remaining) {
+		unsigned long first = bit_pos & (PAGE_SIZE * 8 - 1);
+		unsigned long bits = min_t(u64, remaining,
+				PAGE_SIZE * 8 - first);
+		unsigned long mismatch;
+		unsigned long *bitmap;
+		pgoff_t index = bit_pos >> (PAGE_SHIFT + 3);
+		struct folio *folio;
+
+		folio = read_mapping_folio(mapping, index, NULL);
+		if (IS_ERR(folio))
+			return PTR_ERR(folio);
+		folio_lock(folio);
+		/* Do not inspect a bitmap page while an older write is in flight. */
+		folio_wait_writeback(folio);
+		bitmap = kmap_local_folio(folio, 0);
+		mismatch = value ?
+			find_next_zero_bit(bitmap, first + bits, first) :
+			find_next_bit(bitmap, first + bits, first);
+		kunmap_local(bitmap);
+		folio_unlock(folio);
+		folio_put(folio);
+		if (mismatch < first + bits) {
+			mismatch_bit = bit_pos + mismatch - first;
+			if (first_mismatch)
+				*first_mismatch = mismatch_bit;
+			return -EIO;
+		}
+		bit_pos += bits;
+		remaining -= bits;
+	}
+	return 0;
+}
+
+int ntfs_bitmap_validate_run(struct inode *vi, s64 start_bit, s64 count,
+		u8 value)
+{
+	return ntfs_bitmap_validate_run_core(vi, start_bit, count, value, NULL);
+}
+
+int ntfs_bitmap_validate_run_with_mismatch(struct inode *vi, s64 start_bit,
+		s64 count, u8 value, s64 *first_mismatch)
+{
+	if (!first_mismatch)
+		return -EINVAL;
+	*first_mismatch = -1;
+	return ntfs_bitmap_validate_run_core(vi, start_bit, count, value,
+			first_mismatch);
+}
+
 /*
  * __ntfs_bitmap_set_bits_in_run - set a run of bits in a bitmap to a value
  * @vi:			vfs inode describing the bitmap
@@ -172,15 +303,17 @@ out_free:
  *
  * Return 0 on success and -errno on error.
  */
-int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
-		const s64 count, const u8 value, const bool is_rollback)
+static int ntfs_bitmap_set_bits_in_run_core(struct ntfs_log_handle *log_handle,
+		struct inode *vi, const s64 start_bit, const s64 count,
+		const u8 value, const bool is_rollback)
 {
+	bool own_log_handle = false;
 	s64 cnt = count;
 	pgoff_t index, end_index;
 	struct address_space *mapping;
 	struct folio *folio;
 	u8 *kaddr;
-	int pos, len, err;
+	int pos, len, err, log_err;
 	u8 bit;
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_volume *vol = ni->vol;
@@ -190,8 +323,36 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 			(unsigned long long)cnt, (unsigned int)value,
 			is_rollback ? " (rollback)" : "");
 
-	if (start_bit < 0 || cnt < 0 || value > 1)
+	if (start_bit < 0 || cnt < 0 || value > 1 ||
+	    (cnt && start_bit > S64_MAX - cnt))
 		return -EINVAL;
+	if (!cnt)
+		return 0;
+
+	if (!is_rollback && (vol->journal || log_handle)) {
+		log_err = ntfs_bitmap_validate_run(vi, start_bit, count,
+				value ? 0 : 1);
+		if (log_err)
+			return log_err;
+		if (!vol->journal)
+			return -EROFS;
+		if (!log_handle) {
+			log_err = ntfs_log_bitmap_update_credits(start_bit, count);
+			if (log_err < 0)
+				return log_err;
+			log_handle = ntfs_log_begin_full_reservation(vol, log_err);
+			if (IS_ERR(log_handle))
+				return PTR_ERR(log_handle);
+			own_log_handle = true;
+		}
+		log_err = ntfs_log_bitmap_update(log_handle, vi, start_bit,
+				count, value);
+		if (log_err) {
+			if (own_log_handle)
+				ntfs_log_abort(log_handle);
+			return log_err;
+		}
+	}
 
 	/*
 	 * Calculate the indices for the pages containing the first and last
@@ -208,10 +369,13 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 			ntfs_error(vi->i_sb,
 				"Failed to map first page (error %li), aborting.",
 				PTR_ERR(folio));
-		return PTR_ERR(folio);
+		err = PTR_ERR(folio);
+		goto rollback;
 	}
 
 	folio_lock(folio);
+	/* Serialize a bitmap update with the previous page-cache write. */
+	folio_wait_writeback(folio);
 	kaddr = kmap_local_folio(folio, 0);
 
 	/* Set @pos to the position of the byte containing @start_bit. */
@@ -276,6 +440,7 @@ int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
 		}
 
 		folio_lock(folio);
+		folio_wait_writeback(folio);
 		kaddr = kmap_local_folio(folio, 0);
 		/*
 		 * Depending on @value, modify all remaining whole bytes in the
@@ -315,6 +480,20 @@ done:
 	kunmap_local(kaddr);
 	folio_put(folio);
 	ntfs_debug("Done.");
+	if (own_log_handle) {
+		log_err = ntfs_log_commit(log_handle);
+		if (log_err) {
+			pos = ntfs_bitmap_set_bits_in_run_core(NULL, vi, start_bit,
+					count, value ? 0 : 1, true);
+			if (pos) {
+				ntfs_error(vi->i_sb,
+					"Failed to rollback bitmap after journal commit error %i (rollback error %i).",
+					log_err, pos);
+				NVolSetErrors(vol);
+			}
+			return log_err;
+		}
+	}
 	return 0;
 rollback:
 	/*
@@ -325,8 +504,8 @@ rollback:
 	if (is_rollback)
 		return err;
 	if (count != cnt)
-		pos = __ntfs_bitmap_set_bits_in_run(vi, start_bit, count - cnt,
-				value ? 0 : 1, true);
+		pos = ntfs_bitmap_set_bits_in_run_core(NULL, vi, start_bit,
+				count - cnt, value ? 0 : 1, true);
 	else
 		pos = 0;
 	if (!pos) {
@@ -341,5 +520,30 @@ rollback:
 			err, pos);
 		NVolSetErrors(NTFS_SB(vi->i_sb));
 	}
+	if (own_log_handle) {
+		log_err = ntfs_log_abort(log_handle);
+		if (log_err) {
+			ntfs_error(vi->i_sb,
+				"Failed to abort bitmap journal transaction (error %i).",
+				log_err);
+			NVolSetErrors(vol);
+		}
+	}
 	return err;
+}
+
+int __ntfs_bitmap_set_bits_in_run(struct inode *vi, const s64 start_bit,
+		const s64 count, const u8 value, const bool is_rollback)
+{
+	return ntfs_bitmap_set_bits_in_run_core(NULL, vi, start_bit, count,
+			value, is_rollback);
+}
+
+int ntfs_bitmap_set_bits_in_run_transacted(struct ntfs_log_handle *handle,
+		struct inode *vi, s64 start_bit, s64 count, u8 value)
+{
+	if (!handle || !vi)
+		return -EINVAL;
+	return ntfs_bitmap_set_bits_in_run_core(handle, vi, start_bit, count,
+			value, false);
 }
