@@ -17,6 +17,7 @@
 #include "mft.h"
 #include "index.h"
 #include "lcnalloc.h"
+#include "logfile.h"
 #include "reparse.h"
 
 struct wsl_link_reparse_data {
@@ -551,7 +552,8 @@ out:
 /*
  * Set the index for new reparse data
  */
-static int set_reparse_index(struct ntfs_inode *ni, struct ntfs_index_context *xr,
+static int set_reparse_index(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, struct ntfs_index_context *xr,
 		__le32 reparse_tag)
 {
 	struct reparse_index indx;
@@ -574,14 +576,18 @@ static int set_reparse_index(struct ntfs_inode *ni, struct ntfs_index_context *x
 	indx.filling = 0;
 	ntfs_index_ctx_reinit(xr);
 
+	if (handle)
+		return ntfs_index_entry_add_transacted(handle, xr,
+				(struct index_entry *)&indx);
 	return ntfs_ie_add(xr, (struct index_entry *)&indx);
 }
 
 /*
  * Remove a reparse data index entry if attribute present
  */
-static int remove_reparse_index(struct inode *rp, struct ntfs_index_context *xr,
-				__le32 *preparse_tag)
+static int remove_reparse_index(struct ntfs_log_handle *handle,
+		struct inode *rp, struct ntfs_index_context *xr,
+		__le32 *preparse_tag)
 {
 	struct reparse_index_key key;
 	u64 file_id_cpu;
@@ -604,7 +610,10 @@ static int remove_reparse_index(struct inode *rp, struct ntfs_index_context *xr,
 	/* danger on processors which require proper alignment! */
 	memcpy(&key.file_id, &file_id, 8);
 	if (!ntfs_index_lookup(&key, sizeof(struct reparse_index_key), xr)) {
-		err = ntfs_index_rm(xr);
+		if (handle)
+			err = ntfs_index_entry_remove_transacted(handle, xr);
+		else
+			err = ntfs_index_rm(xr);
 		if (err)
 			ret = err;
 	}
@@ -649,11 +658,254 @@ static struct ntfs_index_context *open_reparse_index(struct ntfs_volume *vol)
 		goto put_dir_vi;
 
 	xr = ntfs_index_ctx_get(NTFS_I(vi), reparse_index_name, 2);
-	if (!xr)
+	if (!xr) {
 		iput(vi);
+	} else {
+		/*
+		 * The journal credit preflight runs before ntfs_index_lookup().
+		 * Keep the context's geometry usable for that preflight. Lookup
+		 * will validate and refresh the same fields before modifying the
+		 * index.
+		 */
+		xr->block_size = NTFS_I(vi)->itype.index.block_size;
+		xr->vcn_size_bits = NTFS_I(vi)->itype.index.vcn_size_bits;
+	}
 put_dir_vi:
 	iput(dir_vi);
 	return xr;
+}
+
+int ntfs_reparse_index_check_unlinked(struct ntfs_inode *ni)
+{
+	struct ntfs_index_context *xr;
+	struct ntfs_inode *xrni;
+	int err;
+
+	xr = open_reparse_index(ni->vol);
+	if (!xr)
+		return -EIO;
+	xrni = xr->idx_ni;
+	mutex_lock_nested(&xrni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
+	err = ntfs_index_check_unlinked(xr, ni->mft_no,
+			NTFS_SYSTEM_INDEX_REPARSE);
+	ntfs_index_ctx_put(xr);
+	mutex_unlock(&xrni->mrec_lock);
+	iput(VFS_I(xrni));
+	return err;
+}
+
+static int resize_reparse_data_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, u32 size)
+{
+	u64 clusters;
+	int err;
+
+	if (!handle || !ni || !size)
+		return -EINVAL;
+	if (size == ni->data_size)
+		return 0;
+	if (!NInoNonResident(ni)) {
+		err = ntfs_resident_attr_resize_transacted(handle, ni, size);
+		if (err != -ENOSPC)
+			return err;
+		err = ntfs_attr_make_nonresident_transacted(handle, ni);
+		if (err)
+			return err;
+	}
+	if (size < ni->data_size)
+		return ntfs_attr_shrink_transacted(handle, ni, size,
+				NTFS_ATTR_TRUNCATE_MAX_CLUSTERS);
+	if (size <= ni->allocated_size)
+		return ntfs_attr_logical_grow_transacted(handle, ni, size);
+	clusters = DIV_ROUND_UP_ULL(size, ni->vol->cluster_size) -
+		DIV_ROUND_UP_ULL(ni->allocated_size, ni->vol->cluster_size);
+	if (!clusters || clusters > NTFS_ATTR_GROW_MAX_CLUSTERS)
+		return -E2BIG;
+	return ntfs_attr_physical_grow_transacted(handle, ni, size, clusters);
+}
+
+static int reparse_update_log_credits(struct ntfs_inode *ni,
+		struct ntfs_index_context *xr, u32 size)
+{
+	struct ntfs_volume *vol = ni->vol;
+	u64 clusters;
+	int add_credits;
+	int conversion_credits;
+	int credits;
+	int extra_credits;
+	int operation_credits;
+	int physical_credits;
+	int resize_credits;
+	int resident_credits;
+
+	if (!vol || !xr || !size || !vol->cluster_size ||
+	    vol->mft_record_size > U16_MAX)
+		return -EINVAL;
+	add_credits = ntfs_index_root_reparent_log_credits(vol,
+			xr->block_size);
+	if (add_credits < 0)
+		return add_credits;
+	operation_credits = ntfs_index_leaf_split_log_credits(vol,
+			xr->block_size);
+	if (operation_credits < 0)
+		return operation_credits;
+	add_credits = max(add_credits, operation_credits);
+	credits = ntfs_index_node_remove_log_credits(vol, xr->block_size);
+	if (credits < 0 || check_add_overflow(credits, add_credits, &credits))
+		return credits < 0 ? credits : -EOVERFLOW;
+	if (NInoAttrList(xr->idx_ni)) {
+		extra_credits = ntfs_index_attrlist_log_credits(vol, 2);
+		if (extra_credits < 0 || check_add_overflow(credits,
+				extra_credits, &credits))
+			return extra_credits < 0 ? extra_credits : -EOVERFLOW;
+	}
+
+	resident_credits = ntfs_resident_attr_resize_log_credits(vol,
+			vol->mft_record_size, vol->mft_record_size);
+	if (resident_credits < 0)
+		return resident_credits;
+	resize_credits = ntfs_attr_logical_grow_log_credits(vol, false);
+	if (resize_credits < 0)
+		return resize_credits;
+	resize_credits = max(resize_credits, resident_credits);
+	operation_credits = ntfs_attr_shrink_log_credits(vol,
+			NTFS_ATTR_TRUNCATE_MAX_CLUSTERS, false);
+	if (operation_credits < 0)
+		return operation_credits;
+	resize_credits = max(resize_credits, operation_credits);
+	clusters = min_t(u64, NTFS_ATTR_GROW_MAX_CLUSTERS,
+			DIV_ROUND_UP_ULL(size, vol->cluster_size));
+	physical_credits = ntfs_attr_physical_grow_log_credits(vol, clusters);
+	if (physical_credits < 0)
+		return physical_credits;
+	conversion_credits = ntfs_attr_make_nonresident_log_credits(vol, 0,
+			vol->mft_record_size);
+	if (conversion_credits < 0 || check_add_overflow(conversion_credits,
+			physical_credits, &conversion_credits))
+		return conversion_credits < 0 ? conversion_credits : -EOVERFLOW;
+	resize_credits = max3(resize_credits, physical_credits,
+			conversion_credits);
+	if (check_add_overflow(credits, resize_credits, &credits))
+		return -EOVERFLOW;
+	operation_credits = ntfs_attr_initialized_grow_log_credits(vol, false);
+	if (operation_credits < 0 ||
+	    check_add_overflow(credits, operation_credits, &credits))
+		return operation_credits < 0 ? operation_credits : -EOVERFLOW;
+	resident_credits = ntfs_attr_pwrite_log_credits(vol, size, false);
+	if (resident_credits < 0)
+		return resident_credits;
+	operation_credits = ntfs_attr_pwrite_log_credits(vol, size, true);
+	if (operation_credits < 0)
+		return operation_credits;
+	/* An initialized prefix and a fresh tail need separate log records. */
+	if (check_add_overflow(operation_credits, 1, &operation_credits))
+		return -EOVERFLOW;
+	operation_credits = max(operation_credits, resident_credits);
+	if (check_add_overflow(credits, operation_credits, &credits))
+		return -EOVERFLOW;
+	if (NInoAttrList(ni)) {
+		extra_credits = ntfs_index_attrlist_log_credits(vol, 1);
+		if (extra_credits < 0 || check_add_overflow(credits,
+				extra_credits, &credits))
+			return extra_credits < 0 ? extra_credits : -EOVERFLOW;
+	}
+	return credits;
+}
+
+static int reparse_index_remove_log_credits(struct ntfs_inode *ni,
+		struct ntfs_index_context *xr)
+{
+	int credits;
+	int extra_credits;
+
+	if (!ni || !xr)
+		return -EINVAL;
+	credits = ntfs_index_node_remove_log_credits(ni->vol,
+			xr->block_size);
+	if (credits < 0)
+		return credits;
+	if (!NInoAttrList(xr->idx_ni))
+		return credits;
+	extra_credits = ntfs_index_attrlist_log_credits(ni->vol, 1);
+	if (extra_credits < 0 || check_add_overflow(credits, extra_credits,
+			&credits))
+		return extra_credits < 0 ? extra_credits : -EOVERFLOW;
+	return credits;
+}
+
+int ntfs_reparse_index_remove_log_credits(struct ntfs_inode *ni)
+{
+	struct ntfs_index_context *xr;
+	struct ntfs_inode *xrni;
+	int credits;
+
+	if (!ni)
+		return -EINVAL;
+	if (!(ni->flags & FILE_ATTR_REPARSE_POINT))
+		return 0;
+	xr = open_reparse_index(ni->vol);
+	if (!xr)
+		return -EINVAL;
+	xrni = xr->idx_ni;
+	credits = reparse_index_remove_log_credits(ni, xr);
+	ntfs_index_ctx_put(xr);
+	iput(VFS_I(xrni));
+	return credits;
+}
+
+static int ntfs_reparse_log_credits(struct ntfs_inode *ni, u32 size)
+{
+	struct ntfs_index_context *xr;
+	struct ntfs_inode *xrni;
+	int credits;
+
+	if (!ni || !size)
+		return -EINVAL;
+	xr = open_reparse_index(ni->vol);
+	if (!xr)
+		return -EINVAL;
+	xrni = xr->idx_ni;
+	credits = reparse_update_log_credits(ni, xr, size);
+	ntfs_index_ctx_put(xr);
+	iput(VFS_I(xrni));
+	return credits;
+}
+
+int ntfs_reparse_wsl_symlink_log_credits(struct ntfs_inode *ni,
+		int target_len)
+{
+	u32 size;
+
+	if (!ni || target_len <= 0)
+		return -EINVAL;
+	if (check_mul_overflow((u32)target_len,
+			(u32)NLS_MAX_CHARSET_SIZE, &size) ||
+	    check_add_overflow(size,
+			(u32)(sizeof(struct reparse_point) + sizeof(__le32)),
+			&size))
+		return -EOVERFLOW;
+	return ntfs_reparse_log_credits(ni, size);
+}
+
+int ntfs_reparse_native_symlink_log_credits(struct ntfs_inode *ni,
+		int target_len)
+{
+	u32 size;
+
+	if (!ni || target_len <= 0)
+		return -EINVAL;
+	if (check_mul_overflow((u32)target_len, 4U, &size) ||
+	    check_add_overflow(size,
+			(u32)(sizeof(struct reparse_point) +
+			      sizeof(struct symlink_reparse_data) + 8),
+			&size))
+		return -EOVERFLOW;
+	return ntfs_reparse_log_credits(ni, size);
+}
+
+int ntfs_reparse_wsl_not_symlink_log_credits(struct ntfs_inode *ni)
+{
+	return ntfs_reparse_log_credits(ni, sizeof(struct reparse_point));
 }
 
 
@@ -664,7 +916,8 @@ put_dir_vi:
  * an existing index is expected if there is an existing value.
  *
  */
-static int update_reparse_data(struct ntfs_inode *ni, struct ntfs_index_context *xr,
+static int update_reparse_data(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, struct ntfs_index_context *xr,
 		char *value, size_t size)
 {
 	struct inode *rp_inode;
@@ -674,28 +927,47 @@ static int update_reparse_data(struct ntfs_inode *ni, struct ntfs_index_context 
 	__le32 reparse_tag;
 	struct ntfs_inode *rp_ni;
 
+	if (handle && size > U32_MAX)
+		return -E2BIG;
 	rp_inode = ntfs_attr_iget(VFS_I(ni), AT_REPARSE_POINT, AT_UNNAMED, 0);
 	if (IS_ERR(rp_inode))
 		return PTR_ERR(rp_inode);
 	rp_ni = NTFS_I(rp_inode);
 
 	/* remove the existing reparse data */
-	oldsize = remove_reparse_index(rp_inode, xr, &reparse_tag);
+	oldsize = remove_reparse_index(handle, rp_inode, xr, &reparse_tag);
 	if (oldsize < 0) {
 		err = oldsize;
 		goto put_rp_inode;
 	}
 
 	/* overwrite value if any */
-	written = ntfs_inode_attr_pwrite(rp_inode, 0, size, value, false);
+	if (handle) {
+		err = resize_reparse_data_transacted(handle, rp_ni, size);
+		if (err) {
+			ntfs_error(ni->vol->sb,
+				   "Failed to resize reparse data to %zu bytes (error %d).",
+				   size, err);
+			goto put_rp_inode;
+		}
+		err = ntfs_attr_pwrite_transacted(handle, rp_ni, 0, value,
+				size);
+		written = err ? err : size;
+	} else {
+		written = ntfs_inode_attr_pwrite(rp_inode, 0, size, value, false);
+	}
 	if (written != size) {
-		ntfs_error(ni->vol->sb, "Failed to update reparse data\n");
-		err = -EIO;
+		err = written < 0 ? written : -EIO;
+		ntfs_error(ni->vol->sb,
+			   "Failed to write reparse data (%zu bytes, error %d).",
+			   size, err);
 		goto put_rp_inode;
 	}
 
-	err = set_reparse_index(ni, xr,
-				((const struct reparse_point *)value)->reparse_tag);
+	err = set_reparse_index(handle, ni, xr,
+			((const struct reparse_point *)value)->reparse_tag);
+	if (err && handle)
+		goto put_rp_inode;
 	if (err && oldsize > 0) {
 		/*
 		 * If cannot index, try to remove the reparse
@@ -706,11 +978,60 @@ static int update_reparse_data(struct ntfs_inode *ni, struct ntfs_index_context 
 		ntfs_error(ni->vol->sb,
 			   "Failed to index reparse data. Possible corruption.\n");
 	}
+	err = 0;
 
 	mark_mft_record_dirty(ni);
 put_rp_inode:
 	iput(rp_inode);
 
+	return err;
+}
+
+int ntfs_prepare_reparse_index_remove(struct ntfs_inode *ni,
+		struct ntfs_system_index_ctx *ctx)
+{
+	struct ntfs_index_context *xr;
+	struct inode *vi;
+
+	if (!ni || !ctx)
+		return -EINVAL;
+	lockdep_assert_held(&ni->vol->system_index_lock);
+	if (!(ni->flags & FILE_ATTR_REPARSE_POINT))
+		return 0;
+	vi = ntfs_attr_iget(VFS_I(ni), AT_REPARSE_POINT, AT_UNNAMED, 0);
+	if (IS_ERR(vi))
+		return PTR_ERR(vi) == -ENOENT ? 0 : PTR_ERR(vi);
+	xr = open_reparse_index(ni->vol);
+	if (!xr) {
+		iput(vi);
+		return -EINVAL;
+	}
+	ctx->attr = vi;
+	ctx->index = xr;
+	return 0;
+}
+
+int ntfs_delete_reparse_index_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		struct ntfs_system_index_ctx *ctx)
+{
+	struct ntfs_inode *xrni;
+	__le32 reparse_tag;
+	int err;
+
+	if (!handle || !ni || !ctx)
+		return -EINVAL;
+	lockdep_assert_held(&ni->vol->system_index_lock);
+	lockdep_assert_held(&ni->mrec_lock);
+	if (!ctx->index)
+		return 0;
+	xrni = ctx->index->idx_ni;
+	mutex_lock_nested(&xrni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
+	err = remove_reparse_index(handle, ctx->attr, ctx->index, &reparse_tag);
+	if (err >= 0)
+		err = 0;
+	ntfs_index_ctx_reinit(ctx->index);
+	mutex_unlock(&xrni->mrec_lock);
 	return err;
 }
 
@@ -722,7 +1043,10 @@ int ntfs_delete_reparse_index(struct ntfs_inode *ni)
 	struct inode *vi;
 	struct ntfs_index_context *xr;
 	struct ntfs_inode *xrni;
+	struct ntfs_log_handle *handle = NULL;
 	__le32 reparse_tag;
+	bool inode_locked = false;
+	bool system_index_locked = false;
 	int err = 0;
 
 	if (!(ni->flags & FILE_ATTR_REPARSE_POINT))
@@ -737,29 +1061,79 @@ int ntfs_delete_reparse_index(struct ntfs_inode *ni)
 	 * and un-index it
 	 */
 	xr = open_reparse_index(ni->vol);
+	if (!xr) {
+		err = -EIO;
+		goto out;
+	}
 	if (xr) {
 		xrni = xr->idx_ni;
+		if (ni->vol->journal) {
+			int credits;
+
+			credits = reparse_index_remove_log_credits(ni, xr);
+			if (credits < 0) {
+				err = credits;
+				goto put_index;
+			}
+			handle = ntfs_log_begin(ni->vol, credits);
+			if (IS_ERR(handle)) {
+				err = PTR_ERR(handle);
+				handle = NULL;
+				goto put_index;
+			}
+			mutex_lock(&ni->vol->system_index_lock);
+			system_index_locked = true;
+			mutex_lock_nested(&ni->mrec_lock,
+					NTFS_INODE_MUTEX_NORMAL);
+			inode_locked = true;
+		}
 		mutex_lock_nested(&xrni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
-		err = remove_reparse_index(vi, xr, &reparse_tag);
+		err = remove_reparse_index(handle, vi, xr, &reparse_tag);
 		if (err < 0) {
+			if (handle) {
+				int abort_err = ntfs_log_abort(handle);
+
+				handle = NULL;
+				if (abort_err)
+					err = abort_err;
+			}
 			ntfs_index_ctx_put(xr);
 			mutex_unlock(&xrni->mrec_lock);
 			iput(VFS_I(xrni));
 			goto out;
 		}
-		mark_mft_record_dirty(xrni);
+		if (handle) {
+			int indexed_size = err;
+
+			err = ntfs_log_commit(handle);
+			handle = NULL;
+			if (!err)
+				err = indexed_size;
+		} else {
+			mark_mft_record_dirty(xrni);
+		}
 		ntfs_index_ctx_put(xr);
 		mutex_unlock(&xrni->mrec_lock);
 		iput(VFS_I(xrni));
+		if (err < 0)
+			goto out;
 	}
-
 	ni->flags &= ~FILE_ATTR_REPARSE_POINT;
 	NInoSetFileNameDirty(ni);
 	mark_mft_record_dirty(ni);
 
 out:
+	if (inode_locked)
+		mutex_unlock(&ni->mrec_lock);
+	if (system_index_locked)
+		mutex_unlock(&ni->vol->system_index_lock);
 	iput(vi);
 	return err;
+
+put_index:
+	ntfs_index_ctx_put(xr);
+	iput(VFS_I(xrni));
+	goto out;
 }
 
 /*
@@ -767,9 +1141,12 @@ out:
  */
 static int ntfs_set_ntfs_reparse_data(struct ntfs_inode *ni, char *value, size_t size)
 {
-	int err = 0;
-	struct ntfs_inode *xrni;
 	struct ntfs_index_context *xr;
+	struct ntfs_log_handle *handle = NULL;
+	struct ntfs_inode *xrni;
+	bool journal;
+	bool present;
+	int err = 0;
 
 	if (!ni)
 		return -EINVAL;
@@ -786,8 +1163,31 @@ static int ntfs_set_ntfs_reparse_data(struct ntfs_inode *ni, char *value, size_t
 	if (!xr)
 		return -EINVAL;
 	xrni = xr->idx_ni;
+	journal = ni->vol->journal != NULL;
+	present = ntfs_attr_exist(ni, AT_REPARSE_POINT, AT_UNNAMED, 0);
+	if (journal) {
+		int credits;
 
-	if (!ntfs_attr_exist(ni, AT_REPARSE_POINT, AT_UNNAMED, 0)) {
+		if (!present || size > U32_MAX) {
+			err = present ? -E2BIG : -EIO;
+			goto put_index;
+		}
+		credits = reparse_update_log_credits(ni, xr, size);
+		if (credits < 0) {
+			err = credits;
+			goto put_index;
+		}
+		handle = ntfs_log_begin(ni->vol, credits);
+		if (IS_ERR(handle)) {
+			err = PTR_ERR(handle);
+			handle = NULL;
+			goto put_index;
+		}
+		mutex_lock(&ni->vol->system_index_lock);
+		mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
+	}
+
+	if (!present) {
 		struct reparse_point rp = {0, };
 
 		/*
@@ -797,36 +1197,94 @@ static int ntfs_set_ntfs_reparse_data(struct ntfs_inode *ni, char *value, size_t
 		 */
 		if (ni->vol->major_ver < 3) {
 			err = -EOPNOTSUPP;
-			ntfs_index_ctx_put(xr);
-			goto out;
+			goto unlock_inode;
 		}
 
 		err = ntfs_attr_add(ni, AT_REPARSE_POINT, AT_UNNAMED, 0, (u8 *)&rp, sizeof(rp));
 		if (err) {
-			ntfs_index_ctx_put(xr);
-			goto out;
+			goto unlock_inode;
 		}
-		ni->flags |= FILE_ATTR_REPARSE_POINT;
-		NInoSetFileNameDirty(ni);
-		mark_mft_record_dirty(ni);
 	}
 
 	/* update value and index */
 	mutex_lock_nested(&xrni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
-	err = update_reparse_data(ni, xr, value, size);
-	if (err) {
+	err = update_reparse_data(handle, ni, xr, value, size);
+	if (handle) {
+		if (err) {
+			int abort_err = ntfs_log_abort(handle);
+
+			if (abort_err)
+				err = abort_err;
+		} else {
+			err = ntfs_log_commit(handle);
+		}
+		handle = NULL;
+	} else if (err) {
 		ni->flags &= ~FILE_ATTR_REPARSE_POINT;
 		NInoSetFileNameDirty(ni);
 		mark_mft_record_dirty(ni);
 	}
 	ntfs_index_ctx_put(xr);
 	mutex_unlock(&xrni->mrec_lock);
+	if (!err) {
+		ni->flags |= FILE_ATTR_REPARSE_POINT;
+		NInoSetFileNameDirty(ni);
+		mark_mft_record_dirty(ni);
+		if (!journal)
+			mark_mft_record_dirty(xrni);
+	}
+	if (journal) {
+		mutex_unlock(&ni->mrec_lock);
+		mutex_unlock(&ni->vol->system_index_lock);
+	}
+	iput(VFS_I(xrni));
+	return err;
 
-out:
-	if (!err)
+unlock_inode:
+	if (handle) {
+		int abort_err = ntfs_log_abort(handle);
+
+		handle = NULL;
+		if (abort_err)
+			err = abort_err;
+	}
+	if (journal) {
+		mutex_unlock(&ni->mrec_lock);
+		mutex_unlock(&ni->vol->system_index_lock);
+	}
+put_index:
+	ntfs_index_ctx_put(xr);
+	if (!err && !journal)
 		mark_mft_record_dirty(xrni);
 	iput(VFS_I(xrni));
+	return err;
+}
 
+static int ntfs_set_ntfs_reparse_data_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		char *value, size_t size)
+{
+	struct ntfs_index_context *xr;
+	struct ntfs_inode *xrni;
+	int err;
+
+	if (!handle || !ni || size > U32_MAX ||
+	    !valid_reparse_data(ni, (const struct reparse_point *)value, size))
+		return -EINVAL;
+	lockdep_assert_held(&ni->vol->system_index_lock);
+	if (!ntfs_attr_exist(ni, AT_REPARSE_POINT, AT_UNNAMED, 0))
+		return -EIO;
+	xr = open_reparse_index(ni->vol);
+	if (!xr)
+		return -EINVAL;
+	xrni = xr->idx_ni;
+	mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
+	mutex_lock_nested(&xrni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
+	err = update_reparse_data(handle, ni, xr, value, size);
+	ntfs_index_ctx_put(xr);
+	mutex_unlock(&xrni->mrec_lock);
+	mutex_unlock(&ni->mrec_lock);
+	iput(VFS_I(xrni));
 	return err;
 }
 
@@ -873,8 +1331,9 @@ int ntfs_reparse_set_wsl_symlink(struct ntfs_inode *ni,
 	return err;
 }
 
-int ntfs_reparse_set_native_symlink(struct ntfs_inode *ni,
-				    const char *target, int target_len)
+static int ntfs_reparse_set_native_symlink_internal(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		const char *target, int target_len, char **converted_target)
 {
 	int err = 0;
 	bool is_absolute, prt_sub_shared = true;
@@ -888,6 +1347,8 @@ int ntfs_reparse_set_native_symlink(struct ntfs_inode *ni,
 	struct symlink_reparse_data *data;
 	int i;
 
+	if (converted_target)
+		*converted_target = NULL;
 	/* Determine if target is absolute (starts with drive letter like C:/ or C:\) */
 	is_absolute = target_len > 2 &&
 		ntfs_is_drive_letter(target) &&
@@ -967,10 +1428,18 @@ int ntfs_reparse_set_native_symlink(struct ntfs_inode *ni,
 	memcpy(data->path_buffer, sub_name_utf16, sub_len * sizeof(__le16));
 	memcpy(data->path_buffer + sub_len, prt_name_utf16, prt_len * sizeof(__le16));
 
-	err = ntfs_set_ntfs_reparse_data(ni, (char *)reparse, total_reparse_len);
+	if (handle)
+		err = ntfs_set_ntfs_reparse_data_transacted(handle, ni,
+				(char *)reparse, total_reparse_len);
+	else
+		err = ntfs_set_ntfs_reparse_data(ni, (char *)reparse,
+				total_reparse_len);
 	if (!err) {
 		strreplace(sub_name, '\\', '/');
-		ni->target = sub_name;
+		if (converted_target)
+			*converted_target = sub_name;
+		else
+			ni->target = sub_name;
 		sub_name = NULL;
 		if (prt_sub_shared)
 			prt_name = NULL;
@@ -986,6 +1455,78 @@ out:
 	kvfree(sub_name_utf16);
 	kvfree(prt_name_utf16);
 	kvfree(reparse);
+	return err;
+}
+
+int ntfs_reparse_set_native_symlink(struct ntfs_inode *ni,
+				    const char *target, int target_len)
+{
+	return ntfs_reparse_set_native_symlink_internal(NULL, ni, target,
+			target_len, NULL);
+}
+
+int ntfs_reparse_set_native_symlink_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		const char *target, int target_len, char **converted_target)
+{
+	if (!handle || !converted_target)
+		return -EINVAL;
+	return ntfs_reparse_set_native_symlink_internal(handle, ni, target,
+			target_len, converted_target);
+}
+
+int ntfs_reparse_set_wsl_symlink_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		const char *target, int target_len, char **converted_target)
+{
+	struct wsl_link_reparse_data *data;
+	struct reparse_point *reparse;
+	char *target_copy = NULL;
+	int reparse_len;
+	int err;
+
+	if (!handle || !ni || !converted_target)
+		return -EINVAL;
+	*converted_target = NULL;
+	if (!target || target_len <= 0 ||
+	    target_len > U16_MAX - (int)sizeof(data->type))
+		return -E2BIG;
+	if (check_add_overflow((int)sizeof(struct reparse_point),
+			(int)sizeof(data->type), &reparse_len) ||
+	    check_add_overflow(reparse_len, target_len, &reparse_len)) {
+		err = -EOVERFLOW;
+		goto free_target;
+	}
+	reparse = kvzalloc(reparse_len, GFP_NOFS);
+	if (!reparse) {
+		err = -ENOMEM;
+		goto free_target;
+	}
+	target_copy = kstrdup(target, GFP_NOFS);
+	if (!target_copy) {
+		err = -ENOMEM;
+		kvfree(reparse);
+		goto free_target;
+	}
+	data = (struct wsl_link_reparse_data *)reparse->reparse_data;
+	reparse->reparse_tag = IO_REPARSE_TAG_LX_SYMLINK;
+	reparse->reparse_data_length =
+		cpu_to_le16(sizeof(data->type) + target_len);
+	data->type = cpu_to_le32(2);
+	memcpy(data->link, target, target_len);
+	err = ntfs_set_ntfs_reparse_data_transacted(handle, ni,
+			(char *)reparse, reparse_len);
+	kvfree(reparse);
+	if (err)
+		goto free_target;
+	ni->reparse_tag = IO_REPARSE_TAG_LX_SYMLINK;
+	ni->reparse_flags = 0;
+	*converted_target = target_copy;
+	target_copy = NULL;
+	return 0;
+
+free_target:
+	kfree(target_copy);
 	return err;
 }
 
@@ -1030,5 +1571,31 @@ int ntfs_reparse_set_wsl_not_symlink(struct ntfs_inode *ni, mode_t mode)
 		}
 	}
 
+	return err;
+}
+
+int ntfs_reparse_set_wsl_not_symlink_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		mode_t mode)
+{
+	struct reparse_point reparse = {};
+	int err;
+
+	if (S_ISSOCK(mode))
+		reparse.reparse_tag = IO_REPARSE_TAG_AF_UNIX;
+	else if (S_ISFIFO(mode))
+		reparse.reparse_tag = IO_REPARSE_TAG_LX_FIFO;
+	else if (S_ISCHR(mode))
+		reparse.reparse_tag = IO_REPARSE_TAG_LX_CHR;
+	else if (S_ISBLK(mode))
+		reparse.reparse_tag = IO_REPARSE_TAG_LX_BLK;
+	else
+		return -EOPNOTSUPP;
+	err = ntfs_set_ntfs_reparse_data_transacted(handle, ni,
+			(char *)&reparse, sizeof(reparse));
+	if (!err) {
+		ni->reparse_tag = reparse.reparse_tag;
+		ni->reparse_flags = 0;
+	}
 	return err;
 }

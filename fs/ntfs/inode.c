@@ -3540,13 +3540,12 @@ static int ntfs_recover_unlinked_inode(struct ntfs_volume *vol, u64 mft_no,
 	if (err)
 		goto out_put;
 	if (has_reparse) {
-		/* Index recovery is added with namespace integration. */
-		err = -EOPNOTSUPP;
+		err = ntfs_reparse_index_check_unlinked(ni);
 		if (err)
 			goto out_put;
 	}
 	if (has_object_id) {
-		err = -EOPNOTSUPP;
+		err = ntfs_object_id_index_check_unlinked(ni);
 		if (err)
 			goto out_put;
 	}

@@ -10,6 +10,7 @@
 
 #include "ntfs.h"
 #include "index.h"
+#include "logfile.h"
 #include "object_id.h"
 
 struct object_id_index_key {
@@ -87,6 +88,25 @@ put_dir_vi:
 	return xo;
 }
 
+int ntfs_object_id_index_check_unlinked(struct ntfs_inode *ni)
+{
+	struct ntfs_index_context *xo;
+	struct ntfs_inode *xoni;
+	int err;
+
+	xo = open_object_id_index(ni->vol);
+	if (!xo)
+		return -EIO;
+	xoni = xo->idx_ni;
+	mutex_lock_nested(&xoni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
+	err = ntfs_index_check_unlinked(xo, ni->mft_no,
+			NTFS_SYSTEM_INDEX_OBJECT_ID);
+	ntfs_index_ctx_put(xo);
+	mutex_unlock(&xoni->mrec_lock);
+	iput(VFS_I(xoni));
+	return err;
+}
+
 
 /*
  * remove_object_id_index - Remove an object id index entry if attribute present
@@ -97,7 +117,8 @@ put_dir_vi:
  *
  * Return: 0 on success, or a negative error code on failure.
  */
-static int remove_object_id_index(struct ntfs_inode *ni, struct ntfs_index_context *xo)
+static int remove_object_id_index(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, struct ntfs_index_context *xo)
 {
 	struct object_id_index_key key = {0};
 	s64 size;
@@ -111,10 +132,97 @@ static int remove_object_id_index(struct ntfs_inode *ni, struct ntfs_index_conte
 	if (size != sizeof(struct guid))
 		return -ENODATA;
 
-	if (!ntfs_index_lookup(&key, sizeof(struct object_id_index_key), xo))
+	if (!ntfs_index_lookup(&key, sizeof(struct object_id_index_key), xo)) {
+		if (handle)
+			return ntfs_index_entry_remove_transacted(handle, xo);
 		return ntfs_index_rm(xo);
+	}
 
 	return 0;
+}
+
+static int object_id_index_remove_log_credits(struct ntfs_inode *ni,
+		struct ntfs_index_context *xo)
+{
+	int credits;
+	int extra_credits;
+
+	if (!ni || !xo)
+		return -EINVAL;
+	credits = ntfs_index_node_remove_log_credits(ni->vol,
+			xo->block_size);
+	if (credits < 0)
+		return credits;
+	if (!NInoAttrList(xo->idx_ni))
+		return credits;
+	extra_credits = ntfs_index_attrlist_log_credits(ni->vol, 1);
+	if (extra_credits < 0 || check_add_overflow(credits, extra_credits,
+			&credits))
+		return extra_credits < 0 ? extra_credits : -EOVERFLOW;
+	return credits;
+}
+
+int ntfs_object_id_index_remove_log_credits(struct ntfs_inode *ni)
+{
+	struct ntfs_index_context *xo;
+	struct ntfs_inode *xoni;
+	int credits;
+
+	if (!ni)
+		return -EINVAL;
+	if (!ntfs_attr_exist(ni, AT_OBJECT_ID, AT_UNNAMED, 0))
+		return 0;
+	xo = open_object_id_index(ni->vol);
+	if (!xo)
+		return -EINVAL;
+	xoni = xo->idx_ni;
+	credits = object_id_index_remove_log_credits(ni, xo);
+	ntfs_index_ctx_put(xo);
+	iput(VFS_I(xoni));
+	return credits;
+}
+
+int ntfs_prepare_object_id_index_remove(struct ntfs_inode *ni,
+		struct ntfs_system_index_ctx *ctx)
+{
+	struct ntfs_index_context *xo;
+	struct inode *attr_vi;
+
+	if (!ni || !ctx)
+		return -EINVAL;
+	lockdep_assert_held(&ni->vol->system_index_lock);
+	attr_vi = ntfs_attr_iget(VFS_I(ni), AT_OBJECT_ID, AT_UNNAMED, 0);
+	if (IS_ERR(attr_vi))
+		return PTR_ERR(attr_vi) == -ENOENT ? 0 : PTR_ERR(attr_vi);
+	xo = open_object_id_index(ni->vol);
+	if (!xo) {
+		iput(attr_vi);
+		return -EINVAL;
+	}
+	ctx->attr = attr_vi;
+	ctx->index = xo;
+	return 0;
+}
+
+int ntfs_delete_object_id_index_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		struct ntfs_system_index_ctx *ctx)
+{
+	struct ntfs_inode *xoni;
+	int err;
+
+	if (!handle || !ni || !ctx)
+		return -EINVAL;
+	lockdep_assert_held(&ni->vol->system_index_lock);
+	lockdep_assert_held(&ni->mrec_lock);
+	if (!ctx->index)
+		return 0;
+	xoni = ctx->index->idx_ni;
+	mutex_lock_nested(&xoni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
+	err = remove_object_id_index(handle, NTFS_I(ctx->attr), ctx->index);
+	ntfs_index_ctx_reinit(ctx->index);
+	mutex_unlock(&xoni->mrec_lock);
+	return err;
 }
 
 /*
@@ -129,7 +237,9 @@ int ntfs_delete_object_id_index(struct ntfs_inode *ni)
 {
 	struct ntfs_index_context *xo;
 	struct ntfs_inode *xoni;
+	struct ntfs_log_handle *handle = NULL;
 	struct inode *attr_vi;
+	bool system_index_locked = false;
 	int ret = 0;
 
 	attr_vi = ntfs_attr_iget(VFS_I(ni), AT_OBJECT_ID, AT_UNNAMED, 0);
@@ -140,19 +250,58 @@ int ntfs_delete_object_id_index(struct ntfs_inode *ni)
 	 * read the existing object id and un-index it
 	 */
 	xo = open_object_id_index(ni->vol);
+	if (!xo) {
+		iput(attr_vi);
+		return -EIO;
+	}
 	if (xo) {
 		xoni = xo->idx_ni;
+		if (ni->vol->journal) {
+			int credits;
+
+			credits = object_id_index_remove_log_credits(ni, xo);
+			if (credits < 0) {
+				ret = credits;
+				goto put_index;
+			}
+			handle = ntfs_log_begin(ni->vol, credits);
+			if (IS_ERR(handle)) {
+				ret = PTR_ERR(handle);
+				handle = NULL;
+				goto put_index;
+			}
+			mutex_lock(&ni->vol->system_index_lock);
+			system_index_locked = true;
+		}
 		mutex_lock_nested(&xoni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
-		ret = remove_object_id_index(NTFS_I(attr_vi), xo);
-		if (!ret) {
+		ret = remove_object_id_index(handle, NTFS_I(attr_vi), xo);
+		if (!ret && handle) {
+			ret = ntfs_log_commit(handle);
+			handle = NULL;
+		} else if (!ret) {
 			ntfs_index_entry_mark_dirty(xo);
 			mark_mft_record_dirty(xoni);
 		}
+		if (ret && handle) {
+			int abort_err = ntfs_log_abort(handle);
+
+			handle = NULL;
+			if (abort_err)
+				ret = abort_err;
+		}
 		ntfs_index_ctx_put(xo);
 		mutex_unlock(&xoni->mrec_lock);
+		if (system_index_locked)
+			mutex_unlock(&ni->vol->system_index_lock);
 		iput(VFS_I(xoni));
 	}
 
+	iput(attr_vi);
+	return ret;
+
+put_index:
+	ntfs_index_ctx_put(xo);
+	iput(VFS_I(xoni));
 	iput(attr_vi);
 	return ret;
 }
