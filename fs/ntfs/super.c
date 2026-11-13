@@ -14,6 +14,7 @@
 #include <linux/sched/mm.h>
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
+#include <linux/ktime.h>
 
 #include "sysctl.h"
 #include "logfile.h"
@@ -31,13 +32,8 @@ static unsigned long ntfs_nr_upcase_users;
 
 static struct workqueue_struct *ntfs_wq;
 
-/* Error constants/strings used in inode.c::ntfs_show_options(). */
-enum {
-	/* One of these must be present, default is ON_ERRORS_CONTINUE. */
-	ON_ERRORS_PANIC = 0x01,
-	ON_ERRORS_REMOUNT_RO = 0x02,
-	ON_ERRORS_CONTINUE = 0x04,
-};
+static int ntfs_start_logfile_writer(struct ntfs_volume *vol);
+static s64 __get_nr_free_clusters(struct ntfs_volume *vol, bool strict);
 
 static const struct constant_table ntfs_param_enums[] = {
 	{ "panic",		ON_ERRORS_PANIC },
@@ -65,6 +61,14 @@ enum {
 static const struct constant_table ntfs_symlink_enums[] = {
 	{ "wsl",		SYMLINK_WSL },
 	{ "native",		SYMLINK_NATIVE },
+	{}
+};
+
+static const struct constant_table ntfs_journal_enums[] = {
+	{ "on",			NTFS_JOURNAL_ON },
+	{ "off",		NTFS_JOURNAL_OFF },
+	{ "reset",		NTFS_JOURNAL_RESET },
+	{ "replay",		NTFS_JOURNAL_REPLAY },
 	{}
 };
 
@@ -105,6 +109,8 @@ enum {
 	Opt_native_symlink,
 	Opt_symlink,
 	Opt_streams_interface,
+	Opt_norecovery,
+	Opt_journal,
 };
 
 static const struct fs_parameter_spec ntfs_parameters[] = {
@@ -134,6 +140,8 @@ static const struct fs_parameter_spec ntfs_parameters[] = {
 	fsparam_enum("symlink",			Opt_symlink, ntfs_symlink_enums),
 	fsparam_enum("streams_interface",	Opt_streams_interface,
 		     ntfs_streams_interface_enums),
+	fsparam_flag("norecovery",		Opt_norecovery),
+	fsparam_enum("journal",			Opt_journal, ntfs_journal_enums),
 	{}
 };
 
@@ -211,6 +219,7 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		break;
 	case Opt_preallocated_size:
 		vol->preallocated_size = (loff_t)result.uint_64;
+		vol->preallocated_size_set = true;
 		break;
 	case Opt_sys_immutable:
 		if (result.boolean)
@@ -288,6 +297,15 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	}
 	case Opt_sparse:
 		break;
+	case Opt_norecovery:
+		NVolSetNoRecovery(vol);
+		break;
+	case Opt_journal:
+		if (result.uint_32 != NTFS_JOURNAL_OFF)
+			return -EOPNOTSUPP;
+		vol->journal_mode = result.uint_32;
+		vol->journal_mode_set = true;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -295,31 +313,125 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	return 0;
 }
 
-static int ntfs_sync_volume_dirty_state(struct ntfs_volume *vol);
+static int ntfs_persist_volume_flags(struct ntfs_volume *vol, bool fallback)
+{
+	u64 started;
+	int err, flush_err;
+
+	err = __ntfs_write_inode(vol->vol_ino, 1);
+	if (!err && NInoDirty(NTFS_I(vol->vol_ino)))
+		err = -EAGAIN;
+	if (err)
+		ntfs_error(vol->sb, "Failed to write the volume flags (%d).",
+			   -err);
+	started = ktime_get_ns();
+	flush_err = blkdev_issue_flush(vol->sb->s_bdev);
+	if (fallback)
+		ntfs_log_account_lifecycle_fallback_flush(ktime_get_ns() - started);
+	if (flush_err)
+		ntfs_error(vol->sb, "Failed to flush the volume flags (%d).",
+			   -flush_err);
+	return err ? err : flush_err;
+}
+
+static int ntfs_start_unjournaled(struct ntfs_volume *vol)
+{
+	struct super_block *sb = vol->sb;
+	int err;
+
+	if (bdev_read_only(sb->s_bdev))
+		return -EROFS;
+	if (NVolRecoveryNeeded(vol) && vol->journal_mode != NTFS_JOURNAL_RESET)
+		return -EROFS;
+	if (NVolRecoveryNeeded(vol))
+		ntfs_warning(sb,
+			     "Discarding uncompleted recovery; volume will remain dirty. Run chkdsk/ntfsck.");
+
+	err = ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+	if (err)
+		return err;
+	err = ntfs_persist_volume_flags(vol, false);
+	if (err)
+		return err;
+
+	if (vol->journal_mode != NTFS_JOURNAL_RESET)
+		return 0;
+	if (!vol->logfile_ino || !ntfs_empty_logfile(vol->logfile_ino))
+		return -EIO;
+	err = sync_blockdev(sb->s_bdev);
+	if (!err)
+		err = blkdev_issue_flush(sb->s_bdev);
+	if (err)
+		ntfs_error(sb, "Failed to persist the LogFile reset (%d).", -err);
+	return err;
+}
+
+static int ntfs_finish_unjournaled(struct ntfs_volume *vol)
+{
+	int err, dirty_err;
+
+	/* Home writes must be durable before the dirty flag is cleared. */
+	err = sync_blockdev(vol->sb->s_bdev);
+	if (!err)
+		err = blkdev_issue_flush(vol->sb->s_bdev);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "Failed to flush unjournaled metadata (%d).", -err);
+		return err;
+	}
+
+	err = ntfs_sync_volume_dirty_state(vol);
+	if (!err)
+		err = ntfs_persist_volume_flags(vol, false);
+	if (err) {
+		dirty_err = ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+		if (!dirty_err)
+			dirty_err = ntfs_persist_volume_flags(vol, false);
+		if (dirty_err)
+			ntfs_error(vol->sb,
+				   "Failed to restore the volume dirty flag (%d).",
+				   -dirty_err);
+	}
+	return err;
+}
 
 static int ntfs_reconfigure(struct fs_context *fc)
 {
 	struct super_block *sb = fc->root->d_sb;
 	struct ntfs_volume *vol = NTFS_SB(sb);
+	struct ntfs_volume *options = fc->s_fs_info;
 	int err;
 
 	ntfs_debug("Entering with remount");
 
+	if (sb_rdonly(sb) && !(fc->sb_flags & SB_RDONLY)) {
+		ntfs_warning(sb, "Journal integration is incomplete; read-write remount is disabled.");
+		return -EROFS;
+	}
+
+	if (options->journal_mode_set &&
+	    options->journal_mode != vol->journal_mode) {
+		ntfs_warning(sb, "Cannot change journal mode on remount.");
+		return -EINVAL;
+	}
+	if (NVolNoRecovery(options) && !NVolNoRecovery(vol)) {
+		ntfs_warning(sb, "Cannot enable norecovery on remount.");
+		return -EINVAL;
+	}
+
 	err = sync_filesystem(sb);
 	if (err) {
 		ntfs_warning(sb, "Failed to sync the filesystem.");
-		/* A forced remount must still turn the superblock read-only. */
 		if (!(fc->sb_flags & SB_FORCE))
 			return err;
+		NVolSetErrors(vol);
 	}
 
 	/*
 	 * For the read-write compiled driver, if we are remounting read-write,
 	 * make sure there are no volume errors and that no unsupported volume
-	 * flags are set.  Also, empty the logfile journal as it would become
-	 * stale as soon as something is written to the volume and mark the
-	 * volume dirty so that chkdsk is run if the volume is not umounted
-	 * cleanly.
+	 * flags are set.  Also, start the logfile writer, mark the volume dirty
+	 * so that recovery is required if it is not unmounted cleanly.
 	 *
 	 * When remounting read-only, mark the volume clean if no volume errors
 	 * have occurred.
@@ -334,12 +446,27 @@ static int ntfs_reconfigure(struct fs_context *fc)
 				   es);
 			return -EROFS;
 		}
+		if (NVolNoRecovery(vol)) {
+			ntfs_warning(sb, "norecovery requires a read-only mount%s", es);
+			return -EROFS;
+		}
+		if (vol->journal_mode == NTFS_JOURNAL_REPLAY) {
+			ntfs_warning(sb, "journal=replay requires a read-only mount%s", es);
+			return -EROFS;
+		}
 		if (NVolErrors(vol)) {
 			ntfs_error(sb, "Volume has errors and is read-only%s",
 					es);
 			return -EROFS;
 		}
-		if (vol->vol_flags & VOLUME_IS_DIRTY) {
+		if (NVolRecoveryNeeded(vol) &&
+		    vol->journal_mode != NTFS_JOURNAL_RESET) {
+			ntfs_error(sb,
+				"Volume requires writable journal recovery%s", es);
+			return -EROFS;
+		}
+		if ((vol->vol_flags & VOLUME_IS_DIRTY) &&
+		    vol->journal_mode != NTFS_JOURNAL_RESET) {
 			ntfs_error(sb, "Volume is dirty and read-only%s", es);
 			return -EROFS;
 		}
@@ -347,72 +474,49 @@ static int ntfs_reconfigure(struct fs_context *fc)
 			ntfs_error(sb, "Volume has been modified by chkdsk and is read-only%s", es);
 			return -EROFS;
 		}
-		if (vol->vol_flags & VOLUME_MUST_MOUNT_RO_MASK) {
+		if (vol->vol_flags & (VOLUME_MUST_MOUNT_RO_MASK & ~VOLUME_IS_DIRTY)) {
 			ntfs_error(sb, "Volume has unsupported flags set (0x%x) and is read-only%s",
 					le16_to_cpu(vol->vol_flags), es);
 			return -EROFS;
 		}
-		if (vol->logfile_ino && !ntfs_empty_logfile(vol->logfile_ino)) {
-			ntfs_error(sb, "Failed to empty journal LogFile%s",
-					es);
+		if (vol->journal_mode == NTFS_JOURNAL_ON)
+			err = ntfs_start_logfile_writer(vol);
+		else
+			err = ntfs_start_unjournaled(vol);
+		if (err) {
+			ntfs_error(sb, "Failed to prepare writable mount (%d)%s",
+				   -err, es);
 			NVolSetErrors(vol);
 			return -EROFS;
 		}
 	} else if (!sb_rdonly(sb) && (fc->sb_flags & SB_RDONLY)) {
-		/* Remounting read-only. */
-		/*
-		 * With errors recorded the dirty bit is set rather than
-		 * cleared, and it is committed right away: the VFS does
-		 * not sync the filesystem during a remount, and once the
-		 * remount succeeds no further persistence point exists -
-		 * ntfs_sync_fs() is only ever invoked for read-write
-		 * superblocks (all its VFS callers skip read-only ones)
-		 * and ntfs_put_super() skips them, so the only remaining
-		 * write would be the evict-time commit at unmount, which
-		 * a crash never reaches.  An error recorded only after
-		 * the remount is still never persisted; a failed commit
-		 * or flush fails the remount, leaving the superblock
-		 * read-write so ntfs_put_super() retries at unmount.
-		 */
-		/*
-		 * A forced remount does not drain writers in progress,
-		 * so one may still be modifying metadata when the flags
-		 * are committed: never clear the dirty bit then; if
-		 * errors have been recorded, the update preserves or
-		 * sets it; otherwise, skip the update entirely.
-		 */
-		if (!(fc->sb_flags & SB_FORCE) || NVolErrors(vol)) {
-			err = ntfs_sync_volume_dirty_state(vol);
-			if (err) {
-				ntfs_warning(sb,
-					"Failed to update dirty bit in volume information flags.  Run chkdsk.");
-				return err;
-			}
+		bool forced = fc->sb_flags & SB_FORCE;
+
+		err = 0;
+		if (forced && vol->journal) {
+			/* In-flight writers can still need the journal. */
+			NVolSetRecoveryNeeded(vol);
+		} else if (vol->journal) {
+			err = ntfs_log_stop(vol, !NVolErrors(vol) &&
+					!NVolShutdown(vol) &&
+					!NVolRecoveryNeeded(vol));
+		} else if (!forced && !NVolErrors(vol) &&
+			   !NVolShutdown(vol) && !NVolRecoveryNeeded(vol)) {
+			err = ntfs_finish_unjournaled(vol);
 		}
-		if (NInoDirty(NTFS_I(vol->vol_ino))) {
-			/* ntfs_commit_inode() would discard the error. */
-			err = __ntfs_write_inode(vol->vol_ino, 1);
-			if (err) {
-				ntfs_warning(sb,
-					"Failed to commit volume information flags.  Run chkdsk.");
-				return err;
-			}
-			/*
-			 * write_mft_record() redirties the record on
-			 * -ENOMEM and still reports success.
-			 */
-			if (NInoDirty(NTFS_I(vol->vol_ino))) {
-				ntfs_warning(sb,
-					"Volume information flags remain dirty after commit.  Run chkdsk.");
-				return -EIO;
-			}
-			err = blkdev_issue_flush(sb->s_bdev);
-			if (err) {
-				ntfs_warning(sb,
-					"Failed to flush volume information flags.  Run chkdsk.");
-				return err;
-			}
+		if (err)
+			NVolSetErrors(vol);
+		if (NVolErrors(vol) && !NVolShutdown(vol) &&
+		    !NVolHibernated(vol)) {
+			int dirty_err = ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+
+			if (!dirty_err)
+				dirty_err = ntfs_persist_volume_flags(vol, true);
+			if (!err)
+				err = dirty_err;
 		}
+		if (err && !forced)
+			return err;
 	}
 
 	ntfs_debug("Done.");
@@ -576,7 +680,7 @@ int ntfs_set_volume_flags(struct ntfs_volume *vol, __le16 flags)
  *
  * Return 0 on success and -errno on error.
  */
-static int ntfs_sync_volume_dirty_state(struct ntfs_volume *vol)
+int ntfs_sync_volume_dirty_state(struct ntfs_volume *vol)
 {
 	if (NVolHibernated(vol))
 		return 0;
@@ -1318,6 +1422,31 @@ static int load_and_check_logfile(struct ntfs_volume *vol,
 	return err;
 }
 
+static int ntfs_start_logfile_writer(struct ntfs_volume *vol)
+{
+	struct restart_page_header *rp = NULL;
+	int err;
+
+	if (!ntfs_check_logfile(vol->logfile_ino, &rp))
+		return -EINVAL;
+	err = ntfs_log_start(vol, rp);
+	kvfree(rp);
+	if (err)
+		return err;
+
+	/* The journal is recoverable before the first mounted metadata write. */
+	err = ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+	if (err) {
+		ntfs_log_stop(vol, false);
+		return err;
+	}
+	/* The mount checkpoint preflush covers the dirty-bit MFT home write. */
+	err = ntfs_log_mount_checkpoint(vol);
+	if (err)
+		ntfs_log_stop(vol, false);
+	return err;
+}
+
 #define NTFS_HIBERFIL_HEADER_SIZE	4096
 
 /*
@@ -1423,6 +1552,93 @@ unm_iput_out:
 iput_out:
 	iput(vi);
 	return ret;
+}
+
+static bool ntfs_check_recovery_hibernation(struct ntfs_volume *vol)
+{
+	struct super_block *sb = vol->sb;
+	struct inode *root;
+	u8 saved_on_errors = vol->on_errors;
+	int err;
+
+	if (saved_on_errors == ON_ERRORS_PANIC)
+		vol->on_errors = ON_ERRORS_REMOUNT_RO;
+	root = ntfs_iget(sb, FILE_root);
+	if (IS_ERR(root)) {
+		err = PTR_ERR(root);
+	} else {
+		vol->root_ino = root;
+		err = check_windows_hibernation_status(vol);
+		vol->root_ino = NULL;
+		iput(root);
+	}
+	vol->on_errors = saved_on_errors;
+	if (err) {
+		ntfs_warning(sb,
+			     "Skipping recovery: Windows hibernation check returned %d.",
+			     err);
+		NVolSetHibernated(vol);
+		NVolSetErrors(vol);
+		sb->s_flags |= SB_RDONLY;
+		return false;
+	}
+	if (NVolErrors(vol)) {
+		sb->s_flags |= SB_RDONLY;
+		return false;
+	}
+	return true;
+}
+
+static bool ntfs_begin_readonly_recovery(struct ntfs_volume *vol)
+{
+	struct super_block *sb = vol->sb;
+
+	if (!sb_rdonly(sb) || !NVolRecoveryNeeded(vol) || NVolErrors(vol) ||
+	    NVolShutdown(vol) || !vol->mft_write_supported ||
+	    (vol->vol_flags & (VOLUME_MUST_MOUNT_RO_MASK & ~VOLUME_IS_DIRTY)))
+		return false;
+	if (NVolNoRecovery(vol) || bdev_read_only(sb->s_bdev)) {
+		ntfs_warning(sb, "Skipping recovery on read-only mount.");
+		return false;
+	}
+	if (!ntfs_check_recovery_hibernation(vol))
+		return false;
+
+	pr_info("(device %s): Enabling writes for read-only mount recovery.\n",
+		sb->s_id);
+	sb->s_flags &= ~SB_RDONLY;
+	return true;
+}
+
+static void ntfs_end_readonly_recovery(struct ntfs_volume *vol)
+{
+	if (vol->journal) {
+		bool clean = !NVolErrors(vol) && !NVolShutdown(vol);
+		int err = ntfs_log_stop(vol, clean);
+
+		if (err) {
+			ntfs_error(vol->sb, "Failed to finish read-only mount recovery (%d).",
+				   -err);
+			NVolSetErrors(vol);
+		}
+		if (clean) {
+			if (!NVolErrors(vol) && !NVolShutdown(vol)) {
+				NVolClearRecoveryNeeded(vol);
+			} else if (NVolShutdown(vol)) {
+				ntfs_error(vol->sb,
+					   "Cannot confirm the volume dirty flag on disk after journal shutdown. Run chkdsk/ntfsck.");
+			} else {
+				err = ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+				if (err)
+					ntfs_error(vol->sb,
+						   "Failed to restore the volume dirty flag (%d).",
+						   -err);
+				else
+					ntfs_persist_volume_flags(vol, true);
+			}
+		}
+	}
+	vol->sb->s_flags |= SB_RDONLY;
 }
 
 /*
@@ -1725,6 +1941,12 @@ static int load_system_files(struct ntfs_volume *vol)
 	struct volume_information *vi;
 	struct ntfs_attr_search_ctx *ctx;
 	struct restart_page_header *rp;
+	__le16 must_mount_ro;
+	bool requested_readonly = sb_rdonly(sb);
+	bool readonly_recovery = false;
+	bool resume_readonly_recovery = false;
+	bool replay_only = vol->journal_mode == NTFS_JOURNAL_REPLAY;
+	bool replay_only_failed = false;
 	int err, ret = -EINVAL;
 	u8 saved_on_errors;
 
@@ -1836,13 +2058,18 @@ get_ctx_vol_failed:
 	vol->vol_flags = vi->flags;
 	vol->major_ver = vi->major_ver;
 	vol->minor_ver = vi->minor_ver;
+	if (vol->vol_flags & VOLUME_IS_DIRTY)
+		NVolSetRecoveryNeeded(vol);
 	ntfs_attr_put_search_ctx(ctx);
 	unmap_mft_record(NTFS_I(vol->vol_ino));
 	pr_info("volume version %i.%i, dev %s, cluster size %d\n",
 		vol->major_ver, vol->minor_ver, sb->s_id, vol->cluster_size);
 
 	/* Make sure that no unsupported volume flags are set. */
-	if (vol->vol_flags & VOLUME_MUST_MOUNT_RO_MASK) {
+	must_mount_ro = vol->vol_flags & VOLUME_MUST_MOUNT_RO_MASK;
+	if (vol->journal_mode == NTFS_JOURNAL_RESET)
+		must_mount_ro &= ~VOLUME_IS_DIRTY;
+	if (must_mount_ro) {
 		static const char *es1a = "Volume is dirty";
 		static const char *es1b = "Volume has been modified by chkdsk";
 		static const char *es1c = "Volume has unsupported flags set";
@@ -1851,9 +2078,9 @@ get_ctx_vol_failed:
 		const char *es1, *es2;
 
 		es2 = es2a;
-		if (vol->vol_flags & VOLUME_IS_DIRTY)
+		if (must_mount_ro & VOLUME_IS_DIRTY)
 			es1 = es1a;
-		else if (vol->vol_flags & VOLUME_MODIFIED_BY_CHKDSK) {
+		else if (must_mount_ro & VOLUME_MODIFIED_BY_CHKDSK) {
 			es1 = es1b;
 			es2 = es2b;
 		} else {
@@ -1862,7 +2089,9 @@ get_ctx_vol_failed:
 					(unsigned int)le16_to_cpu(vol->vol_flags));
 		}
 		/* If a read-write mount, convert it to a read-only mount. */
-		if (!sb_rdonly(sb) && vol->on_errors == ON_ERRORS_REMOUNT_RO) {
+		if (!sb_rdonly(sb) &&
+		    (vol->on_errors == ON_ERRORS_REMOUNT_RO ||
+		     vol->journal_mode != NTFS_JOURNAL_ON)) {
 			sb->s_flags |= SB_RDONLY;
 			ntfs_error(sb, "%s.  Mounting read-only%s", es1, es2);
 		}
@@ -1878,15 +2107,89 @@ get_ctx_vol_failed:
 	rp = NULL;
 	err = load_and_check_logfile(vol, &rp);
 	if (err) {
-		/* If a read-write mount, convert it to a read-only mount. */
-		if (!sb_rdonly(sb) && vol->on_errors == ON_ERRORS_REMOUNT_RO) {
+		/* A writer cannot safely run without a validated recovery log. */
+		if (!sb_rdonly(sb)) {
 			sb->s_flags |= SB_RDONLY;
 			ntfs_error(sb, "Failed to load LogFile. Mounting read-only.");
 		}
 		NVolSetErrors(vol);
+		replay_only_failed = replay_only;
+	} else {
+		bool log_dirty = rp && !ntfs_is_logfile_clean(rp);
+
+		if (log_dirty)
+			NVolSetRecoveryNeeded(vol);
+		if (vol->journal_mode == NTFS_JOURNAL_OFF &&
+		    NVolRecoveryNeeded(vol) && !sb_rdonly(sb)) {
+			ntfs_warning(sb,
+				     "journal=off cannot write an unclean volume. Mounting read-only.");
+			sb->s_flags |= SB_RDONLY;
+		}
+		if (log_dirty && !sb_rdonly(sb) &&
+		    (vol->journal_mode == NTFS_JOURNAL_ON || replay_only))
+			ntfs_check_recovery_hibernation(vol);
+		if (requested_readonly &&
+		    (vol->journal_mode == NTFS_JOURNAL_ON ||
+		     (replay_only && log_dirty)))
+			readonly_recovery = ntfs_begin_readonly_recovery(vol);
+		if (log_dirty &&
+		    (vol->journal_mode == NTFS_JOURNAL_ON || replay_only)) {
+			if (replay_only && !readonly_recovery) {
+				ntfs_error(sb,
+					   "Cannot replay LogFile without writable recovery access.");
+				err = -EROFS;
+			} else {
+				err = ntfs_replay_logfile(vol, rp);
+			}
+			if (err) {
+				/*
+				 * Never expose a volume whose recovery state is unknown for
+				 * further mutation.  Continuing read-only still permits an
+				 * administrator to inspect and copy data before repair.
+				 */
+				ntfs_error(sb,
+					"LogFile could not be replayed (%d); volume left dirty.  Run chkdsk/ntfsck to repair.",
+					-err);
+				if (!sb_rdonly(sb)) {
+					sb->s_flags |= SB_RDONLY;
+					ntfs_error(sb,
+						   "Mounting read-only because journal recovery failed.");
+				}
+				NVolSetErrors(vol);
+				replay_only_failed = replay_only;
+			} else if (replay_only) {
+				if (sb_rdonly(sb) || NVolErrors(vol) || NVolShutdown(vol))
+					err = -EIO;
+				else
+					err = filemap_write_and_wait(vol->mft_ino->i_mapping);
+				if (!err)
+					err = sync_blockdev(sb->s_bdev);
+				if (!err)
+					err = blkdev_issue_flush(sb->s_bdev);
+				if (!err)
+					err = ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+				if (!err)
+					err = ntfs_persist_volume_flags(vol, false);
+				if (!err)
+					err = ntfs_log_finish_replay(vol, rp);
+				if (err) {
+					ntfs_error(sb, "Failed to finish journal replay (%d).",
+						   -err);
+					NVolSetErrors(vol);
+					replay_only_failed = true;
+				}
+			}
+		}
 	}
 
 	kvfree(rp);
+	if (readonly_recovery) {
+		/* Keep read-only inode permissions while loading system files. */
+		resume_readonly_recovery = !replay_only && !sb_rdonly(sb);
+		sb->s_flags |= SB_RDONLY;
+	}
+	if (replay_only_failed)
+		goto iput_logfile_err_out;
 	/* Get the root directory inode so we can do path lookups. */
 	vol->root_ino = ntfs_iget(sb, FILE_root);
 	if (IS_ERR(vol->root_ino)) {
@@ -1957,21 +2260,9 @@ get_ctx_vol_failed:
 			   err);
 	}
 
-	/* If (still) a read-write mount, empty the logfile. */
-	if (!sb_rdonly(sb) &&
-	    vol->logfile_ino && !ntfs_empty_logfile(vol->logfile_ino) &&
-	    vol->on_errors == ON_ERRORS_REMOUNT_RO) {
-		static const char *es1 = "Failed to empty LogFile";
-		static const char *es2 = ".  Mount in Windows.";
-
-		/* Convert to a read-only mount. */
-		ntfs_error(sb, "%s.  Mounting read-only%s", es1, es2);
-		sb->s_flags |= SB_RDONLY;
-		NVolSetErrors(vol);
-	}
 	/* If on NTFS versions before 3.0, we are done. */
 	if (unlikely(vol->major_ver < 3))
-		return 0;
+		goto start_writer;
 	/* NTFS 3.0+ specific initialization. */
 	/* Get the security descriptors inode. */
 	vol->secure_ino = ntfs_iget(sb, FILE_Secure);
@@ -1990,6 +2281,66 @@ get_ctx_vol_failed:
 		ntfs_error(sb, "Failed to load $Extend.");
 		goto iput_sec_err_out;
 	}
+start_writer:
+	if (resume_readonly_recovery && !NVolErrors(vol) && !NVolShutdown(vol))
+		sb->s_flags &= ~SB_RDONLY;
+	if (!sb_rdonly(sb) && NVolRecoveryNeeded(vol) && NVolErrors(vol)) {
+		ntfs_error(sb,
+			"Cannot recover a volume with errors. Mounting read-only.");
+		sb->s_flags |= SB_RDONLY;
+	}
+	if (!sb_rdonly(sb) && !NVolErrors(vol) &&
+	    vol->journal_mode == NTFS_JOURNAL_ON) {
+		if (NVolRecoveryNeeded(vol)) {
+			/*
+			 * Replay can update the bitmaps via the block-device
+			 * mapping, independently of their cached inode pages.
+			 */
+			err = sync_blockdev(sb->s_bdev);
+			if (!err)
+				err = invalidate_inode_pages2(
+						vol->mftbmp_ino->i_mapping);
+			if (!err)
+				err = invalidate_inode_pages2(
+						vol->lcnbmp_ino->i_mapping);
+			if (!err) {
+				s64 free_clusters;
+
+				free_clusters = __get_nr_free_clusters(vol, true);
+				if (free_clusters < 0)
+					err = free_clusters;
+			}
+			if (err) {
+				ntfs_error(sb,
+					"Cannot prepare recovery bitmaps (%d). Mounting read-only.",
+					-err);
+				NVolSetErrors(vol);
+				sb->s_flags |= SB_RDONLY;
+			}
+		}
+	}
+	if (!sb_rdonly(sb) && !NVolErrors(vol) &&
+	    vol->journal_mode == NTFS_JOURNAL_ON) {
+		err = ntfs_start_logfile_writer(vol);
+		if (err) {
+			ntfs_error(sb,
+				"Failed to start $LogFile writer (%d).  Mounting read-only.",
+				-err);
+			NVolSetErrors(vol);
+			sb->s_flags |= SB_RDONLY;
+		}
+	} else if (!sb_rdonly(sb) && !NVolErrors(vol)) {
+		err = ntfs_start_unjournaled(vol);
+		if (err) {
+			ntfs_error(sb,
+				   "Failed to prepare unjournaled mount (%d). Mounting read-only.",
+				   -err);
+			NVolSetErrors(vol);
+			sb->s_flags |= SB_RDONLY;
+		}
+	}
+	if (readonly_recovery)
+		ntfs_end_readonly_recovery(vol);
 	return 0;
 
 iput_sec_err_out:
@@ -2026,6 +2377,8 @@ iput_mftbmp_err_out:
 	iput(vol->mftbmp_ino);
 iput_mirr_err_out:
 	iput(vol->mftmirr_ino);
+	if (readonly_recovery)
+		sb->s_flags |= SB_RDONLY;
 	return ret;
 }
 
@@ -2068,6 +2421,38 @@ static void ntfs_volume_free(struct ntfs_volume *vol)
 	kfree(vol);
 }
 
+static int ntfs_commit_inode_unmount(struct ntfs_volume *vol,
+		struct inode *vi)
+{
+	int err;
+
+	if (!vi || NVolShutdown(vol))
+		return 0;
+	err = __ntfs_write_inode(vi, 1);
+	if (err == -EAGAIN && vol->journal) {
+		err = ntfs_log_reclaim_locked(vol);
+		if (!err)
+			err = __ntfs_write_inode(vi, 1);
+	}
+	if (err) {
+		NVolSetErrors(vol);
+		ntfs_error(vol->sb,
+			   "Failed to commit inode 0x%llx during unmount (error %d).",
+			   (unsigned long long)NTFS_I(vi)->mft_no, err);
+	}
+	return err;
+}
+
+static void ntfs_unmount_io_error(struct ntfs_volume *vol,
+		const char *operation, int err)
+{
+	if (!err)
+		return;
+	NVolSetErrors(vol);
+	ntfs_error(vol->sb, "Failed to %s during unmount (error %d).",
+		   operation, err);
+}
+
 /*
  * ntfs_put_super - called by the vfs to unmount a volume
  * @sb:		vfs superblock of volume to unmount
@@ -2075,8 +2460,10 @@ static void ntfs_volume_free(struct ntfs_volume *vol)
 static void ntfs_put_super(struct super_block *sb)
 {
 	struct ntfs_volume *vol = NTFS_SB(sb);
-
-	pr_info("Entering %s, dev %s\n", __func__, sb->s_id);
+	bool had_journal;
+	bool dirty_state_persisted = false;
+	u64 started;
+	int err;
 
 	cancel_work_sync(&vol->precalc_work);
 
@@ -2084,47 +2471,53 @@ static void ntfs_put_super(struct super_block *sb)
 	 * Commit all inodes while they are still open in case some of them
 	 * cause others to be dirtied.
 	 */
-	ntfs_commit_inode(vol->vol_ino);
+	ntfs_commit_inode_unmount(vol, vol->vol_ino);
 
 	/* NTFS 3.0+ specific. */
 	if (vol->major_ver >= 3) {
 		if (vol->extend_ino)
-			ntfs_commit_inode(vol->extend_ino);
+			ntfs_commit_inode_unmount(vol, vol->extend_ino);
 		if (vol->secure_ino)
-			ntfs_commit_inode(vol->secure_ino);
+			ntfs_commit_inode_unmount(vol, vol->secure_ino);
 	}
 
-	ntfs_commit_inode(vol->root_ino);
+	ntfs_commit_inode_unmount(vol, vol->root_ino);
 
-	ntfs_commit_inode(vol->lcnbmp_ino);
-
-	/*
-	 * the GFP_NOFS scope is not needed because ntfs_commit_inode
-	 * does nothing
-	 */
-	ntfs_commit_inode(vol->mftbmp_ino);
+	ntfs_commit_inode_unmount(vol, vol->lcnbmp_ino);
+	ntfs_commit_inode_unmount(vol, vol->mftbmp_ino);
 
 	if (vol->logfile_ino)
-		ntfs_commit_inode(vol->logfile_ino);
+		ntfs_commit_inode_unmount(vol, vol->logfile_ino);
 
 	if (vol->mftmirr_ino)
-		ntfs_commit_inode(vol->mftmirr_ino);
-	ntfs_commit_inode(vol->mft_ino);
-
+		ntfs_commit_inode_unmount(vol, vol->mftmirr_ino);
+	ntfs_commit_inode_unmount(vol, vol->mft_ino);
 	/*
-	 * If a read-write mount, re-commit all affected inodes once more.
-	 * The dirty state itself is persisted at the end of ntfs_put_super(),
-	 * after the last commits and the final write_inode_now(): those can
-	 * still record errors via __ntfs_write_inode(), and the sync must
-	 * evaluate NVolErrors() with the last setter already run.
+	 * MFT record writeback owns private BIO snapshots and may unlock the
+	 * page-cache folio before those BIOs complete.  Drain the mapping before
+	 * stopping the journal so bitmap home updates cannot become visible while
+	 * a freed MFT record is still only dirty in memory.
 	 */
-	if (!sb_rdonly(sb)) {
-		if (!NVolErrors(vol)) {
-			ntfs_commit_inode(vol->root_ino);
-			if (vol->mftmirr_ino)
-				ntfs_commit_inode(vol->mftmirr_ino);
-			ntfs_commit_inode(vol->mft_ino);
-		}
+	err = filemap_write_and_wait(vol->mft_ino->i_mapping);
+	if (!NVolShutdown(vol))
+		ntfs_unmount_io_error(vol,
+				"write back the $MFT mapping before journal stop", err);
+
+	had_journal = !!vol->journal;
+	if (had_journal) {
+		err = ntfs_log_stop(vol, !NVolErrors(vol) && !NVolShutdown(vol));
+		if (!NVolShutdown(vol) || err != -EROFS)
+			ntfs_unmount_io_error(vol, "stop the journal", err);
+	}
+
+	/* Journal clean-stop already collected these home writes. */
+	if (!sb_rdonly(sb) && !NVolShutdown(vol) && !NVolErrors(vol) &&
+	    !had_journal) {
+		ntfs_commit_inode_unmount(vol, vol->vol_ino);
+		ntfs_commit_inode_unmount(vol, vol->root_ino);
+		if (vol->mftmirr_ino)
+			ntfs_commit_inode_unmount(vol, vol->mftmirr_ino);
+		ntfs_commit_inode_unmount(vol, vol->mft_ino);
 	}
 
 	/* NTFS 3.0+ specific clean up. */
@@ -2153,75 +2546,80 @@ static void ntfs_put_super(struct super_block *sb)
 		vol->logfile_ino = NULL;
 	}
 	if (vol->mftmirr_ino) {
-		/* Re-commit the mft mirror and mft just in case. */
-		ntfs_commit_inode(vol->mftmirr_ino);
-		ntfs_commit_inode(vol->mft_ino);
+		/* Keep the mirror available for the final volume-flag write. */
+		ntfs_commit_inode_unmount(vol, vol->mftmirr_ino);
+		ntfs_commit_inode_unmount(vol, vol->mft_ino);
 	}
 	/*
 	 * We should have no dirty inodes left, due to
 	 * mft.c::ntfs_mft_writepage() cleaning all the dirty pages as
 	 * the underlying mft records are written out and cleaned.
 	 */
-	ntfs_commit_inode(vol->mft_ino);
-	write_inode_now(vol->mft_ino, 1);
+	ntfs_commit_inode_unmount(vol, vol->mft_ino);
+	if (!NVolShutdown(vol)) {
+		err = write_inode_now(vol->mft_ino, 1);
+		ntfs_unmount_io_error(vol, "write back the $MFT inode", err);
+	}
+	err = filemap_write_and_wait(vol->mft_ino->i_mapping);
+	if (!NVolShutdown(vol))
+		ntfs_unmount_io_error(vol, "write back the final $MFT mapping", err);
+	started = ktime_get_ns();
+	if (!sb_rdonly(sb) && !NVolShutdown(vol) && !NVolErrors(vol) &&
+	    !had_journal && !NVolRecoveryNeeded(vol))
+		err = ntfs_finish_unjournaled(vol);
+	else
+		err = blkdev_issue_flush(sb->s_bdev);
+	ntfs_log_account_unmount_final_flush(ktime_get_ns() - started);
+	ntfs_unmount_io_error(vol, "flush the block device", err);
 
 	/*
-	 * If a read-write mount, persist the error state in the volume flags:
-	 * mark the volume clean if no volume errors have occurred, and make
-	 * sure VOLUME_IS_DIRTY is on disk if any have, so chkdsk runs on the
-	 * next mount.
+	 * The journal clean-stop precedes final inode eviction.  If any late
+	 * commit or flush failed, restore and persist the volume dirty flag while
+	 * the volume and MFT inodes are still available.
 	 */
-	if (!sb_rdonly(sb)) {
-		if (ntfs_sync_volume_dirty_state(vol)) {
-			ntfs_warning(sb,
-				"Failed to sync dirty bit in volume information flags.  Run chkdsk.");
+	if (!sb_rdonly(sb) && NVolErrors(vol) && !NVolShutdown(vol) &&
+	    !NVolHibernated(vol)) {
+		err = ntfs_set_volume_flags(vol, VOLUME_IS_DIRTY);
+		if (err) {
+			ntfs_unmount_io_error(vol,
+					"restore the volume dirty flag", err);
 		} else {
-			/*
-			 * __ntfs_write_inode(), not the void
-			 * ntfs_commit_inode() wrapper: the error can only
-			 * be warned about here.  The mirror inode is only
-			 * released below: writing the $Volume record (mft
-			 * record number 3, below vol->mftmirr_size) mirrors
-			 * it through ntfs_sync_mft_mirror(), which fails
-			 * with -EIO once vol->mftmirr_ino is gone.
-			 */
-			if (__ntfs_write_inode(vol->vol_ino, 1)) {
-				ntfs_warning(sb,
-					"Failed to commit volume information flags.  Run chkdsk.");
-			} else if (NInoDirty(NTFS_I(vol->vol_ino))) {
-				ntfs_warning(sb,
-					"Volume information flags remain dirty after commit.  Run chkdsk.");
-			} else if (NVolErrors(vol)) {
-				/*
-				 * Only warn once the commit has succeeded,
-				 * or this could contradict a failure
-				 * reported above.
-				 */
-				ntfs_warning(sb,
-					"Volume has errors.  Leaving volume marked dirty.  Run chkdsk.");
-			}
+			int commit_err;
+			int mapping_err;
+			int flush_err;
+
+			commit_err = ntfs_commit_inode_unmount(vol,
+					vol->vol_ino);
+			mapping_err = filemap_write_and_wait(
+					vol->mft_ino->i_mapping);
+			ntfs_unmount_io_error(vol,
+					"write back the dirty volume flag",
+					mapping_err);
+			started = ktime_get_ns();
+			flush_err = blkdev_issue_flush(sb->s_bdev);
+			ntfs_log_account_unmount_final_flush(
+					ktime_get_ns() - started);
+			ntfs_unmount_io_error(vol,
+					"flush the dirty volume flag", flush_err);
+			dirty_state_persisted = !commit_err && !mapping_err &&
+					!flush_err;
 		}
+		if (dirty_state_persisted)
+			ntfs_warning(sb,
+				"Volume has errors.  Leaving volume marked dirty.  Run chkdsk.");
+		else
+			ntfs_error(sb,
+				"Volume has errors and the dirty flag could not be confirmed on disk.  Run chkdsk.");
 	}
 
-	/*
-	 * Release $Volume while the mft inode is still available: if the
-	 * commit above failed before it could clear the dirty flag,
-	 * ntfs_evict_big_inode() commits the inode again on its way out,
-	 * and __ntfs_write_inode() needs vol->mft_ino to look up the
-	 * runlist of the record to write.
-	 */
 	iput(vol->vol_ino);
 	vol->vol_ino = NULL;
-
 	if (vol->mftmirr_ino) {
 		iput(vol->mftmirr_ino);
 		vol->mftmirr_ino = NULL;
 	}
-
 	iput(vol->mft_ino);
 	vol->mft_ino = NULL;
-	blkdev_issue_flush(sb->s_bdev);
-
 	ntfs_volume_free(vol);
 }
 
@@ -2285,14 +2683,24 @@ static int ntfs_sync_fs(struct super_block *sb, int wait)
 		ntfs_warning(sb, "Failed to sync dirty bit in volume information flags.  Run chkdsk.");
 		err = -EIO;
 	}
-	sync_inodes_sb(sb);
-	ret = sync_blockdev(sb->s_bdev);
-	if (ret && !err)
-		err = ret;
-
-	ret = blkdev_issue_flush(sb->s_bdev);
-	if (ret && !err)
-		err = ret;
+	if (vol->journal) {
+		ret = ntfs_log_checkpoint(vol, false);
+		/* Deferred writeback and insufficient checkpoint space are retryable. */
+		if (!err && (ret == -EAGAIN || ret == -ENOSPC))
+			return ret;
+		if (ret && !err)
+			err = ret;
+	} else {
+		sync_inodes_sb(sb);
+		ret = sync_blockdev(sb->s_bdev);
+		if (ret && !err)
+			err = ret;
+		ret = blkdev_issue_flush(sb->s_bdev);
+		if (ret && !err)
+			err = ret;
+	}
+	if (err)
+		NVolSetErrors(vol);
 	return err;
 }
 
@@ -2315,7 +2723,7 @@ static int ntfs_sync_fs(struct super_block *sb, int wait)
  * in use. This means we return an underestimate on errors which is better than
  * an overestimate.
  */
-s64 get_nr_free_clusters(struct ntfs_volume *vol)
+static s64 __get_nr_free_clusters(struct ntfs_volume *vol, bool strict)
 {
 	s64 nr_free = vol->nr_clusters;
 	u32 nr_used;
@@ -2353,6 +2761,8 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 
 		/* Ignore pages which errored synchronously. */
 		if (IS_ERR(folio)) {
+			if (strict)
+				return PTR_ERR(folio);
 			ntfs_debug("Skipping page (index 0x%lx).", index);
 			nr_free -= PAGE_SIZE * 8;
 			vol->lcn_empty_bits_per_page[index] = 0;
@@ -2394,29 +2804,70 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
 	return nr_free;
 }
 
-/*
- * @nr_clusters is the number of clusters requested for allocation.
- *
- * Return the number of clusters available for allocation within
- * the range of @nr_clusters, which is counts that considered
- * for delayed allocation.
- */
+s64 get_nr_free_clusters(struct ntfs_volume *vol)
+{
+	return __get_nr_free_clusters(vol, false);
+}
+
 s64 ntfs_available_clusters_count(struct ntfs_volume *vol, s64 nr_clusters)
 {
 	s64 free_clusters;
 
-	/* wait event */
 	if (!NVolFreeClusterKnown(vol))
 		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
-
 	free_clusters = atomic64_read(&vol->free_clusters) -
 		atomic64_read(&vol->dirty_clusters);
 	if (free_clusters <= 0)
 		return -ENOSPC;
-	else if (free_clusters < nr_clusters)
-		nr_clusters = free_clusters;
+	return min(free_clusters, nr_clusters);
+}
 
-	return nr_clusters;
+/*
+ * @nr_clusters is the number of clusters requested for allocation.
+ *
+ * Reserve up to @nr_clusters for delayed allocation and return the charge.
+ */
+s64 ntfs_reserve_dirty_clusters(struct ntfs_volume *vol, s64 nr_clusters)
+{
+	s64 free_clusters, dirty_clusters, reserved;
+	int err;
+
+	if (nr_clusters <= 0) {
+		ntfs_error(vol->sb, "Invalid delayed allocation request (%lld clusters).",
+				(long long)nr_clusters);
+		return -EINVAL;
+	}
+	if (!NVolFreeClusterKnown(vol))
+		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
+	if (READ_ONCE(vol->journal)) {
+		free_clusters = atomic64_read(&vol->free_clusters) -
+				atomic64_read(&vol->dirty_clusters);
+		err = ntfs_log_reclaim_deferred(vol, NTFS_LOG_DEFERRED_CLUSTERS,
+				free_clusters, nr_clusters, false);
+		if (err)
+			return err;
+	}
+
+	down_read(&vol->lcnbmp_lock);
+	do {
+		dirty_clusters = atomic64_read(&vol->dirty_clusters);
+		free_clusters = atomic64_read(&vol->free_clusters) -
+			dirty_clusters;
+		if (free_clusters <= 0) {
+			up_read(&vol->lcnbmp_lock);
+			ntfs_error(vol->sb,
+				"Delayed allocation reservation reports no space (free clusters %lld, dirty clusters %lld, requested %lld, total clusters %lld).",
+				(long long)atomic64_read(&vol->free_clusters),
+				(long long)dirty_clusters,
+				(long long)nr_clusters,
+				(long long)vol->nr_clusters);
+			return -ENOSPC;
+		}
+		reserved = min(nr_clusters, free_clusters);
+	} while (atomic64_cmpxchg(&vol->dirty_clusters, dirty_clusters,
+			dirty_clusters + reserved) != dirty_clusters);
+	up_read(&vol->lcnbmp_lock);
+	return reserved;
 }
 
 /*
@@ -2514,12 +2965,26 @@ static unsigned long __get_nr_free_mft_records(struct ntfs_volume *vol,
 static int ntfs_statfs(struct dentry *dentry, struct kstatfs *sfs)
 {
 	struct super_block *sb = dentry->d_sb;
-	s64 size;
+	s64 size, free_clusters, free_mft_records;
 	struct ntfs_volume *vol = NTFS_SB(sb);
 	struct ntfs_inode *mft_ni = NTFS_I(vol->mft_ino);
 	unsigned long flags;
+	int err;
 
 	ntfs_debug("Entering.");
+	/* wait event */
+	if (!NVolFreeClusterKnown(vol))
+		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
+
+	if (READ_ONCE(vol->journal)) {
+		err = ntfs_log_get_free_counts(vol, &free_clusters,
+				&free_mft_records);
+		if (err)
+			return err;
+	} else {
+		free_clusters = atomic64_read(&vol->free_clusters);
+		free_mft_records = atomic64_read(&vol->free_mft_records);
+	}
 	/* Type of filesystem. */
 	sfs->f_type   = NTFS_SB_MAGIC;
 	/* Optimal transfer block size. */
@@ -2534,13 +2999,8 @@ static int ntfs_statfs(struct dentry *dentry, struct kstatfs *sfs)
 	 */
 	sfs->f_blocks = vol->nr_clusters;
 
-	/* wait event */
-	if (!NVolFreeClusterKnown(vol))
-		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
-
 	/* Free data blocks in filesystem in units of f_bsize. */
-	size = atomic64_read(&vol->free_clusters) -
-		atomic64_read(&vol->dirty_clusters);
+	size = free_clusters - atomic64_read(&vol->dirty_clusters);
 	if (size < 0LL)
 		size = 0LL;
 
@@ -2553,7 +3013,7 @@ static int ntfs_statfs(struct dentry *dentry, struct kstatfs *sfs)
 	read_unlock_irqrestore(&mft_ni->size_lock, flags);
 
 	/* Free inodes in fs (based on current total count). */
-	size = atomic64_read(&vol->free_mft_records);
+	size = free_mft_records;
 	if (unlikely(size < 0 || size > (s64)sfs->f_files))
 		ntfs_warning(vol->sb, "Invalid free MFT record count %lld.", size);
 	if (size < 0)
@@ -2639,6 +3099,11 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	vol->sb = sb;
 
+	if (!sb_rdonly(sb)) {
+		ntfs_warning(sb, "Journal integration is incomplete; mounting read-only.");
+		sb->s_flags |= SB_RDONLY;
+	}
+
 	/*
 	 * We do a pretty difficult piece of bootstrap by reading the
 	 * MFT (and other metadata) from disk into memory. We'll only
@@ -2651,6 +3116,19 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	 */
 	lockdep_off();
 	ntfs_debug("Entering.");
+
+	if (NVolNoRecovery(vol) && !sb_rdonly(sb)) {
+		ntfs_warning(sb, "norecovery requires a read-only mount.");
+		goto err_out_now;
+	}
+	if (NVolNoRecovery(vol) && vol->journal_mode == NTFS_JOURNAL_REPLAY) {
+		ntfs_warning(sb, "norecovery conflicts with journal=replay.");
+		goto err_out_now;
+	}
+	if (vol->journal_mode == NTFS_JOURNAL_REPLAY && !sb_rdonly(sb)) {
+		ntfs_warning(sb, "journal=replay mounts read-only after recovery.");
+		sb->s_flags |= SB_RDONLY;
+	}
 
 	if (vol->nls_map && !strcmp(vol->nls_map->charset, "utf8"))
 		vol->nls_utf8 = true;
@@ -2797,6 +3275,7 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 			   "Unable to allocate pages for storing LCN empty bit counts\n");
 		goto unl_upcase_iput_tmp_ino_err_out_now;
 	}
+	init_waitqueue_head(&vol->free_waitq);
 
 	/*
 	 * From now on, ignore @silent parameter. If we fail below this line,
@@ -2838,7 +3317,6 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 				   7) >> 3) + PAGE_SIZE - 1) >> PAGE_SHIFT);
 		ntfs_debug("Free mft records(%lld)", nr_records);
 
-		init_waitqueue_head(&vol->free_waitq);
 		INIT_WORK(&vol->precalc_work, precalc_free_clusters);
 		queue_work(ntfs_wq, &vol->precalc_work);
 		return 0;
@@ -2989,6 +3467,7 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 		.dmask = 0,
 		.mft_zone_multiplier = 1,
 		.on_errors = ON_ERRORS_CONTINUE,
+		.journal_mode = NTFS_JOURNAL_OFF,
 		.nls_map = load_nls_default(),
 		.preallocated_size = NTFS_DEF_PREALLOC_SIZE,
 	};
@@ -2998,6 +3477,8 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 	init_rwsem(&vol->mftbmp_lock);
 	init_rwsem(&vol->lcnbmp_lock);
 	mutex_init(&vol->volume_label_lock);
+	init_rwsem(&vol->journal_lock);
+	mutex_init(&vol->system_index_lock);
 
 	fc->s_fs_info = vol;
 	fc->ops = &ntfs_context_ops;
@@ -3099,6 +3580,12 @@ static int __init init_ntfs_fs(void)
 		goto sysctl_err_out;
 	}
 
+	err = ntfs_log_replay_stats_init();
+	if (err) {
+		pr_crit("Failed to initialize LogFile replay statistics!\n");
+		goto replay_stats_err_out;
+	}
+
 	err = register_filesystem(&ntfs_fs_type);
 	if (!err) {
 		ntfs_debug("NTFS driver registered successfully.");
@@ -3106,6 +3593,8 @@ static int __init init_ntfs_fs(void)
 	}
 	pr_crit("Failed to register NTFS filesystem driver!\n");
 
+	ntfs_log_replay_stats_exit();
+replay_stats_err_out:
 	/* Unregister the ntfs sysctls. */
 	ntfs_sysctl(0);
 sysctl_err_out:
@@ -3132,6 +3621,7 @@ static void __exit exit_ntfs_fs(void)
 	ntfs_debug("Unregistering NTFS driver.");
 
 	unregister_filesystem(&ntfs_fs_type);
+	ntfs_log_replay_stats_exit();
 
 	/*
 	 * Make sure all delayed rcu free inodes are flushed before we

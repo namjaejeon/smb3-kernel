@@ -44,6 +44,7 @@ static inline void mark_mft_record_dirty(struct ntfs_inode *ni)
 
 int ntfs_mft_bioset_init(void);
 void ntfs_mft_bioset_exit(void);
+int ntfs_prepare_mft_record_write(struct ntfs_inode *ni);
 int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int sync);
 
 /*

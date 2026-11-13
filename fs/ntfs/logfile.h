@@ -10,6 +10,13 @@
 
 #include "layout.h"
 
+struct ntfs_volume;
+struct ntfs_log;
+struct ntfs_log_handle;
+struct ntfs_ordered_io;
+struct inode;
+struct runlist_element;
+
 /*
  * Journal (LogFile) organization:
  *
@@ -239,7 +246,254 @@ struct log_client_record {
 	__le16 client_name[64];
 } __packed;
 
+/* On-disk payload used by SetNewAttributeSizes redo/undo records. */
+struct ntfs_new_attribute_sizes {
+	__le64 alloc_size;
+	__le64 valid_size;
+	__le64 data_size;
+	__le64 total_size;
+} __packed;
+
 bool ntfs_check_logfile(struct inode *log_vi,
 		struct restart_page_header **rp);
+bool ntfs_is_logfile_clean(const struct restart_page_header *rp);
+int ntfs_replay_logfile(struct ntfs_volume *vol,
+		const struct restart_page_header *rp);
 bool ntfs_empty_logfile(struct inode *log_vi);
+int ntfs_log_replay_stats_init(void);
+void ntfs_log_replay_stats_exit(void);
+int ntfs_log_start(struct ntfs_volume *vol,
+		const struct restart_page_header *rp);
+int ntfs_log_mount_checkpoint(struct ntfs_volume *vol);
+int ntfs_log_checkpoint(struct ntfs_volume *vol, bool clean);
+void ntfs_log_inode_writeback_deferred(struct ntfs_volume *vol);
+/*
+ * Space-pressure checkpoint with s_umount pinning and thaw wait. Call without
+ * metadata/folio/invalidate/s_umount locks or sb_start_pagefault protection.
+ */
+int ntfs_log_reclaim(struct ntfs_volume *vol);
+/* Caller pins s_umount. No metadata/folio/invalidate/pagefault locks. */
+int ntfs_log_reclaim_locked(struct ntfs_volume *vol);
+/* Wait for checkpoint gates, with the same unlocked/thaw contract as reclaim. */
+int ntfs_log_wait_ready(struct ntfs_volume *vol);
+int ntfs_log_stop(struct ntfs_volume *vol, bool clean);
+int ntfs_log_finish_replay(struct ntfs_volume *vol,
+			   const struct restart_page_header *rp);
+int ntfs_log_wait_lsn(struct ntfs_volume *vol, u64 required_lsn);
+int ntfs_log_writeback_lsn(struct ntfs_volume *vol, u64 required_lsn,
+		bool sync);
+int ntfs_log_track_inode(struct ntfs_log_handle *handle, struct inode *vi,
+		u64 required_lsn);
+int ntfs_log_wait_inode(struct inode *vi);
+int ntfs_log_writeback_inode(struct inode *vi, bool sync);
+int ntfs_log_flush(struct ntfs_volume *vol);
+void ntfs_log_account_metadata_home_flush(u64 nanoseconds);
+void ntfs_log_account_unmount_final_flush(u64 nanoseconds);
+void ntfs_log_account_lifecycle_fallback_flush(u64 nanoseconds);
+
+/*
+ * Transactions may execute concurrently, while appends remain serialized in
+ * LSN order.  The task that begins a transaction must commit or abort it.
+ * Credits count operation/open-attribute RCRD pages. Commit and worst-case CLR
+ * space are reserved internally.  A caller must restore changed home metadata
+ * before ntfs_log_abort(), after which the recorder emits the matching CLRs.
+ * Nonresident home blocks that outlive their mutation context can register
+ * handle-owned restore callbacks. Abort and commit failure invoke them in
+ * reverse order. Optional abort callbacks run after the CLR records and
+ * ForgetTransaction marker are durable. They are skipped if abort logging
+ * fails. Optional commit callbacks run in registration order after a durable
+ * commit marker and before releasing the transaction lock. Registering a
+ * commit callback forces that transaction to commit durably.
+ */
+/* Start with a small reservation and grow within shared foreground headroom. */
+struct ntfs_log_handle *ntfs_log_begin(struct ntfs_volume *vol,
+		unsigned int credits);
+/*
+ * Try checkpoint gates. Unlock before waiting for -EBUSY or reclaiming -EAGAIN.
+ */
+struct ntfs_log_handle *ntfs_log_begin_locked(struct ntfs_volume *vol,
+		unsigned int credits);
+/* Reserve the full credit bound before activating the transaction. */
+struct ntfs_log_handle *ntfs_log_begin_full_reservation(
+		struct ntfs_volume *vol, unsigned int credits);
+/* Fund and enforce a known maximum number of forward-record pages. */
+struct ntfs_log_handle *ntfs_log_begin_bounded(struct ntfs_volume *vol,
+		unsigned int credits);
+/* Reserve full credits while mount recovery holds s_umount exclusively. */
+struct ntfs_log_handle *ntfs_log_begin_mount_full(struct ntfs_volume *vol,
+						  unsigned int credits);
+/* Physical full-reservation ceiling, not a guarantee of current free space. */
+int ntfs_log_transaction_credits_limit(struct ntfs_volume *vol);
+/*
+ * Commit shared allocator growth independently of @parent. The parent pins
+ * the recorder and its locks until this handle is finished. Unused parent
+ * credits are lent to this handle without reducing the parent's undo reserve.
+ * Space pressure returns -EAGAIN instead of checkpointing beneath the parent.
+ */
+struct ntfs_log_handle *ntfs_log_begin_independent(
+		struct ntfs_log_handle *parent, unsigned int credits);
+/* Try to fund the entire bound while retaining the parent's undo reserve. */
+struct ntfs_log_handle *ntfs_log_begin_independent_full(
+		struct ntfs_log_handle *parent, unsigned int credits);
+/*
+ * Use an empty writeback handle only as an admission pin. Its independent
+ * metadata transactions may join the normal asynchronous commit generation.
+ */
+struct ntfs_log_handle *ntfs_log_begin_independent_writeback(
+		struct ntfs_log_handle *parent, unsigned int credits);
+int ntfs_log_register_home_undo(struct ntfs_log_handle *handle,
+		int (*restore)(void *data), void (*release)(void *data),
+		void *data);
+/* The first small undo is copied into the handle and released with it. */
+#define NTFS_LOG_HOME_UNDO_BUFFER_BYTES	128
+int ntfs_log_register_home_undo_buffer(struct ntfs_log_handle *handle,
+		int (*restore)(void *data), void (*release)(void *data),
+		const void *data, size_t bytes);
+int ntfs_log_register_home_undo_with_commit(struct ntfs_log_handle *handle,
+		int (*restore)(void *data), int (*commit)(void *data),
+		void (*release)(void *data), void *data);
+enum ntfs_log_deferred_kind {
+	NTFS_LOG_DEFERRED_CLUSTERS,
+	NTFS_LOG_DEFERRED_MFT,
+	NTFS_LOG_DEFERRED_KINDS,
+};
+int ntfs_log_register_deferred_free(struct ntfs_log_handle *handle,
+		int (*restore)(void *data), int (*commit)(void *data),
+		void (*release)(void *data), void *data,
+		enum ntfs_log_deferred_kind kind, u64 units, size_t bytes);
+/*
+ * Wait for durable deferred frees under allocation pressure.  The caller
+ * must not hold the corresponding bitmap lock.
+ */
+int ntfs_log_reclaim_deferred(struct ntfs_volume *vol,
+		enum ntfs_log_deferred_kind kind, s64 available, s64 needed,
+		bool force);
+/* Include committed deferred frees without making their bitmap bits reusable. */
+int ntfs_log_get_free_counts(struct ntfs_volume *vol, s64 *clusters,
+		s64 *mft_records);
+int ntfs_log_register_home_undo_with_abort(struct ntfs_log_handle *handle,
+		int (*restore)(void *data), int (*abort)(void *data),
+		void (*release)(void *data), void *data);
+int ntfs_log_open_attribute(struct ntfs_log_handle *handle, u64 mref,
+		u32 type, u32 bytes_per_index, const __le16 *name, u8 name_len,
+		bool is_dirty_pages, u16 *target_attr);
+int ntfs_log_bitmap_update_credits(s64 start_bit, s64 count);
+int ntfs_log_bitmap_packed_credits(struct ntfs_volume *vol,
+		unsigned int records);
+int ntfs_log_bitmap_update(struct ntfs_log_handle *handle, struct inode *vi,
+		s64 start_bit, s64 count, u8 value);
+int ntfs_log_bitmap_clear_runs(struct ntfs_log_handle *handle,
+		struct inode *vi, const struct runlist_element *runs,
+		unsigned int nr_runs);
+int ntfs_log_nonresident_value_update_credits(struct ntfs_volume *vol,
+		u32 bytes, bool has_undo);
+int ntfs_log_nonresident_value_prefix_credits(struct ntfs_volume *vol,
+		u32 max_bytes);
+int ntfs_log_nonresident_value_update(struct ntfs_log_handle *handle,
+		struct inode *vi, u64 byte_pos, const u8 *old_data,
+		const u8 *new_data, u32 bytes, u64 *lsn_out);
+int ntfs_log_nonresident_value_undo(struct ntfs_log_handle *handle,
+		struct inode *vi, u64 byte_pos, const u8 *old_data, u32 bytes);
+int ntfs_log_mft_record_credits(struct ntfs_volume *vol);
+int ntfs_log_mft_attribute_credits(struct ntfs_volume *vol, u16 undo_len,
+		u16 redo_len);
+int ntfs_log_mft_record_initialize(struct ntfs_log_handle *handle, u64 mft_no,
+		const struct mft_record *record, u64 *lsn_out);
+int ntfs_log_mft_record_update(struct ntfs_log_handle *handle, u64 mft_no,
+		const struct mft_record *before, const struct mft_record *after,
+		u64 *lsn_out);
+int ntfs_log_mft_record_deallocate(struct ntfs_log_handle *handle, u64 mft_no,
+		const struct mft_record *record, u64 *lsn_out);
+int ntfs_log_mft_attribute_create(struct ntfs_log_handle *handle, u64 mft_no,
+		u16 record_off, const struct attr_record *attr, u16 attr_len,
+		u64 *lsn_out);
+int ntfs_log_mft_attribute_delete(struct ntfs_log_handle *handle, u64 mft_no,
+		u16 record_off, const struct attr_record *attr, u16 attr_len,
+		u64 *lsn_out);
+int ntfs_log_mft_resident_update(struct ntfs_log_handle *handle, u64 mft_no,
+		u16 record_off, u16 attr_off, const void *old_data, u16 old_len,
+		const void *new_data, u16 new_len, u64 *lsn_out);
+int ntfs_log_mft_mapping_pairs_credits(struct ntfs_volume *vol,
+		u16 old_len, u16 new_len);
+int ntfs_log_mft_mapping_pairs_update(struct ntfs_log_handle *handle,
+		u64 mft_no, u16 record_off, u16 attr_off,
+		const void *old_pairs, u16 old_len,
+		const void *new_pairs, u16 new_len, u64 *lsn_out);
+/* The locked variants require the $MFT runlist write lock. */
+int ntfs_log_mft_mapping_pairs_locked(struct ntfs_log_handle *handle,
+				      u64 mft_no, u16 record_off, u16 attr_off,
+				      const void *old_pairs, u16 old_len,
+				      const void *new_pairs, u16 new_len, u64 *lsn_out);
+int ntfs_log_mft_attribute_sizes_credits(struct ntfs_volume *vol,
+		bool has_compressed_size);
+int ntfs_log_mft_attribute_sizes_update(struct ntfs_log_handle *handle,
+		u64 mft_no, u16 record_off,
+		const struct ntfs_new_attribute_sizes *old_sizes,
+		const struct ntfs_new_attribute_sizes *new_sizes,
+		bool has_compressed_size, u64 *lsn_out);
+struct ntfs_log *ntfs_log_try_pin_size_update(struct ntfs_volume *vol);
+void ntfs_log_unpin_size_update(struct ntfs_log *log);
+int ntfs_log_mft_attribute_sizes_coalesce(struct ntfs_log *log, u64 mft_no,
+		u16 record_off, const struct ntfs_new_attribute_sizes *old_sizes,
+		const struct ntfs_new_attribute_sizes *new_sizes,
+		bool has_compressed_size, u64 current_lsn, u64 *lsn_out);
+int ntfs_log_mft_mapping_sizes_coalesce(struct ntfs_log *log, u64 mft_no,
+		u16 record_off, u16 mapping_off, const void *old_pairs,
+		const void *new_pairs, u16 pairs_len,
+		const struct ntfs_new_attribute_sizes *old_sizes,
+		const struct ntfs_new_attribute_sizes *new_sizes,
+		u64 current_lsn, u64 *lsn_out);
+int ntfs_log_mft_attribute_sizes_locked(struct ntfs_log_handle *handle,
+					u64 mft_no, u16 record_off,
+					const struct ntfs_new_attribute_sizes *old_sizes,
+					const struct ntfs_new_attribute_sizes *new_sizes,
+					bool has_compressed_size, u64 *lsn_out);
+int ntfs_log_index_root_credits(struct ntfs_volume *vol, u16 entry_len);
+int ntfs_log_index_root_add(struct ntfs_log_handle *handle, u64 mft_no,
+		u16 record_off, u16 attr_off, const struct index_entry *entry,
+		u16 entry_len, u64 *lsn_out);
+int ntfs_log_index_root_delete(struct ntfs_log_handle *handle, u64 mft_no,
+		u16 record_off, u16 attr_off, const struct index_entry *entry,
+		u16 entry_len, u64 *lsn_out);
+int ntfs_log_index_allocation_credits(struct ntfs_volume *vol,
+		u32 bytes_per_index, u16 entry_len);
+int ntfs_log_index_allocation_add(struct ntfs_log_handle *handle,
+		struct inode *vi, u32 bytes_per_index, u64 byte_pos, u16 attr_off,
+		const struct index_entry *entry, u16 entry_len, u64 *lsn_out);
+int ntfs_log_index_allocation_delete(struct ntfs_log_handle *handle,
+		struct inode *vi, u32 bytes_per_index, u64 byte_pos, u16 attr_off,
+		const struct index_entry *entry, u16 entry_len, u64 *lsn_out);
+int ntfs_log_index_allocation_initialize_credits(struct ntfs_volume *vol,
+		u32 bytes_per_index);
+int ntfs_log_index_allocation_initialize(struct ntfs_log_handle *handle,
+		struct inode *vi, u32 bytes_per_index, u64 byte_pos,
+		const struct index_block *block, u64 *lsn_out);
+int ntfs_log_index_allocation_update_credits(struct ntfs_volume *vol,
+		u32 bytes_per_index);
+int ntfs_log_index_allocation_update(struct ntfs_log_handle *handle,
+		struct inode *vi, u32 bytes_per_index, u64 byte_pos,
+		const struct index_block *old_block,
+		const struct index_block *new_block, u64 *lsn_out);
+int ntfs_log_commit(struct ntfs_log_handle *handle);
+struct ntfs_log_handle *ntfs_log_begin_writeback(struct ntfs_volume *vol,
+		unsigned int credits);
+/*
+ * On admission deferral, return a transaction-gate pin for home writeback.
+ * The caller must release it with ntfs_log_end_inode_writeback().
+ */
+struct ntfs_log_handle *ntfs_log_begin_inode_writeback(struct ntfs_volume *vol,
+		unsigned int credits, struct ntfs_log **deferred_log);
+void ntfs_log_end_inode_writeback(struct ntfs_log *log, bool home_deferred);
+int ntfs_log_ordered_data(struct ntfs_log_handle *handle);
+struct iomap_writepage_ctx;
+struct ntfs_ordered_io *ntfs_log_ordered_io_begin(
+		struct ntfs_log_handle *handle, struct inode *inode);
+int ntfs_log_ordered_io_submit(struct ntfs_log_handle *handle,
+		struct inode *inode, loff_t start, loff_t end,
+		struct ntfs_ordered_io *ordered);
+int ntfs_log_ordered_io_cancel(struct ntfs_ordered_io *ordered,
+		struct inode *inode, loff_t start, loff_t end);
+int ntfs_log_ordered_writeback_submit(struct ntfs_ordered_io *ordered,
+		struct iomap_writepage_ctx *wpc, int error);
+int ntfs_log_abort(struct ntfs_log_handle *handle);
 #endif /* _LINUX_NTFS_LOGFILE_H */

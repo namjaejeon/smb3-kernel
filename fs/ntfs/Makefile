@@ -12,3 +12,6 @@ ntfs-$(CONFIG_NTFS_FS_WOF_COMPRESSION) += wof.o \
 	lib/decompress_common.o lib/lzx_decompress.o lib/xpress_decompress.o
 
 ccflags-$(CONFIG_NTFS_DEBUG) += -DDEBUG
+CFLAGS_logfile.o += -I$(src)
+CFLAGS_logfile_record.o += -I$(src)
+CFLAGS_logfile_replay_io.o += -I$(src)

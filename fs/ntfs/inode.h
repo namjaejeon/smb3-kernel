@@ -99,7 +99,9 @@ enum ntfs_inode_mutex_lock_class {
  */
 struct ntfs_inode {
 	rwlock_t size_lock;
+	spinlock_t journal_lsn_lock;
 	unsigned long state;
+	u64 journal_lsn;
 	__le32 flags;
 	u64 mft_no;
 	u16 seq_no;
@@ -113,6 +115,7 @@ struct ntfs_inode {
 	s64 data_size;
 	s64 initialized_size;
 	s64 allocated_size;
+	s64 zeroed_size;
 	struct timespec64 i_crtime;
 	void *mrec;
 	struct mutex mrec_lock;

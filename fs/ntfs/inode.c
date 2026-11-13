@@ -520,7 +520,9 @@ void __ntfs_init_inode(struct super_block *sb, struct ntfs_inode *ni)
 {
 	ntfs_debug("Entering.");
 	rwlock_init(&ni->size_lock);
-	ni->initialized_size = ni->allocated_size = 0;
+	spin_lock_init(&ni->journal_lsn_lock);
+	ni->journal_lsn = 0;
+	ni->initialized_size = ni->allocated_size = ni->zeroed_size = 0;
 	ni->seq_no = 0;
 	atomic_set(&ni->count, 1);
 	ni->vol = NTFS_SB(sb);

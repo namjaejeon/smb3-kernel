@@ -594,6 +594,27 @@ out_unlock:
 	return err;
 }
 
+int ntfs_prepare_mft_record_write(struct ntfs_inode *ni)
+{
+	struct ntfs_inode *mft_ni = NTFS_I(ni->vol->mft_ino);
+	int err;
+
+	if (likely(ni->mft_lcn_count &&
+		   ni->mft_lcn[0] != LCN_RL_NOT_MAPPED))
+		return 0;
+
+	down_read(&mft_ni->runlist.lock);
+	err = ntfs_get_block_mft_record(mft_ni, ni);
+	up_read(&mft_ni->runlist.lock);
+	if (err)
+		return err;
+
+	if (WARN_ON_ONCE(!ni->mft_lcn_count))
+		return -EIO;
+
+	return 0;
+}
+
 static int ntfs_sync_mft_mirror_record(struct ntfs_volume *vol,
 				       struct folio *source, const u64 mft_no)
 {

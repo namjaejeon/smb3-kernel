@@ -37,7 +37,6 @@ static int ntfs_log_read_page(struct inode *log_vi,
 	u32 usa_off, usa_count, usa_end;
 	s64 got;
 
-	/* The usable log size may end within a physically complete page. */
 	if (page_off < layout->first_page || page_off >= layout->log_size ||
 	    page_off > S64_MAX)
 		return -EINVAL;

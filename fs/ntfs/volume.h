@@ -19,6 +19,21 @@
 
 #include "layout.h"
 
+struct ntfs_log;
+
+enum ntfs_journal_mode {
+	NTFS_JOURNAL_ON,
+	NTFS_JOURNAL_OFF,
+	NTFS_JOURNAL_RESET,
+	NTFS_JOURNAL_REPLAY,
+};
+
+enum {
+	ON_ERRORS_PANIC = 0x01,
+	ON_ERRORS_REMOUNT_RO = 0x02,
+	ON_ERRORS_CONTINUE = 0x04,	/* Default. */
+};
+
 #define NTFS_VOL_UID	BIT(1)
 #define NTFS_VOL_GID	BIT(2)
 
@@ -34,6 +49,9 @@
  * @dmask: The mask for directory permissions.
  * @mft_zone_multiplier: Initial mft zone multiplier.
  * @on_errors: What to do on filesystem errors.
+ * @journal_mode: Journal recording and recovery policy for this mount.
+ * @journal_mode_set: A journal mode was explicitly supplied in the fs context.
+ * @preallocated_size_set: A preallocation size was explicitly supplied.
  * @wb_err: Writeback error tracking.
  * @sector_size: in bytes
  * @sector_size_bits: log2(sector_size)
@@ -71,6 +89,7 @@
  * @mftmirr_ino: The VFS inode of $MFTMirr.
  * @mftmirr_size: Size of mft mirror in mft records.
  * @logfile_ino: The VFS inode of LogFile.
+ * @journal: Per-volume $LogFile recording context, or NULL when stopped.
  * @lcnbmp_ino: The VFS inode of $Bitmap.
  * @lcnbmp_lock: Lock for serializing accesses to the cluster bitmap
  * @vol_ino: The VFS inode of $Volume.
@@ -104,6 +123,9 @@ struct ntfs_volume {
 	umode_t dmask;
 	u8 mft_zone_multiplier;
 	u8 on_errors;
+	enum ntfs_journal_mode journal_mode;
+	bool journal_mode_set;
+	bool preallocated_size_set;
 	errseq_t wb_err;
 	u16 sector_size;
 	u8 sector_size_bits;
@@ -146,6 +168,13 @@ struct ntfs_volume {
 	struct inode *mftmirr_ino;
 	int mftmirr_size;
 	struct inode *logfile_ino;
+	/* Protects publication and lifetime of @journal. */
+	struct rw_semaphore journal_lock;
+	/* Serializes system-index transactions before inode and directory locks. */
+	struct mutex system_index_lock;
+	struct ntfs_log *journal;
+	/* Durable tail discovered beyond the last published restart area. */
+	u64 journal_recovery_lsn;
 	struct inode *lcnbmp_ino;
 	struct rw_semaphore lcnbmp_lock;
 	struct mutex volume_label_lock;
@@ -168,6 +197,12 @@ struct ntfs_volume {
 	struct work_struct precalc_work;
 	loff_t preallocated_size;
 };
+
+/* Allocation ENOSPC may invoke a strict error policy before retry is possible. */
+static inline bool ntfs_can_speculate_allocation(const struct ntfs_volume *vol)
+{
+	return vol->on_errors == ON_ERRORS_CONTINUE;
+}
 
 /*
  * Defined bits for the flags field in the ntfs_volume structure.
@@ -198,6 +233,10 @@ struct ntfs_volume {
  * NV_NativeSymlinkRel		Translate absolute Windows reparse targets (native_symlink=rel).
  * NV_MftBootstrap		Mount is still assembling $MFT's own runlist.
  * NV_StreamsWindows		Interpret the final path component as file:stream.
+ * NV_Replaying			$LogFile redo pass is in progress. MFT records
+ *				may be momentarily inconsistent.
+ * NV_RecoveryNeeded		An unclean volume has not completed writable recovery.
+ * NV_NoRecovery		Do not perform recovery on a read-only mount.
  */
 enum {
 	NV_Errors,
@@ -220,6 +259,9 @@ enum {
 	NV_SymlinkNative,
 	NV_MftBootstrap,
 	NV_StreamsWindows,
+	NV_Replaying,
+	NV_RecoveryNeeded,
+	NV_NoRecovery,
 };
 
 /*
@@ -261,6 +303,9 @@ DEFINE_NVOL_BIT_OPS(NativeSymlinkRel)
 DEFINE_NVOL_BIT_OPS(SymlinkNative)
 DEFINE_NVOL_BIT_OPS(MftBootstrap)
 DEFINE_NVOL_BIT_OPS(StreamsWindows)
+DEFINE_NVOL_BIT_OPS(Replaying)
+DEFINE_NVOL_BIT_OPS(RecoveryNeeded)
+DEFINE_NVOL_BIT_OPS(NoRecovery)
 
 static inline void ntfs_inc_free_clusters(struct ntfs_volume *vol, s64 nr)
 {
@@ -311,6 +356,7 @@ static __always_inline void ntfs_release_dirty_clusters(struct ntfs_volume *vol,
 		atomic64_sub(nr_clusters, &vol->dirty_clusters);
 }
 
+s64 ntfs_reserve_dirty_clusters(struct ntfs_volume *vol, s64 nr_clusters);
 s64 ntfs_available_clusters_count(struct ntfs_volume *vol, s64 nr_clusters);
 s64 get_nr_free_clusters(struct ntfs_volume *vol);
 #endif /* _LINUX_NTFS_VOLUME_H */

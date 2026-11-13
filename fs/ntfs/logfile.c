@@ -9,7 +9,60 @@
 
 #include "attrib.h"
 #include "logfile.h"
+#include "logfile_internal.h"
 #include "ntfs.h"
+
+DEFINE_STATIC_KEY_FALSE(ntfs_log_recording_stats_key);
+
+void __ntfs_log_recording_account(enum ntfs_log_recording_stat stat, u64 count)
+{
+}
+
+void __ntfs_log_recording_account_operation(u16 operation, u32 bytes)
+{
+}
+
+void ntfs_log_account_unmount_final_flush(u64 nanoseconds)
+{
+}
+
+void ntfs_log_account_lifecycle_fallback_flush(u64 nanoseconds)
+{
+}
+
+int ntfs_log_replay_stats_init(void)
+{
+	return 0;
+}
+
+void ntfs_log_replay_stats_exit(void)
+{
+}
+
+bool ntfs_is_logfile_clean(const struct restart_page_header *rp)
+{
+	const struct restart_area *ra;
+	u32 page_size;
+	u16 ra_off;
+
+	if (!rp || ntfs_is_chkd_record(rp->magic))
+		return true;
+	if (!ntfs_is_rstr_record(rp->magic))
+		return false;
+	page_size = le32_to_cpu(rp->system_page_size);
+	ra_off = le16_to_cpu(rp->restart_area_offset);
+	if (page_size < sizeof(*ra) || ra_off > page_size - sizeof(*ra))
+		return false;
+	ra = (const struct restart_area *)((const u8 *)rp + ra_off);
+	return ra->client_in_use_list == LOGFILE_NO_CLIENT ||
+		(ra->flags & RESTART_VOLUME_IS_CLEAN);
+}
+
+int ntfs_replay_logfile(struct ntfs_volume *vol,
+		const struct restart_page_header *rp)
+{
+	return -EOPNOTSUPP;
+}
 
 /*
  * ntfs_check_restart_page_header - check the page header for consistency

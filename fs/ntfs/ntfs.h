@@ -174,6 +174,9 @@ extern struct kmem_cache *ntfs_index_ctx_cache;
 extern const struct address_space_operations ntfs_aops;
 extern const struct address_space_operations ntfs_mft_aops;
 
+int ntfs_fsync_write_and_wait_range(struct file *filp, loff_t start,
+		loff_t end);
+
 extern const struct  file_operations ntfs_file_ops;
 extern const struct inode_operations ntfs_file_inode_ops;
 extern const  struct inode_operations ntfs_symlink_inode_operations;
@@ -225,6 +228,7 @@ struct option_t {
 };
 extern const struct option_t on_errors_arr[];
 int ntfs_set_volume_flags(struct ntfs_volume *vol, __le16 flags);
+int ntfs_sync_volume_dirty_state(struct ntfs_volume *vol);
 int ntfs_write_volume_label(struct ntfs_volume *vol, char *label);
 
 /* From fs/ntfs/mst.c */
