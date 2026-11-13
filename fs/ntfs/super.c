@@ -301,8 +301,6 @@ static int ntfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 		NVolSetNoRecovery(vol);
 		break;
 	case Opt_journal:
-		if (result.uint_32 != NTFS_JOURNAL_OFF)
-			return -EOPNOTSUPP;
 		vol->journal_mode = result.uint_32;
 		vol->journal_mode_set = true;
 		break;
@@ -403,11 +401,6 @@ static int ntfs_reconfigure(struct fs_context *fc)
 	int err;
 
 	ntfs_debug("Entering with remount");
-
-	if (sb_rdonly(sb) && !(fc->sb_flags & SB_RDONLY)) {
-		ntfs_warning(sb, "Journal integration is incomplete; read-write remount is disabled.");
-		return -EROFS;
-	}
 
 	if (options->journal_mode_set &&
 	    options->journal_mode != vol->journal_mode) {
@@ -3104,11 +3097,6 @@ static int ntfs_fill_super(struct super_block *sb, struct fs_context *fc)
 
 	vol->sb = sb;
 
-	if (!sb_rdonly(sb)) {
-		ntfs_warning(sb, "Journal integration is incomplete; mounting read-only.");
-		sb->s_flags |= SB_RDONLY;
-	}
-
 	/*
 	 * We do a pretty difficult piece of bootstrap by reading the
 	 * MFT (and other metadata) from disk into memory. We'll only
@@ -3472,7 +3460,7 @@ static int ntfs_init_fs_context(struct fs_context *fc)
 		.dmask = 0,
 		.mft_zone_multiplier = 1,
 		.on_errors = ON_ERRORS_CONTINUE,
-		.journal_mode = NTFS_JOURNAL_OFF,
+		.journal_mode = NTFS_JOURNAL_ON,
 		.nls_map = load_nls_default(),
 		.preallocated_size = NTFS_DEF_PREALLOC_SIZE,
 	};
