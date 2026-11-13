@@ -30,6 +30,38 @@
 
 __le16 AT_UNNAMED[] = { cpu_to_le16('\0') };
 
+/* Attribute transaction support is added before journal writes are enabled. */
+int ntfs_attr_mft_register_home_undo(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, const struct mft_record *mrec)
+{
+	return -EOPNOTSUPP;
+}
+
+int ntfs_attr_size_register_home_undo(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni)
+{
+	return -EOPNOTSUPP;
+}
+
+int ntfs_attr_allocation_register_home_undo(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni)
+{
+	return -EOPNOTSUPP;
+}
+
+int ntfs_attr_update_mapping_pairs_log_credits(struct ntfs_volume *vol,
+		u16 old_len, u16 new_len, u64 max_new_extents,
+		u64 max_removed_extents)
+{
+	return -EOPNOTSUPP;
+}
+
+int ntfs_attr_update_mapping_pairs_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni)
+{
+	return -EOPNOTSUPP;
+}
+
 /*
  * Maximum size allowed for reading attributes by ntfs_attr_readall().
  * Extended attribute, reparse point are not expected to be larger than this size.

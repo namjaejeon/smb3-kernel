@@ -74,6 +74,7 @@ int ntfs_attr_lookup(const __le32 type, const __le16 *name,
 		const u32 name_len, const u32 ic,
 		const s64 lowest_vcn, const u8 *val, const u32 val_len,
 		struct ntfs_attr_search_ctx *ctx);
+int ntfs_attrs_walk_mft_record(struct ntfs_attr_search_ctx *ctx);
 bool ntfs_attr_list_entry_is_valid(const struct attr_list_entry *ale,
 				   const u8 *al_end);
 bool ntfs_attr_list_is_valid(const u8 *al_start, s64 size);
@@ -112,6 +113,19 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
 int ntfs_non_resident_attr_insert_range(struct ntfs_inode *ni, s64 start_vcn, s64 len);
 int ntfs_non_resident_attr_collapse_range(struct ntfs_inode *ni, s64 start_vcn, s64 len);
 int ntfs_non_resident_attr_punch_hole(struct ntfs_inode *ni, s64 start_vcn, s64 len);
+int ntfs_attr_range_update_log_credits(struct ntfs_volume *vol,
+		u64 clusters, bool alloc_clusters, bool free_clusters);
+int ntfs_attr_range_update_log_credits_for_inode(struct ntfs_inode *ni,
+		u64 clusters, bool alloc_clusters, bool free_clusters);
+int ntfs_non_resident_attr_insert_range_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		s64 start_vcn, s64 len);
+int ntfs_non_resident_attr_collapse_range_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		s64 start_vcn, s64 len);
+int ntfs_non_resident_attr_punch_hole_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		s64 start_vcn, s64 len);
 int __ntfs_attr_truncate_vfs(struct ntfs_inode *ni, const s64 newsize,
 		const s64 i_size);
 int ntfs_attr_expand(struct ntfs_inode *ni, const s64 newsize, const s64 prealloc_size);
@@ -124,14 +138,41 @@ int ntfs_attr_truncate_i_locked(struct ntfs_inode *ni, const s64 newsize,
 			       struct ntfs_inode *locked_ni);
 int ntfs_attr_truncate(struct ntfs_inode *ni, const s64 newsize);
 int ntfs_attr_rm(struct ntfs_inode *ni);
+/*
+ * The transacted variants require a handle reserved before MFT/search-context
+ * locks are taken.  They currently support only resident or empty
+ * nonresident changes that stay in one MFT record without an attribute list.
+ */
+int ntfs_attr_rm_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni);
+int ntfs_attr_rm_empty_log_credits(struct ntfs_volume *vol,
+		bool has_attr_list, bool nonresident_attr_list);
+int ntfs_attr_rm_empty_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni);
+int ntfs_attr_rm_stream_log_credits(struct ntfs_inode *ni);
+int ntfs_attr_rm_stream_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni);
 int ntfs_attr_exist(struct ntfs_inode *ni, const __le32 type, __le16 *name,
 		u32 name_len);
 int ntfs_attr_remove(struct ntfs_inode *ni, const __le32 type, __le16 *name,
 		u32 name_len, struct inode **attr_vi);
 int ntfs_attr_record_rm(struct ntfs_attr_search_ctx *ctx);
+int ntfs_attr_record_rm_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_attr_search_ctx *ctx);
 int ntfs_attr_record_move_to(struct ntfs_attr_search_ctx *ctx, struct ntfs_inode *ni);
+/*
+ * Move up to @max_moves base-record attributes to provide @required_free
+ * total free bytes.
+ */
+int ntfs_attr_make_base_record_space_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *base_ni,
+		u32 required_free, u32 max_moves, u8 *pending_list,
+		u32 pending_size);
 int ntfs_attr_add(struct ntfs_inode *ni, __le32 type,
 		__le16 *name, u8 name_len, u8 *val, s64 size);
+int ntfs_attr_add_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, __le32 type, __le16 *name, u8 name_len,
+		u8 *val, s64 size);
 int ntfs_attr_record_move_away(struct ntfs_attr_search_ctx *ctx, int extra);
 char *ntfs_attr_name_get(const struct ntfs_volume *vol, const __le16 *uname,
 		const int uname_len);
@@ -141,10 +182,123 @@ void *ntfs_attr_readall(struct ntfs_inode *ni, const __le32 type,
 int ntfs_resident_attr_record_add(struct ntfs_inode *ni, __le32 type,
 		__le16 *name, u8 name_len, u8 *val, u32 size,
 		__le16 flags);
+int ntfs_resident_attr_record_add_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, __le32 type, __le16 *name, u8 name_len,
+		u8 *val, u32 size, __le16 flags);
+/* The caller publishes the matching attribute-list entry separately. */
+int ntfs_non_resident_attr_record_add_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		__le32 type, __le16 *name, u8 name_len, s64 lowest_vcn,
+		int dataruns_size, __le16 flags);
 int ntfs_attr_update_mapping_pairs(struct ntfs_inode *ni, s64 from_vcn);
 int ntfs_attr_update_mapping_pairs_locked(struct ntfs_inode *ni,
 					  s64 from_vcn,
 					 struct ntfs_inode *locked_ni);
+int ntfs_attr_mft_register_home_undo(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, const struct mft_record *mrec);
+int ntfs_attr_record_move_to_new_extent_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_attr_search_ctx *ctx,
+		struct ntfs_inode *target_ni, struct mft_record *target_mrec,
+		u8 *pending_list, u32 pending_size);
+int ntfs_attr_relocate_resident_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, u32 required_len);
+int ntfs_attr_make_base_record_space_initial_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *base_ni,
+		u32 required_free, u32 max_moves, u8 *pending_list,
+		u32 pending_size);
+int ntfs_attr_pwrite_log_credits(struct ntfs_volume *vol, u32 bytes,
+		bool nonresident);
+int ntfs_attr_pwrite_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, u64 pos, const u8 *value, u32 bytes);
+int ntfs_attr_value_snapshot_undo(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, u64 pos, u32 bytes);
+/* Caller holds the base MFT-record mutex. */
+int ntfs_resident_attr_update_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, u64 pos, const u8 *value, u32 bytes);
+int ntfs_attr_size_register_home_undo(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni);
+/* Caller holds ni->runlist.lock. A resident inode may have an empty runlist. */
+int ntfs_attr_allocation_register_home_undo(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni);
+/* Extent bounds are zero for mapping-only updates without allocation/free. */
+int ntfs_attr_update_mapping_pairs_log_credits(struct ntfs_volume *vol,
+		u16 old_len, u16 new_len, u64 max_new_extents,
+		u64 max_removed_extents);
+/* Caller holds the runlist lock. Extent updates register their own MFT undo. */
+int ntfs_attr_update_mapping_pairs_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni);
+int ntfs_attr_update_non_tail_mapping_pairs_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni);
+int ntfs_attr_map_cluster_log_credits(struct ntfs_volume *vol, u64 clusters);
+/*
+ * Caller holds the base MFT-record mutex and ni->runlist.lock for write.
+ * Zero up to zero_clusters newly allocated clusters before publishing them.
+ */
+int ntfs_attr_map_cluster_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
+		s64 *lcn_count, s64 max_clu_count, bool *balloc,
+		bool skip_holes, bool *was_delalloc, s64 zero_clusters);
+int ntfs_attr_logical_shrink_log_credits(struct ntfs_volume *vol,
+		bool has_compressed_size);
+int ntfs_attr_logical_grow_log_credits(struct ntfs_volume *vol,
+		bool has_compressed_size);
+/* Grows EOF only when existing allocation already covers @new_size. */
+int ntfs_attr_logical_grow_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 new_size);
+int ntfs_attr_publish_pending_empty_eof(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni);
+/* Ordered data must already have been submitted before allowing an unzeroed tail. */
+int ntfs_attr_append_grow_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 new_size, bool ordered);
+int ntfs_attr_initialized_grow_log_credits(struct ntfs_volume *vol,
+		bool has_compressed_size);
+int ntfs_attr_initialized_grow_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 new_size);
+int ntfs_resident_attr_resize_log_credits(struct ntfs_volume *vol,
+		u16 old_size, u16 new_size);
+int ntfs_resident_attr_resize_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, u32 new_size);
+int ntfs_attr_sparse_grow_log_credits(struct ntfs_volume *vol);
+int ntfs_attr_sparse_grow_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 new_size);
+/* Caller has zeroed any existing tail and gated mmap during DELALLOC growth. */
+int ntfs_attr_delalloc_grow_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 new_size);
+int ntfs_attr_delalloc_grow_coalesced(struct ntfs_log *log,
+		struct ntfs_inode *ni, s64 new_size);
+int ntfs_attr_delalloc_mapping_grow_coalesced(struct ntfs_log *log,
+		struct ntfs_inode *ni, s64 new_size);
+int ntfs_attr_compressed_grow_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 new_size);
+#define NTFS_ATTR_GROW_MAX_CLUSTERS	64
+int ntfs_attr_physical_grow_log_credits(struct ntfs_volume *vol,
+		u64 clusters);
+int ntfs_attr_physical_grow_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 new_size, u64 max_clusters);
+int ntfs_attr_physical_prealloc_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 allocation_size, u64 max_clusters);
+int ntfs_attr_append_prealloc_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 allocation_size, u64 max_clusters);
+int ntfs_attr_empty_make_nonresident_log_credits(struct ntfs_volume *vol,
+		u8 name_len);
+int ntfs_attr_empty_make_nonresident_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni);
+int ntfs_attr_make_nonresident_log_credits(struct ntfs_volume *vol,
+		u8 name_len, u32 data_size);
+int ntfs_attr_make_nonresident_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni);
+/* Shrinks sizes only. Physical allocation is retained for a later step. */
+int ntfs_attr_logical_shrink_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 new_size);
+#define NTFS_ATTR_TRUNCATE_MAX_CLUSTERS	1024
+int ntfs_attr_shrink_log_credits(struct ntfs_volume *vol,
+		u64 max_free_clusters, bool has_compressed_size);
+int ntfs_attr_shrink_log_credits_bound(struct ntfs_volume *vol,
+		u64 max_free_clusters, bool has_compressed_size,
+		u64 max_attr_extents);
+/* Frees at most @max_free_clusters physical clusters while publishing @new_size. */
+int ntfs_attr_shrink_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni, s64 new_size, u64 max_free_clusters);
 struct runlist_element *ntfs_attr_vcn_to_rl(struct ntfs_inode *ni, s64 vcn, s64 *lcn);
 
 /*
@@ -176,5 +330,22 @@ static inline int ntfs_attrs_walk(struct ntfs_attr_search_ctx *ctx)
 {
 	return ntfs_attr_lookup(AT_UNUSED, NULL, 0, CASE_SENSITIVE, 0,
 			NULL, 0, ctx);
+}
+
+/*
+ * Pin @vi for a journal home undo.  Writeback of an inode in final iput or
+ * eviction can run a transaction while i_count is zero. That caller keeps the
+ * inode alive until the transaction ends, and taking and dropping a reference
+ * here would re-enter final iput and wait on our own writeback.
+ */
+static inline bool ntfs_home_undo_igrab(struct inode *vi)
+{
+	return igrab(vi) != NULL;
+}
+
+static inline void ntfs_home_undo_iput(struct inode *vi, bool held)
+{
+	if (held)
+		iput(vi);
 }
 #endif /* _LINUX_NTFS_ATTRIB_H */

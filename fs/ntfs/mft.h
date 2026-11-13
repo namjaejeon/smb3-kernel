@@ -13,6 +13,13 @@
 
 #include "inode.h"
 
+struct ntfs_log_handle;
+
+struct ntfs_mft_retire_record {
+	struct ntfs_inode *ni;
+	u64 mft_no;
+};
+
 struct mft_record *map_mft_record(struct ntfs_inode *ni);
 void unmap_mft_record(struct ntfs_inode *ni);
 struct mft_record *map_extent_mft_record(struct ntfs_inode *base_ni, u64 mref,
@@ -34,18 +41,21 @@ void __mark_mft_record_dirty(struct ntfs_inode *ni);
  * vfs inode dirty.  This ensures that any changes to the mft record are
  * written out to disk.
  *
- * NOTE:  Do not do anything if the mft record is already marked dirty.
+ * Always requeue the VFS inode: writeback can clear its dirty flags while the
+ * private MFT record is still dirty and another metadata update is made.
  */
 static inline void mark_mft_record_dirty(struct ntfs_inode *ni)
 {
-	if (!NInoTestSetDirty(ni))
-		__mark_mft_record_dirty(ni);
+	NInoSetDirty(ni);
+	__mark_mft_record_dirty(ni);
 }
 
 int ntfs_mft_bioset_init(void);
 void ntfs_mft_bioset_exit(void);
 int ntfs_prepare_mft_record_write(struct ntfs_inode *ni);
 int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int sync);
+int ntfs_mft_wait_page_log(struct ntfs_volume *vol, const u8 *data,
+		pgoff_t index, u32 start, u32 len, bool sync);
 
 /*
  * write_mft_record - write out a mapped (extent) mft record
@@ -74,6 +84,12 @@ static inline int write_mft_record(struct ntfs_inode *ni, struct mft_record *m, 
 	int err;
 
 	folio_lock(folio);
+	/*
+	 * MFT writeback uses a private snapshot and releases the folio lock
+	 * before the BIO completes.  Do not let a synchronous record update or
+	 * record reuse overtake that older snapshot on the block device.
+	 */
+	folio_wait_writeback(folio);
 	err = write_mft_record_nolock(ni, m, sync);
 	folio_unlock(folio);
 
@@ -83,6 +99,25 @@ static inline int write_mft_record(struct ntfs_inode *ni, struct mft_record *m, 
 int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
 		struct ntfs_inode **ni, struct ntfs_inode *base_ni,
 		struct mft_record **ni_mrec, const s64 mft_data_vcn);
+int ntfs_mft_record_alloc_credits(struct ntfs_volume *vol);
+int ntfs_mft_base_record_alloc_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, int mode, struct ntfs_inode **ni,
+		struct mft_record **ni_mrec);
+int ntfs_mft_record_alloc_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, struct ntfs_inode **ni,
+		struct ntfs_inode *base_ni, struct mft_record **ni_mrec);
+int ntfs_mft_record_free_credits(struct ntfs_volume *vol);
+int ntfs_mft_records_retire_credits(struct ntfs_volume *vol,
+		const struct ntfs_mft_retire_record *records, u64 nr_records);
+int ntfs_mft_record_free_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni);
+int ntfs_mft_record_retire_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni);
+int ntfs_mft_records_retire_preflight(struct ntfs_inode *base_ni,
+		const struct ntfs_mft_retire_record *records, u64 nr_records);
+int ntfs_mft_records_retire_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *base_ni,
+		const struct ntfs_mft_retire_record *records, u64 nr_records);
 int ntfs_mft_record_free(struct ntfs_volume *vol, struct ntfs_inode *ni);
 int ntfs_mft_records_write(const struct ntfs_volume *vol, const u64 mref,
 		const s64 count, struct mft_record *b);

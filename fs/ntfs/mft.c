@@ -17,8 +17,384 @@
 
 #include "bitmap.h"
 #include "lcnalloc.h"
+#include "logfile_internal.h"
 #include "mft.h"
 #include "ntfs.h"
+
+struct ntfs_mft_alloc_home_undo {
+	struct ntfs_volume *vol;
+	struct ntfs_inode *ni;
+	u64 mft_no;
+	bool counted;
+	bool close_on_abort;
+	bool lock_bitmap;
+	u8 record[];
+};
+
+struct ntfs_mft_free_home_undo {
+	struct ntfs_volume *vol;
+	struct ntfs_inode *ni;
+	bool aborted;
+	bool close_on_commit;
+	bool mft_dirty;
+	u8 record[];
+};
+
+struct ntfs_mft_bitmap_home_undo {
+	struct ntfs_volume *vol;
+	s64 start_bit;
+	s64 count;
+	bool lock_bitmap;
+};
+
+struct ntfs_mft_count_home_undo {
+	struct ntfs_volume *vol;
+	s64 records;
+	bool counted;
+};
+
+/*
+ * An MFT record which is already mapped and protected by the caller.
+ *
+ * MFT record allocation holds the page-cache folio while it initializes a
+ * newly allocated record.  Extent inode setup must be able to consume that
+ * record without trying to acquire the same folio lock again.
+ */
+struct ntfs_mft_locked_record {
+	struct mft_record *mrec;
+	unsigned int ofs;
+	struct folio *folio;
+};
+
+static int ntfs_mft_record_format(const struct ntfs_volume *vol,
+		const s64 mft_no);
+static int ntfs_mft_record_format_transacted(struct ntfs_log_handle *handle,
+					     const struct ntfs_volume *vol,
+					     s64 mft_no);
+static int ntfs_mft_record_alloc_credits_batch(struct ntfs_volume *vol,
+					      u32 batch_records);
+
+static int ntfs_mft_count_home_restore(void *data)
+{
+	struct ntfs_mft_count_home_undo *undo = data;
+
+	if (undo->counted) {
+		ntfs_dec_free_mft_records(undo->vol, undo->records);
+		undo->counted = false;
+	}
+	return 0;
+}
+
+static void ntfs_mft_count_home_release(void *data)
+{
+	kfree(data);
+}
+
+static int ntfs_mft_count_register_home_undo(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		s64 records, struct ntfs_mft_count_home_undo **undo_out)
+{
+	struct ntfs_mft_count_home_undo *undo;
+	int err;
+
+	if (!handle || !vol || records <= 0 || !undo_out)
+		return -EINVAL;
+	undo = kzalloc_obj(*undo, GFP_NOFS);
+	if (!undo)
+		return -ENOMEM;
+	undo->vol = vol;
+	undo->records = records;
+	err = ntfs_log_register_home_undo(handle, ntfs_mft_count_home_restore,
+			ntfs_mft_count_home_release, undo);
+	if (err) {
+		kfree(undo);
+		return err;
+	}
+	*undo_out = undo;
+	return 0;
+}
+
+static int ntfs_mft_free_home_restore(void *data)
+{
+	struct ntfs_mft_free_home_undo *undo = data;
+	struct mft_record *m;
+	int err;
+
+	undo->aborted = true;
+	m = map_mft_record(undo->ni);
+	if (IS_ERR(m)) {
+		err = PTR_ERR(m);
+	} else {
+		memcpy(m, undo->record, undo->vol->mft_record_size);
+		err = ntfs_prepare_mft_record_write(undo->ni);
+		if (!err) {
+			NInoSetDirty(undo->ni);
+			err = write_mft_record(undo->ni, m, 1);
+			if (!err && undo->mft_dirty)
+				NInoSetDirty(undo->ni);
+		}
+		unmap_mft_record(undo->ni);
+	}
+	return err;
+}
+
+static void ntfs_mft_free_home_release(void *data)
+{
+	struct ntfs_mft_free_home_undo *undo = data;
+
+	if (!undo->aborted && undo->close_on_commit && undo->ni)
+		ntfs_inode_close(undo->ni);
+	kvfree(undo);
+}
+
+static int ntfs_mft_free_home_commit(void *data)
+{
+	struct ntfs_mft_free_home_undo *undo = data;
+	struct ntfs_inode *ni;
+
+	if (!undo || !undo->ni)
+		return -EINVAL;
+	if (!undo->close_on_commit)
+		return 0;
+	ni = undo->ni;
+	undo->ni = NULL;
+	undo->close_on_commit = false;
+	return ntfs_inode_close(ni);
+}
+
+static int ntfs_mft_bitmap_home_restore(void *data)
+{
+	if (!data)
+		return -EINVAL;
+	/*
+	 * MFT bitmap bits remain allocated until the durable commit callback.
+	 */
+	return 0;
+}
+
+static int ntfs_mft_bitmap_home_commit(void *data)
+{
+	struct ntfs_mft_bitmap_home_undo *undo = data;
+	unsigned int memalloc_flags;
+	s64 first_mismatch = -1;
+	int err;
+
+	if (!undo || !undo->vol)
+		return -EINVAL;
+	memalloc_flags = memalloc_nofs_save();
+	if (undo->lock_bitmap)
+		down_write(&undo->vol->mftbmp_lock);
+	err = ntfs_bitmap_validate_run_with_mismatch(undo->vol->mftbmp_ino,
+			undo->start_bit, undo->count, 1, &first_mismatch);
+	if (!err)
+		err = __ntfs_bitmap_set_bits_in_run(undo->vol->mftbmp_ino,
+				undo->start_bit, undo->count, 0, true);
+	if (!err)
+		ntfs_inc_free_mft_records(undo->vol, undo->count);
+	if (undo->lock_bitmap)
+		up_write(&undo->vol->mftbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	if (err) {
+		if (first_mismatch >= 0)
+			ntfs_error(undo->vol->sb,
+				   "Committed MFT bitmap free failed for records 0x%llx-0x%llx (first mismatched record 0x%llx, error %d).",
+				   (unsigned long long)undo->start_bit,
+				   (unsigned long long)(undo->start_bit +
+						undo->count - 1),
+				   (unsigned long long)first_mismatch, err);
+		else
+			ntfs_error(undo->vol->sb,
+				   "Committed MFT bitmap free failed for records 0x%llx-0x%llx (error %d).",
+				   (unsigned long long)undo->start_bit,
+				   (unsigned long long)(undo->start_bit +
+						undo->count - 1), err);
+	}
+	return err;
+}
+
+static void ntfs_mft_bitmap_home_release(void *data)
+{
+	kfree(data);
+}
+
+static int ntfs_mft_bitmap_register_free_home_undo(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		s64 start_bit, s64 count, bool lock_bitmap)
+{
+	struct ntfs_mft_bitmap_home_undo *undo;
+	int err;
+
+	if (!handle || !vol || start_bit < 0 || count <= 0 ||
+	    start_bit > S64_MAX - count)
+		return -EINVAL;
+	undo = kzalloc(sizeof(*undo), GFP_NOFS);
+	if (!undo)
+		return -ENOMEM;
+	undo->vol = vol;
+	undo->start_bit = start_bit;
+	undo->count = count;
+	undo->lock_bitmap = lock_bitmap;
+	if (lock_bitmap)
+		err = ntfs_log_register_deferred_free(handle,
+				ntfs_mft_bitmap_home_restore,
+				ntfs_mft_bitmap_home_commit,
+				ntfs_mft_bitmap_home_release, undo,
+				NTFS_LOG_DEFERRED_MFT, count, sizeof(*undo));
+	else
+		err = ntfs_log_register_home_undo_with_commit(handle,
+				ntfs_mft_bitmap_home_restore,
+				ntfs_mft_bitmap_home_commit,
+				ntfs_mft_bitmap_home_release, undo);
+	if (err)
+		ntfs_mft_bitmap_home_release(undo);
+	return err;
+}
+
+static int ntfs_mft_free_register_home_undo(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		const struct mft_record *mrec, bool close_on_commit,
+		struct ntfs_mft_free_home_undo **undo_out)
+{
+	struct ntfs_mft_free_home_undo *undo;
+	int err;
+
+	if (!handle || !ni || !mrec || !undo_out)
+		return -EINVAL;
+	undo = kvzalloc(struct_size(undo, record, ni->vol->mft_record_size),
+			GFP_NOFS);
+	if (!undo)
+		return -ENOMEM;
+	undo->vol = ni->vol;
+	undo->ni = ni;
+	undo->close_on_commit = close_on_commit;
+	undo->mft_dirty = NInoDirty(ni);
+	memcpy(undo->record, mrec, ni->vol->mft_record_size);
+	if (close_on_commit)
+		err = ntfs_log_register_home_undo_with_commit(handle,
+				ntfs_mft_free_home_restore,
+				ntfs_mft_free_home_commit,
+				ntfs_mft_free_home_release, undo);
+	else
+		err = ntfs_log_register_home_undo(handle,
+				ntfs_mft_free_home_restore,
+				ntfs_mft_free_home_release, undo);
+	if (err) {
+		kvfree(undo);
+		return err;
+	}
+	*undo_out = undo;
+	return 0;
+}
+
+static int ntfs_mft_alloc_home_restore(void *data)
+{
+	struct ntfs_mft_alloc_home_undo *undo = data;
+	struct mft_record *m;
+	int err = 0;
+
+	m = map_mft_record(undo->ni);
+	if (IS_ERR(m)) {
+		err = PTR_ERR(m);
+	} else {
+		memcpy(m, undo->record, undo->vol->mft_record_size);
+		err = ntfs_prepare_mft_record_write(undo->ni);
+		if (!err) {
+			NInoSetDirty(undo->ni);
+			err = write_mft_record(undo->ni, m, 1);
+		}
+		unmap_mft_record(undo->ni);
+	}
+
+	/* Extent callers drop their mapped hold before abort. */
+	if (undo->close_on_abort) {
+		ntfs_inode_close(undo->ni);
+		undo->ni = NULL;
+		undo->close_on_abort = false;
+	}
+	return err;
+}
+
+static int ntfs_mft_alloc_home_abort(void *data)
+{
+	struct ntfs_mft_alloc_home_undo *undo = data;
+	unsigned int memalloc_flags;
+	s64 first_mismatch = -1;
+	int err;
+
+	if (!undo || !undo->vol)
+		return -EINVAL;
+	memalloc_flags = memalloc_nofs_save();
+	if (undo->lock_bitmap)
+		down_write(&undo->vol->mftbmp_lock);
+	err = ntfs_bitmap_validate_run_with_mismatch(undo->vol->mftbmp_ino,
+			undo->mft_no, 1, 1, &first_mismatch);
+	if (!err)
+		err = __ntfs_bitmap_set_bits_in_run(undo->vol->mftbmp_ino,
+				undo->mft_no, 1, 0, true);
+	if (undo->lock_bitmap)
+		up_write(&undo->vol->mftbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	if (err) {
+		if (first_mismatch >= 0)
+			ntfs_error(undo->vol->sb,
+				   "Aborted MFT allocation bitmap update failed for record 0x%llx (first mismatched record 0x%llx, error %d).",
+				   (unsigned long long)undo->mft_no,
+				   (unsigned long long)first_mismatch, err);
+		else
+			ntfs_error(undo->vol->sb,
+				   "Aborted MFT allocation bitmap update failed for record 0x%llx (error %d).",
+				   (unsigned long long)undo->mft_no, err);
+		return err;
+	}
+	if (undo->counted) {
+		ntfs_inc_free_mft_records(undo->vol, 1);
+		undo->counted = false;
+	}
+	return 0;
+}
+
+static void ntfs_mft_alloc_home_release(void *data)
+{
+	kvfree(data);
+}
+
+static int ntfs_mft_alloc_register_home_undo(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		struct ntfs_inode *ni, u64 mft_no,
+		const struct mft_record *disk_record, bool close_on_abort,
+		struct ntfs_mft_alloc_home_undo **undo_out)
+{
+	struct ntfs_mft_alloc_home_undo *undo;
+	int err;
+
+	if (!handle || !vol || !ni || !disk_record || !undo_out)
+		return -EINVAL;
+	undo = kvzalloc(struct_size(undo, record, vol->mft_record_size),
+			GFP_NOFS);
+	if (!undo)
+		return -ENOMEM;
+	undo->vol = vol;
+	undo->ni = ni;
+	undo->mft_no = mft_no;
+	undo->close_on_abort = close_on_abort;
+	undo->lock_bitmap = mft_no != FILE_MFT;
+	memcpy(undo->record, disk_record, vol->mft_record_size);
+	if (post_read_mst_fixup((struct ntfs_record *)undo->record,
+			vol->mft_record_size)) {
+		kvfree(undo);
+		return -EIO;
+	}
+	err = ntfs_log_register_home_undo_with_abort(handle,
+			ntfs_mft_alloc_home_restore,
+			ntfs_mft_alloc_home_abort,
+			ntfs_mft_alloc_home_release, undo);
+	if (err) {
+		kvfree(undo);
+		return err;
+	}
+	*undo_out = undo;
+	return 0;
+}
 
 /*
  * ntfs_mft_record_check - Check the consistency of an MFT record
@@ -127,6 +503,9 @@ static inline struct mft_record *map_mft_record_folio(struct ntfs_inode *ni)
 	ofs = NTFS_MFT_NR_TO_POFS(vol, ni->mft_no);
 
 	i_size = i_size_read(mft_vi);
+	/* Growth formats the new records before logging the final MFT EOF. */
+	if (NVolReplaying(vol))
+		i_size = max_t(loff_t, i_size, NTFS_I(mft_vi)->allocated_size);
 	/* The maximum valid index into the page cache for $MFT's data. */
 	end_index = i_size >> PAGE_SHIFT;
 
@@ -147,8 +526,17 @@ static inline struct mft_record *map_mft_record_folio(struct ntfs_inode *ni)
 	if (!IS_ERR(folio)) {
 		u8 *addr;
 
+		/*
+		 * MFT writeback unlocks the folio before its private BIO snapshot
+		 * completes.  Serialize the copy with both the page-cache update and
+		 * the outstanding device write so a newly mapped inode cannot retain
+		 * an older record image.
+		 */
+		folio_lock(folio);
+		folio_wait_writeback(folio);
 		ni->mrec = kmalloc(vol->mft_record_size, GFP_NOFS);
 		if (!ni->mrec) {
+			folio_unlock(folio);
 			folio_put(folio);
 			folio = ERR_PTR(-ENOMEM);
 			goto err_out;
@@ -158,14 +546,25 @@ static inline struct mft_record *map_mft_record_folio(struct ntfs_inode *ni)
 		memcpy(ni->mrec, addr + ofs, vol->mft_record_size);
 		post_read_mst_fixup((struct ntfs_record *)ni->mrec, vol->mft_record_size);
 
-		/* Catch multi sector transfer fixup errors. */
-		if (!ntfs_mft_record_check(vol, (struct mft_record *)ni->mrec, ni->mft_no)) {
+		/*
+		 * Catch multi sector transfer fixup errors.  During $LogFile
+		 * replay accept the record even if it is not (yet) a valid FILE
+		 * record: InitializeFileRecordSegment redo maps a freshly
+		 * allocated, still-zeroed record in order to write its initial
+		 * contents.  Redo ops that need a valid record re-check the
+		 * magic themselves (see ntfs_redo_apply_mft_record() and
+		 * ntfs_is_file_record() in the locate helpers).
+		 */
+		if (NVolReplaying(vol) ||
+		    !ntfs_mft_record_check(vol, (struct mft_record *)ni->mrec, ni->mft_no)) {
 			kunmap_local(addr);
+			folio_unlock(folio);
 			ni->folio = folio;
 			ni->folio_ofs = ofs;
 			return ni->mrec;
 		}
 		kunmap_local(addr);
+		folio_unlock(folio);
 		folio_put(folio);
 		kfree(ni->mrec);
 		ni->mrec = NULL;
@@ -176,6 +575,39 @@ err_out:
 	ni->folio = NULL;
 	ni->folio_ofs = 0;
 	return (struct mft_record *)folio;
+}
+
+/*
+ * Map an MFT record from a folio/page which the caller already owns and has
+ * locked.  The caller's mapping reference is retained for the inode.
+ */
+static struct mft_record *map_mft_record_from_locked(
+		struct ntfs_inode *ni,
+		const struct ntfs_mft_locked_record *locked)
+{
+	struct ntfs_volume *vol = ni->vol;
+
+	ni->mrec = kmalloc(vol->mft_record_size, GFP_NOFS);
+	if (!ni->mrec)
+		return ERR_PTR(-ENOMEM);
+	memcpy(ni->mrec, locked->mrec, vol->mft_record_size);
+	post_read_mst_fixup((struct ntfs_record *)ni->mrec,
+			vol->mft_record_size);
+	if (NVolReplaying(vol) ||
+			!ntfs_mft_record_check(vol, (struct mft_record *)ni->mrec,
+			ni->mft_no)) {
+		folio_get(locked->folio);
+		ni->folio = locked->folio;
+		ni->folio_ofs = locked->ofs;
+		/* Account for the mapping reference just installed above. */
+		atomic_inc(&ni->count);
+		return ni->mrec;
+	}
+
+	kfree(ni->mrec);
+	ni->mrec = NULL;
+	NVolSetErrors(vol);
+	return ERR_PTR(-EIO);
 }
 
 /*
@@ -263,8 +695,9 @@ void unmap_mft_record(struct ntfs_inode *ni)
  * On successful return, @ntfs_ino contains a pointer to the ntfs_inode
  * structure of the mapped extent inode.
  */
-struct mft_record *map_extent_mft_record(struct ntfs_inode *base_ni, u64 mref,
-		struct ntfs_inode **ntfs_ino)
+static struct mft_record *__map_extent_mft_record(struct ntfs_inode *base_ni,
+		u64 mref, struct ntfs_inode **ntfs_ino,
+		const struct ntfs_mft_locked_record *locked)
 {
 	struct mft_record *m;
 	struct ntfs_inode *ni = NULL;
@@ -333,8 +766,11 @@ map_err_out:
 	ni->seq_no = seq_no;
 	ni->nr_extents = -1;
 	ni->ext.base_ntfs_ino = base_ni;
-	/* Now map the record. */
-	m = map_mft_record(ni);
+	/* Now map the record, reusing the caller's locked mapping if supplied. */
+	if (locked)
+		m = map_mft_record_from_locked(ni, locked);
+	else
+		m = map_mft_record(ni);
 	if (IS_ERR(m)) {
 		atomic_dec(&base_ni->count);
 		ntfs_clear_extent_inode(ni);
@@ -397,6 +833,20 @@ unm_nolock_err_out:
 	return m;
 }
 
+static struct mft_record *map_extent_mft_record_from_locked(
+		struct ntfs_inode *base_ni, u64 mref,
+		struct ntfs_inode **ntfs_ino,
+		const struct ntfs_mft_locked_record *locked)
+{
+	return __map_extent_mft_record(base_ni, mref, ntfs_ino, locked);
+}
+
+struct mft_record *map_extent_mft_record(struct ntfs_inode *base_ni, u64 mref,
+		struct ntfs_inode **ntfs_ino)
+{
+	return __map_extent_mft_record(base_ni, mref, ntfs_ino, NULL);
+}
+
 /*
  * __mark_mft_record_dirty - mark the base vfs inode dirty
  * @ni:		ntfs inode describing the mapped mft record
@@ -440,6 +890,7 @@ struct ntfs_mft_io_unit {
 
 struct ntfs_mft_write_ctx {
 	struct folio *folio;
+	struct page *io_page;
 	struct address_space *mapping;
 	struct ntfs_volume *vol;
 	struct completion *done;
@@ -481,6 +932,7 @@ static void ntfs_mft_end_io(struct bio *bio)
 			   err);
 	}
 
+	__free_page(ctx->io_page);
 	if (!done)
 		bio_put(bio);
 	folio_end_writeback(folio);
@@ -513,6 +965,12 @@ static struct bio *ntfs_alloc_mft_parent_bio(struct ntfs_volume *vol,
 		return NULL;
 
 	ctx = container_of(parent, struct ntfs_mft_write_ctx, bio);
+	ctx->io_page = alloc_page(GFP_NOIO);
+	if (!ctx->io_page) {
+		bio_put(parent);
+		return NULL;
+	}
+	copy_highpage(ctx->io_page, &folio->page);
 	ctx->folio = folio;
 	ctx->mapping = folio->mapping;
 	ctx->vol = vol;
@@ -521,6 +979,15 @@ static struct bio *ntfs_alloc_mft_parent_bio(struct ntfs_volume *vol,
 	ctx->writeback_started = false;
 	parent->bi_end_io = ntfs_mft_end_io;
 	return parent;
+}
+
+static void ntfs_free_mft_parent_bio(struct bio *bio)
+{
+	struct ntfs_mft_write_ctx *ctx =
+		container_of(bio, struct ntfs_mft_write_ctx, bio);
+
+	__free_page(ctx->io_page);
+	bio_put(bio);
 }
 
 /*
@@ -697,8 +1164,8 @@ static int ntfs_prepare_mft_record_io_units(struct ntfs_inode *ni,
  * redirtying while synchronous callers receive the error.  For other errors,
  * mark the volume with errors.
  *
- * If @sync is false, PG_writeback keeps the folio stable and serializes later
- * writers until the I/O completes.
+ * The BIO uses a private snapshot, and PG_writeback serializes later writers
+ * until the I/O completes.
  */
 int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int sync)
 {
@@ -712,11 +1179,14 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 	int err = 0;
 	u8 *kaddr;
 	struct mft_record *fixup_m;
+	bool dirty;
 
 	ntfs_debug("Entering for inode 0x%llx.", ni->mft_no);
 
 	WARN_ON(NInoAttr(ni));
 	WARN_ON(!folio_test_locked(folio));
+	if (WARN_ON_ONCE(!ni->mft_lcn_count))
+		return -EIO;
 
 	if (folio_test_writeback(folio))
 		folio_wait_writeback(folio);
@@ -727,7 +1197,8 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 	 * There is no danger of races since the caller is holding the locks
 	 * for the mft record @m and the page it is in.
 	 */
-	if (!NInoTestClearDirty(ni))
+	dirty = NInoTestClearDirty(ni);
+	if (!dirty)
 		goto done;
 
 	err = ntfs_prepare_mft_record_io_units(ni, units);
@@ -746,6 +1217,20 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 		goto unmap_err_out;
 	}
 
+	err = ntfs_log_writeback_lsn(vol, le64_to_cpu(m->lsn), sync);
+	if (!err && units[0].len > vol->mft_record_size)
+		err = ntfs_mft_wait_page_log(vol, kaddr, folio->index,
+				units[0].folio_ofs, units[0].len, sync);
+	if (err) {
+		if (err == -EAGAIN) {
+			folio_mark_dirty(folio);
+			kunmap_local(kaddr);
+			return 0;
+		}
+		mark_mft_record_dirty(ni);
+		goto unmap_err_out;
+	}
+
 	parent = ntfs_alloc_mft_parent_bio(vol, folio, sync ? &done : NULL);
 	if (!parent) {
 		err = -ENOMEM;
@@ -754,15 +1239,16 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 	ctx = container_of(parent, struct ntfs_mft_write_ctx, bio);
 
 	parent->bi_iter.bi_sector = units[0].sector;
-	if (!bio_add_folio(parent, folio, units[0].len, units[0].folio_ofs)) {
+	if (!bio_add_page(parent, ctx->io_page, units[0].len,
+			  units[0].folio_ofs)) {
 		err = -EIO;
 		goto put_bios_out;
 	}
 
 	if (nr_units == 2) {
 		if (bio_end_sector(parent) != units[1].sector ||
-		    !bio_add_folio(parent, folio, units[1].len,
-				   units[1].folio_ofs)) {
+		    !bio_add_page(parent, ctx->io_page, units[1].len,
+				  units[1].folio_ofs)) {
 			child = bio_alloc(vol->sb->s_bdev, 1, REQ_OP_WRITE,
 					  GFP_NOIO);
 			if (!child) {
@@ -770,8 +1256,8 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 				goto put_bios_out;
 			}
 			child->bi_iter.bi_sector = units[1].sector;
-			if (!bio_add_folio(child, folio, units[1].len,
-					   units[1].folio_ofs)) {
+			if (!bio_add_page(child, ctx->io_page, units[1].len,
+					  units[1].folio_ofs)) {
 				err = -EIO;
 				goto put_bios_out;
 			}
@@ -779,7 +1265,8 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 	}
 
 	if (ni->mft_no < vol->mftmirr_size) {
-		err = ntfs_sync_mft_mirror_record(vol, folio, ni->mft_no);
+		err = ntfs_sync_mft_mirror_record(vol, page_folio(ctx->io_page),
+						  ni->mft_no);
 		if (err)
 			ctx->error = err;
 	}
@@ -813,7 +1300,7 @@ done:
 put_bios_out:
 	if (child)
 		bio_put(child);
-	bio_put(parent);
+	ntfs_free_mft_parent_bio(parent);
 unmap_err_out:
 	kunmap_local(kaddr);
 err_out:
@@ -842,11 +1329,13 @@ static int ntfs_test_inode_wb(struct inode *vi, u64 ino, void *data)
 		return 0;
 
 	/*
-	 * Without this, ntfs_write_mst_block() could call iput_final()
-	 * , and ntfs_evict_big_inode() could try to unlink this inode
-	 * and the contex could be blocked infinitly in map_mft_record().
+	 * An open unlinked inode can still have a committed, in-use image to
+	 * checkpoint.  Pin it while writeback holds its mrec lock. The caller
+	 * drops the reference only after releasing the MFT folio.
 	 */
 	if (NInoBeingDeleted(NTFS_I(vi))) {
+		if (igrab(vi))
+			return 1;
 		na->state = NI_BeingDeleted;
 		return -1;
 	}
@@ -912,10 +1401,9 @@ static int ntfs_test_inode_wb(struct inode *vi, u64 ino, void *data)
  * Note we cannot just lock the mft record and sleep while waiting for the lock
  * because this would deadlock due to lock reversal.
  *
- * If the inode is not in icache we need to perform further checks.
- *
- * If the mft record is not a FILE record or it is a base mft record, we can
- * safely write it and return 'true'.
+ * If the inode is not in icache, the locked $MFT folio is the writeback
+ * source.  This includes extent records whose asynchronous writes have
+ * already staged a protected image there.
  */
 static bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const u64 mft_no,
 		const struct mft_record *m, struct ntfs_inode **locked_ni,
@@ -933,6 +1421,18 @@ static bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const u64 mft_no,
 	 */
 	*locked_ni = NULL;
 	*ref_vi = NULL;
+	/*
+	 * A retired record is authoritative in the MFT page cache.  In
+	 * particular, do not let an inode which is still being torn down (and
+	 * whose mrec_lock may still be held by the retirement transaction) defer
+	 * this free image indefinitely.  Leaving it dirty without submitting it
+	 * allows the page to be reclaimed and exposes the old on-disk IN_USE
+	 * image to the allocator.
+	 */
+	if (ntfs_is_file_record(m->magic) &&
+			!(m->flags & MFT_RECORD_IN_USE)) {
+		return true;
+	}
 
 	/*
 	 * Check if the inode corresponding to this mft record is in the VFS
@@ -946,9 +1446,15 @@ static bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const u64 mft_no,
 	 * we get here for it rather often.
 	 */
 	if (!mft_no) {
-		/* Balance the below iput(). */
+		/*
+		 * During final iput(), write_inode_now() can write the $MFT
+		 * mapping after the inode has entered I_WILL_FREE.  In that
+		 * case igrab() must fail. The writeback itself keeps the inode
+		 * alive and no other user can modify its private record.
+		 */
 		vi = igrab(mft_vi);
-		WARN_ON(vi != mft_vi);
+		if (!vi)
+			return true;
 	} else {
 		/*
 		 * Have to use find_inode_nowait() since ilookup5_nowait()
@@ -956,8 +1462,20 @@ static bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const u64 mft_no,
 		 * when inodes are unlinked concurrently
 		 */
 		vi = find_inode_nowait(sb, mft_no, ntfs_test_inode_wb, &na);
-		if (na.state == NI_BeingDeleted || na.state == NI_BeingCreated)
+		if (na.state == NI_BeingCreated)
 			return false;
+		if (na.state == NI_BeingDeleted) {
+			/*
+			 * Do not write an old, still-in-use image from an inode which is
+			 * being deleted.  The delete transaction may have cleared the
+			 * page-cache image already, in which case raw writeback is safe,
+			 * but writing the old image after the MFT bitmap was cleared can
+			 * make a free record appear to be in use again.
+			 */
+			if (m->flags & MFT_RECORD_IN_USE)
+				return false;
+			return true;
+		}
 	}
 	if (vi) {
 		ntfs_debug("Base inode 0x%llx is in icache.", mft_no);
@@ -1005,16 +1523,76 @@ static bool ntfs_may_write_mft_record(struct ntfs_volume *vol, const u64 mft_no,
 				mft_no);
 		return true;
 	}
-
-	ntfs_debug("Mft record 0x%llx is an extent record, skip it.",
+	/*
+	 * Asynchronous extent writes stage their protected image in the $MFT
+	 * folio and leave it dirty for this writeback path.  There is no VFS
+	 * inode for an extent to find above, so skipping it here would prevent
+	 * that staged image from ever reaching disk.  The caller holds the
+	 * folio lock and submits a private BIO snapshot.
+	 */
+	ntfs_debug("Mft record 0x%llx is an extent record, write it.",
 		   mft_no);
-	return false;
+	return true;
 }
 
 static const char *es = "  Leaving inconsistent metadata.  Unmount and run chkdsk.";
 
 #define FIRST_NORMAL_MFT_RECORD	24
 #define MFT_RECORD_RESERVE	4
+#define MFT_RECORD_INIT_BATCH	16
+#define MFT_RECORD_INIT_MEDIUM_BATCH	64
+#define MFT_RECORD_INIT_LARGE_BATCH	256
+#define MFT_BITMAP_INIT_MIN_BYTES	8
+#define MFT_GROWTH_MAX_RUNS	16
+
+/* Keep optional initialization within both allocation and bitmap coverage. */
+static s64 ntfs_mft_initialized_batch_end(s64 initialized_size,
+		s64 required_size, s64 allocated_size, s64 bitmap_records,
+		u8 record_size_bits, u32 batch_records)
+{
+	s64 initialized_records = initialized_size >> record_size_bits;
+	s64 end_records = initialized_records + batch_records;
+
+	end_records = min_t(s64, end_records,
+			allocated_size >> record_size_bits);
+	end_records = min_t(s64, end_records, bitmap_records);
+	if (end_records <= initialized_records)
+		return required_size;
+	return max_t(s64, required_size, end_records << record_size_bits);
+}
+
+static u32 ntfs_mft_bitmap_initialized_bytes(s64 initialized_size,
+		s64 allocated_size, u32 batch_records)
+{
+	u32 batch_bytes = max_t(u32, MFT_BITMAP_INIT_MIN_BYTES,
+			batch_records >> 3);
+	u32 bytes;
+
+	if (initialized_size < 0 || allocated_size < initialized_size ||
+	    allocated_size - initialized_size < MFT_BITMAP_INIT_MIN_BYTES ||
+	    batch_bytes > MFT_RECORD_INIT_LARGE_BATCH / 8 ||
+	    !is_power_of_2(batch_bytes))
+		return 0;
+	bytes = batch_bytes - ((u64)initialized_size & (batch_bytes - 1));
+	bytes = max_t(u32, bytes, MFT_BITMAP_INIT_MIN_BYTES);
+	return min_t(u64, bytes, allocated_size - initialized_size);
+}
+
+static s64 ntfs_mft_growth_aligned_clusters(s64 old_clusters, s64 preferred,
+		s64 minimum, u64 batch_clusters)
+{
+	s64 end;
+
+	/* Align the allocation end without exceeding the reserved growth. */
+	if (old_clusters < 0 || minimum <= 0 || preferred < minimum ||
+	    batch_clusters > S64_MAX || !is_power_of_2(batch_clusters) ||
+	    check_add_overflow(old_clusters, preferred, &end))
+		return preferred;
+	end &= ~((s64)batch_clusters - 1);
+	if (end < old_clusters || end - old_clusters < minimum)
+		return preferred;
+	return end - old_clusters;
+}
 
 /*
  * Records 12-15 are marked in use by Windows but normally have no name
@@ -1294,12 +1872,10 @@ found:
 		*new_reserve_end = mft_reserve_end(buf, data_pos,
 						   data_pos + size, ll, pass_end,
 						   initialized_mft_records);
-	*byte |= 1 << b;
-	folio_mark_dirty(folio);
 	folio_unlock(folio);
 	kunmap_local(buf);
 	folio_put(folio);
-	ntfs_debug("Done.  (Found and allocated mft record 0x%llx.)", ll);
+	ntfs_debug("Done.  (Found free mft record 0x%llx.)", ll);
 	return ll;
 }
 
@@ -1431,7 +2007,8 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 	 */
 	if (*b != 0xff && !(*b & tb) &&
 	    vol->lcn_empty_bits_per_page[ll >> PAGE_SHIFT] &&
-	    ntfs_available_clusters_count(vol, 1) > 0) {
+	    atomic64_read(&vol->free_clusters) >
+			atomic64_read(&vol->dirty_clusters)) {
 		/* Next cluster is free, allocate it. */
 		*b |= tb;
 		folio_mark_dirty(folio);
@@ -1783,6 +2360,742 @@ unm_err_out:
 #endif /* DEBUG */
 err_out:
 	return ret;
+}
+
+static int ntfs_mft_bitmap_extend_initialized_transacted_nolock(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		u32 batch_records)
+{
+	struct ntfs_new_attribute_sizes old_sizes = { };
+	struct ntfs_new_attribute_sizes new_sizes = { };
+	struct inode *mftbmp_vi;
+	struct ntfs_inode *mft_ni;
+	struct ntfs_inode *mftbmp_ni;
+	struct ntfs_attr_search_ctx *ctx;
+	struct mft_record *mrec;
+	struct attr_record *attr;
+	unsigned long flags;
+	u64 operation_lsn;
+	s64 allocated_size;
+	s64 data_size;
+	s64 initialized_size;
+	ptrdiff_t record_pos;
+	u32 attr_len;
+	u32 bytes;
+	u32 used;
+	u16 record_off;
+	u8 zeroes[MFT_RECORD_INIT_LARGE_BATCH / 8] = { };
+	int err;
+
+	if (!handle || !vol)
+		return -EINVAL;
+	mft_ni = NTFS_I(vol->mft_ino);
+	mftbmp_vi = vol->mftbmp_ino;
+	mftbmp_ni = NTFS_I(mftbmp_vi);
+	mrec = map_mft_record(mft_ni);
+	if (IS_ERR(mrec))
+		return PTR_ERR(mrec);
+	ctx = ntfs_attr_get_search_ctx(mft_ni, mrec);
+	if (!ctx) {
+		err = -ENOMEM;
+		goto out_unmap;
+	}
+	err = ntfs_attr_lookup(mftbmp_ni->type, mftbmp_ni->name,
+			mftbmp_ni->name_len, CASE_SENSITIVE, 0, NULL, 0, ctx);
+	if (err) {
+		if (err == -ENOENT)
+			err = -EIO;
+		goto out_ctx;
+	}
+	attr = ctx->attr;
+	record_pos = (u8 *)attr - (u8 *)mrec;
+	attr_len = le32_to_cpu(attr->length);
+	used = le32_to_cpu(mrec->bytes_in_use);
+	read_lock_irqsave(&mftbmp_ni->size_lock, flags);
+	allocated_size = mftbmp_ni->allocated_size;
+	data_size = i_size_read(mftbmp_vi);
+	initialized_size = mftbmp_ni->initialized_size;
+	read_unlock_irqrestore(&mftbmp_ni->size_lock, flags);
+	bytes = ntfs_mft_bitmap_initialized_bytes(initialized_size,
+			allocated_size, batch_records);
+	if (!attr->non_resident || attr->flags ||
+	    le64_to_cpu(attr->data.non_resident.lowest_vcn) ||
+	    record_pos < 0 || record_pos > U16_MAX ||
+	    !IS_ALIGNED(record_pos, 8) || attr_len > U16_MAX ||
+	    record_pos > used || attr_len > used - record_pos ||
+	    allocated_size < 0 || data_size < 0 || initialized_size < 0 ||
+	    initialized_size > data_size || data_size > allocated_size ||
+	    !bytes ||
+	    le64_to_cpu(attr->data.non_resident.allocated_size) !=
+			allocated_size ||
+	    le64_to_cpu(attr->data.non_resident.data_size) != data_size ||
+	    le64_to_cpu(attr->data.non_resident.initialized_size) !=
+			initialized_size) {
+		err = -EIO;
+		goto out_ctx;
+	}
+	record_off = record_pos;
+	new_sizes.alloc_size = old_sizes.alloc_size =
+			attr->data.non_resident.allocated_size;
+	old_sizes.valid_size = attr->data.non_resident.initialized_size;
+	old_sizes.data_size = attr->data.non_resident.data_size;
+	new_sizes.valid_size = cpu_to_le64(initialized_size + bytes);
+	new_sizes.data_size = cpu_to_le64(max(data_size,
+			initialized_size + (s64)bytes));
+	err = ntfs_attr_size_register_home_undo(handle, mftbmp_ni);
+	if (err)
+		goto out_ctx;
+	err = ntfs_attr_mft_register_home_undo(handle, ctx->ntfs_ino, mrec);
+	if (err)
+		goto out_ctx;
+	err = ntfs_log_nonresident_value_update(handle, mftbmp_vi,
+			initialized_size, NULL, zeroes, bytes, NULL);
+	if (err)
+		goto out_ctx;
+	err = ntfs_log_mft_attribute_sizes_update(handle,
+			ctx->ntfs_ino->mft_no, record_off, &old_sizes,
+			&new_sizes, false, &operation_lsn);
+	if (err)
+		goto out_ctx;
+	attr->data.non_resident.initialized_size = new_sizes.valid_size;
+	attr->data.non_resident.data_size = new_sizes.data_size;
+	mrec->lsn = cpu_to_le64(operation_lsn);
+	mark_mft_record_dirty(ctx->ntfs_ino);
+	write_lock_irqsave(&mftbmp_ni->size_lock, flags);
+	mftbmp_ni->initialized_size = initialized_size + bytes;
+	mftbmp_ni->data_size = le64_to_cpu(new_sizes.data_size);
+	mftbmp_ni->zeroed_size = mftbmp_ni->initialized_size;
+	i_size_write(mftbmp_vi, mftbmp_ni->data_size);
+	write_unlock_irqrestore(&mftbmp_ni->size_lock, flags);
+	ntfs_attr_put_search_ctx(ctx);
+	unmap_mft_record(mft_ni);
+	err = ntfs_attr_set(mftbmp_ni, initialized_size, bytes, 0);
+	if (err)
+		return err;
+	return 0;
+
+out_ctx:
+	ntfs_attr_put_search_ctx(ctx);
+out_unmap:
+	unmap_mft_record(mft_ni);
+	return err;
+}
+
+static int ntfs_mft_mapping_growth_preflight(struct ntfs_inode *ni,
+		s64 old_clusters, u64 max_new_runs)
+{
+	struct ntfs_inode *base_ni;
+	struct ntfs_attr_search_ctx *ctx;
+	struct runlist_element *rl;
+	struct attr_record *attr;
+	struct mft_record *mrec;
+	u64 extra;
+	s64 lowest_vcn;
+	ptrdiff_t record_pos;
+	u32 allocated;
+	u32 attr_len;
+	u32 mapping_off;
+	u32 required;
+	u32 used;
+	int mapping_size;
+	int err;
+
+	if (!ni || old_clusters <= 0 || !max_new_runs)
+		return -EINVAL;
+	base_ni = NInoAttr(ni) ? ni->ext.base_ntfs_ino : ni;
+	if (!base_ni)
+		return -EINVAL;
+	ctx = ntfs_attr_get_search_ctx(base_ni, NULL);
+	if (!ctx)
+		return -ENOMEM;
+	err = ntfs_attr_lookup(ni->type, ni->name, ni->name_len,
+			CASE_SENSITIVE, old_clusters - 1,
+			NULL, 0, ctx);
+	if (err) {
+		if (err == -ENOENT)
+			err = -EIO;
+		goto out;
+	}
+	attr = ctx->attr;
+	mrec = ctx->mrec;
+	record_pos = (u8 *)attr - (u8 *)mrec;
+	attr_len = le32_to_cpu(attr->length);
+	mapping_off = le16_to_cpu(
+			attr->data.non_resident.mapping_pairs_offset);
+	lowest_vcn = le64_to_cpu(attr->data.non_resident.lowest_vcn);
+	used = le32_to_cpu(mrec->bytes_in_use);
+	allocated = le32_to_cpu(mrec->bytes_allocated);
+	if (!attr->non_resident || attr->flags || lowest_vcn < 0 ||
+	    le64_to_cpu(attr->data.non_resident.highest_vcn) !=
+			old_clusters - 1 ||
+	    record_pos < 0 || record_pos > used || attr_len > U16_MAX ||
+	    !IS_ALIGNED(record_pos, 8) || !IS_ALIGNED(mapping_off, 8) ||
+	    mapping_off >= attr_len || attr_len > used - record_pos ||
+	    used > allocated) {
+		err = -EIO;
+		goto out;
+	}
+	down_read(&ni->runlist.lock);
+	rl = ntfs_attr_find_vcn_nolock(ni, lowest_vcn, NULL);
+	if (IS_ERR(rl)) {
+		err = PTR_ERR(rl);
+		goto out_unlock;
+	}
+	mapping_size = ntfs_get_size_for_mapping_pairs(ni->vol, rl,
+			lowest_vcn, -1, -1);
+	if (mapping_size <= 0) {
+		err = mapping_size ? mapping_size : -EIO;
+		goto out_unlock;
+	}
+	/* Each new run can add a header and two s64 fields. */
+	if (check_mul_overflow(max_new_runs, 17ULL, &extra) ||
+	    extra > U32_MAX) {
+		err = -EOVERFLOW;
+		goto out_unlock;
+	}
+	if (check_add_overflow(mapping_off, (u32)mapping_size, &required) ||
+	    check_add_overflow(required, (u32)extra, &required)) {
+		err = -EOVERFLOW;
+		goto out_unlock;
+	}
+	required = ALIGN(required, 8);
+	err = required <= attr_len + allocated - used && required <= U16_MAX ?
+		0 : -EOPNOTSUPP;
+out_unlock:
+	up_read(&ni->runlist.lock);
+out:
+	ntfs_attr_put_search_ctx(ctx);
+	return err;
+}
+
+static int ntfs_mft_bitmap_extend_allocation_transacted_nolock(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol)
+{
+	struct runlist_element *allocated_rl = NULL;
+	struct runlist_element *merged_rl;
+	struct runlist_element *rl;
+	struct ntfs_inode *base_ni;
+	struct ntfs_inode *mftbmp_ni;
+	unsigned long flags;
+	s64 allocated_size;
+	s64 lcn_hint = -1;
+	s64 old_clusters;
+	size_t new_rl_count;
+	int err = 0;
+
+	if (!handle || !vol)
+		return -EINVAL;
+	mftbmp_ni = NTFS_I(vol->mftbmp_ino);
+	base_ni = mftbmp_ni->ext.base_ntfs_ino;
+	if (!base_ni || !NInoNonResident(mftbmp_ni) ||
+	    NInoCompressed(mftbmp_ni) || NInoSparse(mftbmp_ni) ||
+	    NInoEncrypted(mftbmp_ni))
+		return -EOPNOTSUPP;
+	err = ntfs_attr_map_whole_runlist(mftbmp_ni);
+	if (err)
+		return err;
+	read_lock_irqsave(&mftbmp_ni->size_lock, flags);
+	allocated_size = mftbmp_ni->allocated_size;
+	read_unlock_irqrestore(&mftbmp_ni->size_lock, flags);
+	if (allocated_size <= 0 ||
+	    !IS_ALIGNED(allocated_size, vol->cluster_size))
+		return -EIO;
+	old_clusters = allocated_size >> vol->cluster_size_bits;
+	err = ntfs_mft_mapping_growth_preflight(mftbmp_ni, old_clusters, 1);
+	if (err && err != -EOPNOTSUPP)
+		return err;
+	/*
+	 * A full mapping-pairs record can be extended into a new attribute-list
+	 * extent by ntfs_attr_update_mapping_pairs_transacted().  Keep the
+	 * preflight as a corruption/state check, but do not refuse that valid
+	 * tail-growth case here.
+	 */
+	down_read(&mftbmp_ni->runlist.lock);
+	for (rl = mftbmp_ni->runlist.rl; rl && rl->length; rl++) {
+		if (rl->lcn < 0 || rl->length <= 0 ||
+		    check_add_overflow(rl->lcn, rl->length, &lcn_hint)) {
+			err = -EIO;
+			break;
+		}
+	}
+	if (!err && (!rl || rl->vcn != old_clusters ||
+		    rl->lcn != LCN_ENOENT))
+		err = -EIO;
+	up_read(&mftbmp_ni->runlist.lock);
+	if (err)
+		return err;
+	allocated_rl = ntfs_cluster_alloc_transacted(handle, vol,
+			old_clusters, 1, lcn_hint, DATA_ZONE, true, false, false);
+	if (IS_ERR(allocated_rl))
+		return PTR_ERR(allocated_rl);
+	if (allocated_rl->vcn != old_clusters || allocated_rl->lcn < 0 ||
+	    allocated_rl->length != 1 || allocated_rl[1].length ||
+	    allocated_rl[1].vcn != old_clusters + 1 ||
+	    allocated_rl[1].lcn != LCN_ENOENT) {
+		err = -EIO;
+		goto out;
+	}
+	down_write(&mftbmp_ni->runlist.lock);
+	read_lock_irqsave(&mftbmp_ni->size_lock, flags);
+	err = mftbmp_ni->allocated_size == allocated_size ? 0 : -EAGAIN;
+	read_unlock_irqrestore(&mftbmp_ni->size_lock, flags);
+	if (err)
+		goto out_unlock;
+	err = ntfs_attr_allocation_register_home_undo(handle, mftbmp_ni);
+	if (err)
+		goto out_unlock;
+	merged_rl = ntfs_runlists_merge(&mftbmp_ni->runlist, allocated_rl, 0,
+			&new_rl_count);
+	if (IS_ERR(merged_rl)) {
+		err = PTR_ERR(merged_rl);
+		goto out_unlock;
+	}
+	allocated_rl = NULL;
+	mftbmp_ni->runlist.rl = merged_rl;
+	mftbmp_ni->runlist.count = new_rl_count;
+	mftbmp_ni->runlist.rl_hint = -1;
+	write_lock_irqsave(&mftbmp_ni->size_lock, flags);
+	mftbmp_ni->allocated_size += vol->cluster_size;
+	VFS_I(mftbmp_ni)->i_blocks = mftbmp_ni->allocated_size >> 9;
+	VFS_I(base_ni)->i_blocks += vol->cluster_size >> 9;
+	write_unlock_irqrestore(&mftbmp_ni->size_lock, flags);
+	up_write(&mftbmp_ni->runlist.lock);
+	down_write(&mftbmp_ni->runlist.lock);
+	err = ntfs_attr_update_mapping_pairs_transacted(handle, mftbmp_ni);
+	up_write(&mftbmp_ni->runlist.lock);
+	return err;
+
+out_unlock:
+	up_write(&mftbmp_ni->runlist.lock);
+out:
+	kvfree(allocated_rl);
+	return err;
+}
+
+static int ntfs_mft_data_extend_initialized_transacted_nolock(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		s64 new_initialized_size)
+{
+	struct ntfs_new_attribute_sizes old_sizes = { };
+	struct ntfs_new_attribute_sizes new_sizes = { };
+	struct ntfs_attr_search_ctx *ctx;
+	struct ntfs_inode *mft_ni;
+	struct mft_record *mrec;
+	struct attr_record *attr;
+	unsigned long flags;
+	u64 operation_lsn;
+	s64 allocated_size;
+	s64 byte_pos;
+	s64 data_size;
+	s64 mft_data_size;
+	s64 initialized_size;
+	s64 last_mft_no;
+	s64 mft_no;
+	ptrdiff_t record_pos;
+	u64 attr_allocated_size;
+	u64 attr_data_size;
+	u64 attr_initialized_size;
+	u64 lowest_vcn;
+	u32 attr_len;
+	u32 used;
+	u16 record_off;
+	int err;
+
+	if (!handle || !vol || new_initialized_size <= 0)
+		return -EINVAL;
+	mft_ni = NTFS_I(vol->mft_ino);
+	read_lock_irqsave(&mft_ni->size_lock, flags);
+	allocated_size = mft_ni->allocated_size;
+	data_size = i_size_read(vol->mft_ino);
+	mft_data_size = mft_ni->data_size;
+	initialized_size = mft_ni->initialized_size;
+	err = mft_data_size == data_size ? 0 : -EIO;
+	read_unlock_irqrestore(&mft_ni->size_lock, flags);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "In-memory $MFT::$DATA size mismatch before initialized-size extension to %lld (data_size %lld, i_size %lld, initialized_size %lld, allocated_size %lld).",
+			   (long long)new_initialized_size,
+			   (long long)mft_data_size, (long long)data_size,
+			   (long long)initialized_size,
+			   (long long)allocated_size);
+		return err;
+	}
+	if (allocated_size < 0 || data_size < initialized_size ||
+	    data_size > allocated_size ||
+	    new_initialized_size <= initialized_size ||
+	    new_initialized_size > allocated_size) {
+		ntfs_error(vol->sb,
+			   "Invalid $MFT::$DATA initialized-size extension range (allocated_size %lld, data_size %lld, initialized_size %lld, requested %lld).",
+			   (long long)allocated_size, (long long)data_size,
+			   (long long)initialized_size,
+			   (long long)new_initialized_size);
+		return -EOPNOTSUPP;
+	}
+	mft_no = initialized_size >> vol->mft_record_size_bits;
+	if (check_shl_overflow(mft_no, vol->mft_record_size_bits,
+			&byte_pos) || byte_pos != initialized_size) {
+		ntfs_error(vol->sb,
+			   "Invalid starting MFT record boundary for initialized-size extension (initialized_size %lld, record size bits %u).",
+			   (long long)initialized_size,
+			   vol->mft_record_size_bits);
+		return -EOVERFLOW;
+	}
+	last_mft_no = (new_initialized_size >>
+			vol->mft_record_size_bits) - 1;
+	if (last_mft_no < mft_no ||
+	    check_add_overflow(last_mft_no, 1, &byte_pos)) {
+		ntfs_error(vol->sb,
+			   "Invalid MFT record range for initialized-size extension (first record 0x%llx, last record 0x%llx, requested initialized_size %lld).",
+			   (unsigned long long)mft_no,
+			   (unsigned long long)last_mft_no,
+			   (long long)new_initialized_size);
+		return -EOVERFLOW;
+	}
+	if (check_shl_overflow(byte_pos, vol->mft_record_size_bits,
+			       &byte_pos) || byte_pos != new_initialized_size) {
+		ntfs_error(vol->sb,
+			   "Invalid ending MFT record boundary for initialized-size extension (last record 0x%llx, requested initialized_size %lld, record size bits %u).",
+			   (unsigned long long)last_mft_no,
+			   (long long)new_initialized_size,
+			   vol->mft_record_size_bits);
+		return -EOVERFLOW;
+	}
+	err = ntfs_attr_size_register_home_undo(handle, mft_ni);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "Failed to register $MFT::$DATA size undo before formatting records 0x%llx-0x%llx (initialized_size %lld, requested %lld, error %d).",
+			   (unsigned long long)mft_no,
+			   (unsigned long long)last_mft_no,
+			   (long long)initialized_size,
+			   (long long)new_initialized_size, err);
+		return err;
+	}
+	write_lock_irqsave(&mft_ni->size_lock, flags);
+	if (new_initialized_size > i_size_read(vol->mft_ino))
+		i_size_write(vol->mft_ino, new_initialized_size);
+	write_unlock_irqrestore(&mft_ni->size_lock, flags);
+	for (;;) {
+		err = ntfs_mft_record_format_transacted(handle, vol, mft_no);
+		if (err) {
+			ntfs_error(vol->sb,
+				   "Failed to format MFT record 0x%llx while extending $MFT::$DATA initialized_size from %lld to %lld (error %d).",
+				   (unsigned long long)mft_no,
+				   (long long)initialized_size,
+				   (long long)new_initialized_size, err);
+			return err;
+		}
+		if (mft_no == last_mft_no)
+			break;
+		mft_no++;
+	}
+	write_lock_irqsave(&mft_ni->size_lock, flags);
+	mft_ni->initialized_size = new_initialized_size;
+	mft_ni->data_size = max(data_size, new_initialized_size);
+	mft_ni->zeroed_size = mft_ni->initialized_size;
+	i_size_write(vol->mft_ino, mft_ni->data_size);
+	write_unlock_irqrestore(&mft_ni->size_lock, flags);
+
+	mrec = map_mft_record(mft_ni);
+	if (IS_ERR(mrec)) {
+		err = PTR_ERR(mrec);
+		ntfs_error(vol->sb,
+			   "Failed to map MFT record 0 while updating $MFT::$DATA initialized_size from %lld to %lld (error %d).",
+			   (long long)initialized_size,
+			   (long long)new_initialized_size, err);
+		return err;
+	}
+	ctx = ntfs_attr_get_search_ctx(mft_ni, mrec);
+	if (!ctx) {
+		err = -ENOMEM;
+		ntfs_error(vol->sb,
+			   "Failed to allocate attribute search context for $MFT::$DATA initialized-size update to %lld (error %d).",
+			   (long long)new_initialized_size, err);
+		goto out_unmap;
+	}
+	err = ntfs_attr_lookup(mft_ni->type, mft_ni->name, mft_ni->name_len,
+			CASE_SENSITIVE, 0, NULL, 0, ctx);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "Failed to find $MFT::$DATA while updating initialized_size from %lld to %lld (lookup error %d).",
+			   (long long)initialized_size,
+			   (long long)new_initialized_size, err);
+		if (err == -ENOENT)
+			err = -EIO;
+		goto out_ctx;
+	}
+	attr = ctx->attr;
+	record_pos = (u8 *)attr - (u8 *)mrec;
+	attr_len = le32_to_cpu(attr->length);
+	used = le32_to_cpu(mrec->bytes_in_use);
+	lowest_vcn = 0;
+	attr_allocated_size = 0;
+	attr_data_size = 0;
+	attr_initialized_size = 0;
+	if (attr->non_resident) {
+		lowest_vcn = le64_to_cpu(attr->data.non_resident.lowest_vcn);
+		attr_allocated_size =
+			le64_to_cpu(attr->data.non_resident.allocated_size);
+		attr_data_size = le64_to_cpu(attr->data.non_resident.data_size);
+		attr_initialized_size =
+			le64_to_cpu(attr->data.non_resident.initialized_size);
+	}
+	if (!attr->non_resident || attr->flags ||
+	    lowest_vcn ||
+	    record_pos < 0 || record_pos > U16_MAX ||
+	    !IS_ALIGNED(record_pos, 8) || attr_len > U16_MAX ||
+	    record_pos > used || attr_len > used - record_pos ||
+	    attr_allocated_size != (u64)allocated_size ||
+	    attr_data_size != (u64)data_size ||
+	    attr_initialized_size != (u64)initialized_size) {
+		ntfs_error(vol->sb,
+			   "Invalid $MFT::$DATA extent during initialized-size extension to %lld: non_resident %u, flags 0x%x, lowest_vcn 0x%llx, record offset %lld, attribute length 0x%x, bytes in use 0x%x; cached allocated/data/initialized sizes 0x%llx/0x%llx/0x%llx, attribute sizes 0x%llx/0x%llx/0x%llx.",
+			   (long long)new_initialized_size,
+			   (unsigned int)attr->non_resident,
+			   (unsigned int)attr->flags,
+			   (unsigned long long)lowest_vcn,
+			   (long long)record_pos, attr_len, used,
+			   (unsigned long long)allocated_size,
+			   (unsigned long long)data_size,
+			   (unsigned long long)initialized_size,
+			   (unsigned long long)attr_allocated_size,
+			   (unsigned long long)attr_data_size,
+			   (unsigned long long)attr_initialized_size);
+		err = -EIO;
+		goto out_ctx;
+	}
+	record_off = record_pos;
+	old_sizes.alloc_size = attr->data.non_resident.allocated_size;
+	old_sizes.valid_size = attr->data.non_resident.initialized_size;
+	old_sizes.data_size = attr->data.non_resident.data_size;
+	new_sizes.alloc_size = old_sizes.alloc_size;
+	new_sizes.valid_size = cpu_to_le64(new_initialized_size);
+	new_sizes.data_size = cpu_to_le64(max(data_size,
+			new_initialized_size));
+	err = ntfs_attr_mft_register_home_undo(handle, ctx->ntfs_ino, mrec);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "Failed to register MFT record 0x%llx undo for $MFT::$DATA initialized-size update to %lld (error %d).",
+			   (unsigned long long)ctx->ntfs_ino->mft_no,
+			   (long long)new_initialized_size, err);
+		goto out_ctx;
+	}
+	err = ntfs_log_mft_attribute_sizes_update(handle,
+			ctx->ntfs_ino->mft_no, record_off, &old_sizes,
+			&new_sizes, false, &operation_lsn);
+	if (err) {
+		ntfs_error(vol->sb,
+			   "Failed to journal $MFT::$DATA size update for initialized-size extension from %lld to %lld (allocated_size 0x%llx, data_size 0x%llx, error %d).",
+			   (long long)initialized_size,
+			   (long long)new_initialized_size,
+			   (unsigned long long)attr_allocated_size,
+			   (unsigned long long)attr_data_size, err);
+		goto out_ctx;
+	}
+	attr->data.non_resident.initialized_size = new_sizes.valid_size;
+	attr->data.non_resident.data_size = new_sizes.data_size;
+	mrec->lsn = cpu_to_le64(operation_lsn);
+	mark_mft_record_dirty(ctx->ntfs_ino);
+out_ctx:
+	ntfs_attr_put_search_ctx(ctx);
+out_unmap:
+	unmap_mft_record(mft_ni);
+	return err;
+}
+
+static int ntfs_mft_data_extend_allocation_transacted_nolock(
+		struct ntfs_log_handle *handle, struct ntfs_volume *vol,
+		s64 required_size, u32 batch_records)
+{
+	struct runlist_element *allocated_rl = NULL;
+	struct runlist_element *merged_rl;
+	struct runlist_element *rl;
+	struct ntfs_inode *mft_ni;
+	unsigned long flags;
+	u64 added_bytes;
+	u64 batch_clusters;
+	u64 growth_bytes;
+	u64 new_bytes;
+	s64 allocated_size;
+	s64 expected_vcn;
+	s64 lcn_hint = -1;
+	s64 min_nr;
+	s64 nr;
+	s64 required_nr = 0;
+	s64 allocated_nr;
+	s64 new_clusters;
+	s64 old_clusters;
+	size_t new_rl_count;
+	u64 runs;
+	unsigned int max_runs = 0;
+	int err = 0;
+
+	if (!handle || !vol || required_size <= 0 || !batch_records)
+		return -EINVAL;
+	mft_ni = NTFS_I(vol->mft_ino);
+	if (!NInoNonResident(mft_ni) || NInoCompressed(mft_ni) ||
+	    NInoSparse(mft_ni) || NInoEncrypted(mft_ni)) {
+		ntfs_error(vol->sb,
+			   "Unsupported $MFT data state (nonresident %d, compressed %d, sparse %d, encrypted %d).",
+			   NInoNonResident(mft_ni), NInoCompressed(mft_ni),
+			   NInoSparse(mft_ni), NInoEncrypted(mft_ni));
+		return -EOPNOTSUPP;
+	}
+	err = ntfs_attr_map_whole_runlist(mft_ni);
+	if (err)
+		return err;
+	read_lock_irqsave(&mft_ni->size_lock, flags);
+	allocated_size = mft_ni->allocated_size;
+	read_unlock_irqrestore(&mft_ni->size_lock, flags);
+	if (allocated_size <= 0 ||
+	    !IS_ALIGNED(allocated_size, vol->cluster_size))
+		return -EIO;
+	old_clusters = allocated_size >> vol->cluster_size_bits;
+	min_nr = DIV_ROUND_UP_ULL(vol->mft_record_size, vol->cluster_size);
+	if (required_size > allocated_size) {
+		growth_bytes = required_size - allocated_size;
+		required_nr = DIV_ROUND_UP_ULL(growth_bytes,
+					       vol->cluster_size);
+	}
+	min_nr = max(min_nr, required_nr);
+	growth_bytes = (u64)vol->mft_record_size * batch_records;
+	batch_clusters = DIV_ROUND_UP_ULL(growth_bytes, vol->cluster_size);
+	nr = batch_clusters;
+	nr = max(nr, min_nr);
+	if (batch_records > MFT_RECORD_INIT_BATCH)
+		nr = ntfs_mft_growth_aligned_clusters(old_clusters, nr,
+				min_nr, batch_clusters);
+	if (check_shl_overflow((u64)nr, vol->cluster_size_bits,
+			&added_bytes) ||
+	    check_add_overflow((u64)allocated_size, added_bytes,
+			&new_bytes) ||
+	    (new_bytes >> vol->mft_record_size_bits) >= (1ULL << 32))
+		nr = min_nr;
+	if (check_shl_overflow((u64)nr, vol->cluster_size_bits,
+			&added_bytes) ||
+	    check_add_overflow((u64)allocated_size, added_bytes,
+			&new_bytes) ||
+	    (new_bytes >> vol->mft_record_size_bits) >= (1ULL << 32))
+		return -ENOSPC;
+	err = ntfs_mft_mapping_growth_preflight(mft_ni, old_clusters, nr);
+	if (err == -EOPNOTSUPP && nr > MFT_GROWTH_MAX_RUNS &&
+	    min_nr <= MFT_GROWTH_MAX_RUNS &&
+	    batch_records > MFT_RECORD_INIT_BATCH) {
+		/* Bound the actual run count to the mapping space preflighted. */
+		err = ntfs_mft_mapping_growth_preflight(mft_ni, old_clusters,
+				MFT_GROWTH_MAX_RUNS);
+		if (!err)
+			max_runs = MFT_GROWTH_MAX_RUNS;
+	}
+	if (err && nr != min_nr) {
+		nr = min_nr;
+		max_runs = 0;
+		err = ntfs_mft_mapping_growth_preflight(mft_ni, old_clusters,
+				nr);
+	}
+	if (err && err != -EOPNOTSUPP) {
+		ntfs_error(vol->sb,
+			   "Failed $MFT mapping growth preflight (error %d, old clusters %lld, new clusters %lld).",
+			   err, old_clusters, nr);
+		return err;
+	}
+	if (check_shl_overflow((u64)nr, vol->cluster_size_bits,
+			&added_bytes) ||
+	    check_add_overflow((u64)allocated_size, added_bytes,
+			&new_bytes) || new_bytes > S64_MAX)
+		return -EOVERFLOW;
+	new_clusters = new_bytes >> vol->cluster_size_bits;
+	down_read(&mft_ni->runlist.lock);
+	for (rl = mft_ni->runlist.rl; rl && rl->length; rl++) {
+		if (rl->lcn < 0 || rl->length <= 0 ||
+		    check_add_overflow(rl->lcn, rl->length, &lcn_hint)) {
+			err = -EIO;
+			break;
+		}
+	}
+	if (!err && (!rl || rl->vcn != old_clusters ||
+		    rl->lcn != LCN_ENOENT))
+		err = -EIO;
+	up_read(&mft_ni->runlist.lock);
+	if (err)
+		return err;
+	allocated_rl = ntfs_cluster_alloc_transacted_partial(handle, vol,
+			old_clusters, nr, min_nr, lcn_hint, MFT_ZONE, true,
+			false, false, max_runs);
+	if (IS_ERR(allocated_rl)) {
+		return PTR_ERR(allocated_rl);
+	}
+	expected_vcn = old_clusters;
+	runs = 0;
+	for (rl = allocated_rl; rl->length; rl++) {
+		if (rl->vcn != expected_vcn || rl->lcn < 0 ||
+		    rl->length <= 0 ||
+		    check_add_overflow(expected_vcn, rl->length,
+			    &expected_vcn) || ++runs > nr) {
+			err = -EIO;
+			goto out;
+		}
+	}
+	if (expected_vcn <= old_clusters ||
+	    expected_vcn - old_clusters < min_nr ||
+	    expected_vcn - old_clusters > nr) {
+		err = -EIO;
+		goto out;
+	}
+	allocated_nr = expected_vcn - old_clusters;
+	if (allocated_nr != nr) {
+		nr = allocated_nr;
+		if (check_shl_overflow((u64)nr, vol->cluster_size_bits,
+				&added_bytes) ||
+		    check_add_overflow((u64)allocated_size, added_bytes,
+				&new_bytes) || new_bytes > S64_MAX) {
+			err = -EOVERFLOW;
+			goto out;
+		}
+		new_clusters = new_bytes >> vol->cluster_size_bits;
+	}
+	if (expected_vcn != new_clusters || rl->vcn != expected_vcn ||
+	    rl->lcn != LCN_ENOENT) {
+		err = -EIO;
+		goto out;
+	}
+	down_write(&mft_ni->runlist.lock);
+	read_lock_irqsave(&mft_ni->size_lock, flags);
+	err = mft_ni->allocated_size == allocated_size ? 0 : -EAGAIN;
+	read_unlock_irqrestore(&mft_ni->size_lock, flags);
+	if (err)
+		goto out_unlock;
+	err = ntfs_attr_allocation_register_home_undo(handle, mft_ni);
+	if (err)
+		goto out_unlock;
+	merged_rl = ntfs_runlists_merge(&mft_ni->runlist, allocated_rl, 0,
+			&new_rl_count);
+	if (IS_ERR(merged_rl)) {
+		err = PTR_ERR(merged_rl);
+		goto out_unlock;
+	}
+	allocated_rl = NULL;
+	mft_ni->runlist.rl = merged_rl;
+	mft_ni->runlist.count = new_rl_count;
+	mft_ni->runlist.rl_hint = -1;
+	write_lock_irqsave(&mft_ni->size_lock, flags);
+	mft_ni->allocated_size = new_bytes;
+	VFS_I(mft_ni)->i_blocks += added_bytes >> 9;
+	write_unlock_irqrestore(&mft_ni->size_lock, flags);
+	up_write(&mft_ni->runlist.lock);
+	down_write(&mft_ni->runlist.lock);
+	err = ntfs_attr_update_mapping_pairs_transacted(handle, mft_ni);
+	up_write(&mft_ni->runlist.lock);
+	if (err)
+		ntfs_error(vol->sb,
+			   "Failed to update grown $MFT mapping pairs (error %d).",
+			   err);
+	return err;
+
+out_unlock:
+	up_write(&mft_ni->runlist.lock);
+out:
+	kvfree(allocated_rl);
+	return err;
 }
 
 /*
@@ -2198,16 +3511,37 @@ static int ntfs_mft_record_layout(const struct ntfs_volume *vol, const s64 mft_n
  *
  * Return 0 on success and -errno on error.
  */
-static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_no)
+static int ntfs_mft_record_format_common(struct ntfs_log_handle *handle,
+					 const struct ntfs_volume *vol,
+					 const s64 mft_no)
 {
 	loff_t i_size;
 	struct inode *mft_vi = vol->mft_ino;
 	struct folio *folio;
+	struct mft_record *log_mrec;
 	struct mft_record *m;
 	pgoff_t index, end_index;
 	unsigned int ofs;
+	u64 operation_lsn;
 	int err;
 
+	if (handle) {
+		log_mrec = kmalloc(vol->mft_record_size, GFP_NOFS);
+		if (!log_mrec)
+			return -ENOMEM;
+		err = ntfs_mft_record_layout(vol, mft_no, log_mrec);
+		if (!err)
+			err = ntfs_log_mft_record_initialize(handle, mft_no,
+							     log_mrec,
+							     &operation_lsn);
+		kfree(log_mrec);
+		if (err) {
+			ntfs_error(vol->sb,
+				   "Failed to journal formatted mft record 0x%llx (error %d).",
+				   (long long)mft_no, err);
+			return err;
+		}
+	}
 	ntfs_debug("Entering for mft record 0x%llx.", (long long)mft_no);
 	/*
 	 * The index into the page cache and the offset within the page cache
@@ -2243,12 +3577,15 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 	if (unlikely(err)) {
 		ntfs_error(vol->sb, "Failed to layout mft record 0x%llx.",
 				(long long)mft_no);
+
 		folio_mark_uptodate(folio);
 		folio_unlock(folio);
 		kunmap_local(m);
 		folio_put(folio);
 		return err;
 	}
+	if (handle)
+		m->lsn = cpu_to_le64(operation_lsn);
 	pre_write_mst_fixup((struct ntfs_record *)m, vol->mft_record_size);
 	folio_mark_uptodate(folio);
 	/*
@@ -2262,6 +3599,60 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
 	folio_put(folio);
 	ntfs_debug("Done.");
 	return 0;
+}
+
+static int ntfs_mft_record_format(const struct ntfs_volume *vol,
+				  const s64 mft_no)
+{
+	return ntfs_mft_record_format_common(NULL, vol, mft_no);
+}
+
+static int ntfs_mft_record_format_transacted(struct ntfs_log_handle *handle,
+					     const struct ntfs_volume *vol,
+					     s64 mft_no)
+{
+	if (!handle)
+		return -EINVAL;
+	return ntfs_mft_record_format_common(handle, vol, mft_no);
+}
+
+static struct ntfs_log_handle *ntfs_mft_growth_begin(
+		struct ntfs_log_handle *parent, struct ntfs_volume *vol,
+		u32 *batch_records)
+{
+	static const u32 batches[] = {
+		MFT_RECORD_INIT_LARGE_BATCH, MFT_RECORD_INIT_MEDIUM_BATCH,
+	};
+	struct ntfs_log_handle *handle;
+	int credits, i;
+
+	if (!parent || !vol || !batch_records)
+		return ERR_PTR(-EINVAL);
+	*batch_records = MFT_RECORD_INIT_BATCH;
+	if (!ntfs_can_speculate_allocation(vol))
+		goto default_batch;
+
+	/* Never start optional growth without funding its entire undo budget. */
+	for (i = 0; i < ARRAY_SIZE(batches); i++) {
+		credits = ntfs_mft_record_alloc_credits_batch(vol, batches[i]);
+		if (credits < 0 && credits != -EOVERFLOW && credits != -E2BIG)
+			return ERR_PTR(credits);
+		if (credits < 0 || credits > parent->operation_credits)
+			continue;
+		handle = ntfs_log_begin_independent_full(parent, credits);
+		if (!IS_ERR(handle)) {
+			*batch_records = batches[i];
+			return handle;
+		}
+		if (PTR_ERR(handle) != -EAGAIN)
+			return handle;
+	}
+
+default_batch:
+	credits = ntfs_mft_record_alloc_credits(vol);
+	if (credits < 0)
+		return ERR_PTR(credits);
+	return ntfs_log_begin_independent(parent, credits);
 }
 
 /*
@@ -2307,21 +3698,24 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
  * When scanning the mft bitmap, we only search up to the last allocated mft
  * record.  If there are no free records left in the range 24 to number of
  * allocated mft records, then we extend the $MFT/$DATA attribute in order to
- * create free mft records.  We extend the allocated size of $MFT/$DATA by 16
- * records at a time or one cluster, if cluster size is above 16kiB.  If there
- * is not sufficient space to do this, we try to extend by two mft records or
- * one cluster, if a cluster already contains at least two mft records.
+ * create free mft records.  Non-journaled growth normally allocates 16 records
+ * or one cluster at a time.  Journaled growth can reserve a larger batch when
+ * its complete undo budget fits, and accepts a shorter allocation if necessary.
  *
  * When extending the initialized MFT tail, we also initialize up to four
  * additional records and reserve them in memory for future $MFT metadata
- * extents.  If there are less than 24 mft records, records are initialized
- * until record 24, which is the first record used for normal files.
+ * extents. Journaled growth initializes up to 16, 64, or 256 records per
+ * transaction within the allocated space and initialized bitmap. The
+ * remaining free records can be used without another durable growth commit.
+ * If there are fewer than 24 mft records, records are initialized until record
+ * 24, which is the first record used for normal files.
  *
  * If during any stage we overflow the initialized data in the mft bitmap, we
- * extend the initialized size (and data size) by 8 bytes, allocating another
- * cluster if required.  The bitmap data size has to be at least equal to the
- * number of mft records in the mft, but it can be bigger, in which case the
- * superfluous bits are padded with zeroes.
+ * extend the initialized size (and data size), allocating another cluster if
+ * required.  Non-journaled growth extends by 8 bytes. The largest journaled
+ * batch extends by up to 32 bytes.  The bitmap data size has to cover the
+ * number of mft records, but it can be bigger, in which case the superfluous
+ * bits are padded with zeroes.
  *
  * Thus, when we return successfully (IS_ERR() is false), we will have:
  *	- initialized / extended the mft bitmap if necessary,
@@ -2349,15 +3743,23 @@ static int ntfs_mft_record_format(const struct ntfs_volume *vol, const s64 mft_n
  * easier because otherwise there might be circular invocations of functions
  * when reading the bitmap.
  */
-int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
-			  struct ntfs_inode **ni, struct ntfs_inode *base_ni,
-			  struct mft_record **ni_mrec, const s64 mft_data_vcn)
+static int __ntfs_mft_record_alloc(struct ntfs_log_handle *caller_handle,
+		struct ntfs_volume *vol, const int mode, struct ntfs_inode **ni,
+		struct ntfs_inode *base_ni, struct mft_record **ni_mrec,
+		const s64 mft_data_vcn)
 {
+	struct ntfs_log_handle *log_handle = caller_handle;
+	struct ntfs_log_handle *growth_handle = NULL;
+	struct ntfs_mft_alloc_home_undo *alloc_undo = NULL;
+	struct ntfs_mft_count_home_undo *count_undo = NULL;
+	struct mft_record *old_disk_mrec = NULL;
+	struct mft_record *log_mrec = NULL;
 	s64 ll, bit, old_data_initialized, old_data_size;
 	s64 nr_new_mft_records = 0;
 	s64 max_mft_no = -1, reserve_start = -1, reserve_end = -1;
 	s64 candidate_reserve_end = -1;
 	s64 *reserve_endp;
+	u64 operation_lsn = 0;
 	unsigned long flags;
 	struct folio *folio;
 	struct ntfs_inode *mft_ni, *mftbmp_ni;
@@ -2366,16 +3768,23 @@ int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
 	struct attr_record *a;
 	pgoff_t index;
 	unsigned int ofs;
+	int credits;
 	int err;
 	__le16 seq_no, usn;
 	bool record_formatted = false, from_reserve = false, tail_alloc = false;
 	bool reserve_created = false;
 	bool forced_reserved_record = false;
+	bool log_commit_failed = false;
+	bool mft_allocation_grown = false;
+	bool own_log_handle = false;
+	bool corrupt_mft_record = false;
+	u32 growth_batch_records = MFT_RECORD_INIT_BATCH;
 	unsigned int memalloc_flags;
 
-	if (base_ni && *ni)
+	if (!vol || !ni || (base_ni && *ni))
 		return -EINVAL;
-
+	if (NVolShutdown(vol))
+		return -EIO;
 	/* @mode and @base_ni are mutually exclusive. */
 	if (mode && base_ni)
 		return -EINVAL;
@@ -2401,13 +3810,36 @@ int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
 	else
 		ntfs_debug("Entering (allocating a base mft record).");
 
+	/* $MFT's own extent allocation may already hold mftbmp_lock. */
+	if (READ_ONCE(vol->journal) &&
+	    (!base_ni || base_ni->mft_no != FILE_MFT)) {
+		err = ntfs_log_reclaim_deferred(vol, NTFS_LOG_DEFERRED_MFT,
+				atomic64_read(&vol->free_mft_records), 1, false);
+		if (err)
+			return err;
+	}
+
+	/* Reserve before taking allocator locks so checkpoint writeback cannot recurse. */
+	if (!base_ni && vol->journal && !caller_handle) {
+		credits = ntfs_mft_record_alloc_credits(vol);
+		if (credits < 0)
+			return credits;
+		log_handle = ntfs_log_begin(vol, credits);
+		if (IS_ERR(log_handle))
+			return PTR_ERR(log_handle);
+		own_log_handle = true;
+	}
+
 	memalloc_flags = memalloc_nofs_save();
 
 	mft_ni = NTFS_I(vol->mft_ino);
 	if (!base_ni || base_ni->mft_no != FILE_MFT)
 		mutex_lock(&mft_ni->mrec_lock);
+	if (NVolShutdown(vol)) {
+		err = -EIO;
+		goto err_out;
+	}
 	mftbmp_ni = NTFS_I(vol->mftbmp_ino);
-search_free_rec:
 	from_reserve = false;
 	reserve_created = false;
 	candidate_reserve_end = -1;
@@ -2417,7 +3849,11 @@ search_free_rec:
 	    vol->mft_record_reserve_pos < vol->mft_record_reserve_end &&
 	    (max_mft_no < 0 || vol->mft_record_reserve_pos < max_mft_no)) {
 		bit = vol->mft_record_reserve_pos;
-		err = ntfs_bitmap_set_bit(vol->mftbmp_ino, bit);
+		if (log_handle)
+			err = ntfs_bitmap_set_bits_in_run_transacted(log_handle,
+					vol->mftbmp_ino, bit, 1, 1);
+		else
+			err = ntfs_bitmap_set_bit(vol->mftbmp_ino, bit);
 		if (unlikely(err)) {
 			ntfs_error(vol->sb,
 				   "Failed to allocate reserved MFT record 0x%llx.",
@@ -2441,19 +3877,23 @@ search_free_rec:
 			ntfs_debug("Reserved free MFT records [0x%llx, 0x%llx) for metadata.",
 				   bit + 1, candidate_reserve_end);
 		}
-		ntfs_debug("Found and allocated free record (#1), bit 0x%llx.",
+		ntfs_debug("Found free record (#1), bit 0x%llx.",
 				(long long)bit);
-		goto have_alloc_rec;
+		goto found_free_rec;
 	}
 	if (bit != -ENOSPC) {
-		if (!base_ni || base_ni->mft_no != FILE_MFT) {
+		err = bit;
+		if (!base_ni || base_ni->mft_no != FILE_MFT)
 			up_write(&vol->mftbmp_lock);
-			mutex_unlock(&mft_ni->mrec_lock);
-		}
-		memalloc_nofs_restore(memalloc_flags);
-		return bit;
-	}
+		if (own_log_handle) {
+			int abort_err = ntfs_log_abort(log_handle);
 
+			log_handle = NULL;
+			if (abort_err)
+				err = abort_err;
+		}
+		goto err_out;
+	}
 	if (base_ni && base_ni->mft_no == FILE_MFT) {
 		static const u8 bootstrap_records[] = {
 			FILE_reserved15, FILE_reserved12, FILE_reserved13,
@@ -2510,6 +3950,16 @@ search_free_rec:
 	bit = old_data_initialized << 3;
 	if (unlikely(bit >= (1ll << 32)))
 		goto max_err_out;
+	if (log_handle) {
+		growth_handle = ntfs_mft_growth_begin(log_handle, vol,
+				&growth_batch_records);
+		if (IS_ERR(growth_handle)) {
+			err = PTR_ERR(growth_handle);
+			growth_handle = NULL;
+			up_write(&vol->mftbmp_lock);
+			goto err_out;
+		}
+	}
 	read_lock_irqsave(&mftbmp_ni->size_lock, flags);
 	old_data_size = mftbmp_ni->allocated_size;
 	ntfs_debug("Status of mftbmp before extension: allocated_size 0x%llx, data_size 0x%llx, initialized_size 0x%llx.",
@@ -2519,13 +3969,24 @@ search_free_rec:
 	if (old_data_initialized + 8 > old_data_size) {
 		/* Need to extend bitmap by one more cluster. */
 		ntfs_debug("mftbmp: initialized_size + 8 > allocated_size.");
-		err = ntfs_mft_bitmap_extend_allocation_nolock(vol);
-		if (err == -EAGAIN)
+		if (log_handle)
+			err = ntfs_mft_bitmap_extend_allocation_transacted_nolock(
+					growth_handle, vol);
+		else
 			err = ntfs_mft_bitmap_extend_allocation_nolock(vol);
+		if (err == -EAGAIN)
+			err = log_handle ?
+				ntfs_mft_bitmap_extend_allocation_transacted_nolock(
+					growth_handle, vol) :
+				ntfs_mft_bitmap_extend_allocation_nolock(vol);
 
 		if (unlikely(err)) {
 			if (!base_ni || base_ni->mft_no != FILE_MFT)
 				up_write(&vol->mftbmp_lock);
+			ntfs_error(vol->sb,
+				   "Failed to extend MFT bitmap allocation while allocating record for inode %llu (error %d).",
+				   base_ni ? (unsigned long long)base_ni->mft_no :
+					   (unsigned long long)FILE_MFT, err);
 			goto err_out;
 		}
 #ifdef DEBUG
@@ -2542,10 +4003,18 @@ search_free_rec:
 	 * as well as the data_size if necessary and fill the new space with
 	 * zeroes.
 	 */
-	err = ntfs_mft_bitmap_extend_initialized_nolock(vol);
+	if (log_handle)
+		err = ntfs_mft_bitmap_extend_initialized_transacted_nolock(
+				growth_handle, vol, growth_batch_records);
+	else
+		err = ntfs_mft_bitmap_extend_initialized_nolock(vol);
 	if (unlikely(err)) {
 		if (!base_ni || base_ni->mft_no != FILE_MFT)
 			up_write(&vol->mftbmp_lock);
+		ntfs_error(vol->sb,
+			   "Failed to extend MFT bitmap initialized size while allocating record for inode %llu (error %d).",
+			   base_ni ? (unsigned long long)base_ni->mft_no :
+				   (unsigned long long)FILE_MFT, err);
 		goto err_out;
 	}
 #ifdef DEBUG
@@ -2560,7 +4029,26 @@ search_free_rec:
 found_free_rec:
 	/* @bit is the found free mft record, allocate it in the mft bitmap. */
 	ntfs_debug("At found_free_rec.");
-	err = ntfs_bitmap_set_bit(vol->mftbmp_ino, bit);
+	if (check_shl_overflow(bit + 1, vol->mft_record_size_bits, &ll)) {
+		err = -EOVERFLOW;
+		if (!base_ni || base_ni->mft_no != FILE_MFT)
+			up_write(&vol->mftbmp_lock);
+		goto err_out;
+	}
+	err = ntfs_bitmap_validate_run(vol->mftbmp_ino, bit, 1, 0);
+	if (unlikely(err)) {
+		ntfs_error(vol->sb,
+				"Selected MFT bitmap bit is not free (error %d).",
+				err);
+		if (!base_ni || base_ni->mft_no != FILE_MFT)
+			up_write(&vol->mftbmp_lock);
+		goto err_out;
+	}
+	if (log_handle)
+		err = ntfs_bitmap_set_bits_in_run_transacted(log_handle,
+				vol->mftbmp_ino, bit, 1, 1);
+	else
+		err = ntfs_bitmap_set_bit(vol->mftbmp_ino, bit);
 	if (unlikely(err)) {
 		ntfs_error(vol->sb, "Failed to allocate bit in mft bitmap.");
 		if (!base_ni || base_ni->mft_no != FILE_MFT)
@@ -2568,7 +4056,6 @@ found_free_rec:
 		goto err_out;
 	}
 	ntfs_debug("Set bit 0x%llx in mft bitmap.", (long long)bit);
-have_alloc_rec:
 	/*
 	 * The mft bitmap is now uptodate.  Deal with mft data attribute now.
 	 * Note, we keep hold of the mft bitmap lock for writing until all
@@ -2577,9 +4064,11 @@ have_alloc_rec:
 	 * by a parallel allocation and if the lock is not maintained a
 	 * parallel allocation could allocate the same mft record as this one.
 	 */
+have_alloc_rec:
 	ll = (bit + 1) << vol->mft_record_size_bits;
 	read_lock_irqsave(&mft_ni->size_lock, flags);
 	old_data_initialized = mft_ni->initialized_size;
+	old_data_size = i_size_read(vol->mft_ino);
 	read_unlock_irqrestore(&mft_ni->size_lock, flags);
 	tail_alloc = (!base_ni || base_ni->mft_no != FILE_MFT) &&
 			bit >= (old_data_initialized >> vol->mft_record_size_bits) &&
@@ -2589,6 +4078,16 @@ have_alloc_rec:
 	if (ll <= old_data_initialized) {
 		ntfs_debug("Allocated mft record already initialized.");
 		goto mft_rec_already_initialized;
+	}
+	if (log_handle && !growth_handle &&
+	    (!base_ni || base_ni->mft_no != FILE_MFT)) {
+		growth_handle = ntfs_mft_growth_begin(log_handle, vol,
+				&growth_batch_records);
+		if (IS_ERR(growth_handle)) {
+			err = PTR_ERR(growth_handle);
+			growth_handle = NULL;
+			goto undo_mftbmp_alloc_nolock;
+		}
 	}
 	ntfs_debug("Initializing allocated mft record.");
 	/*
@@ -2604,12 +4103,34 @@ have_alloc_rec:
 				mft_ni->initialized_size);
 		while (ll > mft_ni->allocated_size) {
 			read_unlock_irqrestore(&mft_ni->size_lock, flags);
-			err = ntfs_mft_data_extend_allocation_nolock(vol);
-			if (err == -EAGAIN)
+			if (log_handle) {
+				if (mft_allocation_grown) {
+					read_lock_irqsave(&mft_ni->size_lock, flags);
+					old_data_size = mft_ni->allocated_size;
+					read_unlock_irqrestore(&mft_ni->size_lock,
+							       flags);
+					ntfs_error(vol->sb,
+						   "$MFT allocation remained too small after journaled growth (required 0x%llx, allocated 0x%llx).",
+						   ll, old_data_size);
+					err = -EOPNOTSUPP;
+				} else {
+					err = ntfs_mft_data_extend_allocation_transacted_nolock(
+						growth_handle, vol, ll,
+						growth_batch_records);
+					if (!err)
+						mft_allocation_grown = true;
+				}
+			} else {
 				err = ntfs_mft_data_extend_allocation_nolock(vol);
+				if (err == -EAGAIN)
+					err = ntfs_mft_data_extend_allocation_nolock(
+						vol);
+			}
 
 			if (unlikely(err)) {
-				ntfs_error(vol->sb, "Failed to extend mft data allocation.");
+				ntfs_error(vol->sb,
+					   "Failed to extend mft data allocation (error %d).",
+					   err);
 				goto undo_mftbmp_alloc_nolock;
 			}
 			read_lock_irqsave(&mft_ni->size_lock, flags);
@@ -2644,6 +4165,30 @@ have_alloc_rec:
 	} else if (ll > mft_ni->allocated_size) {
 		err = -ENOSPC;
 		goto undo_mftbmp_alloc_nolock;
+	}
+	if (log_handle) {
+		s64 allocated_size, bitmap_records;
+
+		read_lock_irqsave(&mft_ni->size_lock, flags);
+		allocated_size = mft_ni->allocated_size;
+		read_unlock_irqrestore(&mft_ni->size_lock, flags);
+		read_lock_irqsave(&mftbmp_ni->size_lock, flags);
+		bitmap_records = mftbmp_ni->initialized_size << 3;
+		read_unlock_irqrestore(&mftbmp_ni->size_lock, flags);
+		ll = ntfs_mft_initialized_batch_end(old_data_initialized, ll,
+				allocated_size, bitmap_records,
+				vol->mft_record_size_bits, growth_batch_records);
+		err = ntfs_mft_data_extend_initialized_transacted_nolock(
+				growth_handle ? growth_handle : log_handle,
+				vol, ll);
+		if (err) {
+			ntfs_error(vol->sb,
+				   "Failed to extend mft data initialized size to 0x%llx (error %d).",
+				   ll, err);
+			goto undo_mftbmp_alloc_nolock;
+		}
+		record_formatted = true;
+		goto mft_data_initialized;
 	}
 	/*
 	 * Extend mft data initialized size (and data size of course) to reach
@@ -2709,12 +4254,7 @@ have_alloc_rec:
 	mark_mft_record_dirty(ctx->ntfs_ino);
 	ntfs_attr_put_search_ctx(ctx);
 	unmap_mft_record(mft_ni);
-	if (reserve_start >= 0 && reserve_end > reserve_start) {
-		vol->mft_record_reserve_pos = reserve_start;
-		vol->mft_record_reserve_end = reserve_end;
-		ntfs_debug("Reserved MFT records [0x%llx, 0x%llx) for metadata.",
-			   reserve_start, reserve_end);
-	}
+mft_data_initialized:
 	read_lock_irqsave(&mft_ni->size_lock, flags);
 	ntfs_debug("Status of mft data after mft record initialization: allocated_size 0x%llx, data_size 0x%llx, initialized_size 0x%llx.",
 			mft_ni->allocated_size,	i_size_read(vol->mft_ino),
@@ -2726,8 +4266,37 @@ have_alloc_rec:
 	read_unlock_irqrestore(&mft_ni->size_lock, flags);
 mft_rec_already_initialized:
 	/* Account for newly visible MFT records before dropping the lock. */
-	if (nr_new_mft_records > 0)
+	if (nr_new_mft_records > 0) {
+		if (log_handle) {
+			err = ntfs_mft_count_register_home_undo(
+					growth_handle ? growth_handle : log_handle, vol,
+					nr_new_mft_records, &count_undo);
+			if (err)
+				goto undo_mftbmp_alloc_nolock;
+		}
 		ntfs_inc_free_mft_records(vol, nr_new_mft_records);
+		if (count_undo)
+			count_undo->counted = true;
+	}
+	if (growth_handle) {
+		/*
+		 * Keep the MFT mutex until growth is durable. Bitmap callbacks
+		 * acquire mftbmp_lock themselves, so do not hold it at finish.
+		 */
+		up_write(&vol->mftbmp_lock);
+		err = ntfs_log_commit(growth_handle);
+		growth_handle = NULL;
+		count_undo = NULL;
+		down_write(&vol->mftbmp_lock);
+		if (err)
+			goto undo_mftbmp_alloc_nolock;
+	}
+	if (reserve_start >= 0 && reserve_end > reserve_start) {
+		vol->mft_record_reserve_pos = reserve_start;
+		vol->mft_record_reserve_end = reserve_end;
+		ntfs_debug("Reserved MFT records [0x%llx, 0x%llx) for metadata.",
+			   reserve_start, reserve_end);
+	}
 	/*
 	 * We can finally drop the mft bitmap lock as the mft data attribute
 	 * has been fully updated.  The only disparity left is that the
@@ -2758,20 +4327,40 @@ mft_rec_already_initialized:
 		folio_wait_writeback(folio);
 	folio_clear_uptodate(folio);
 	m = (struct mft_record *)((u8 *)kmap_local_folio(folio, 0) + ofs);
+	if (log_handle) {
+		old_disk_mrec = kmemdup(m, vol->mft_record_size, GFP_NOFS);
+		if (!old_disk_mrec) {
+			err = -ENOMEM;
+			folio_mark_uptodate(folio);
+			folio_unlock(folio);
+			kunmap_local(m);
+			folio_put(folio);
+			goto undo_mftbmp_alloc;
+		}
+	}
+
 	/* If we just formatted the mft record no need to do it again. */
 	if (!record_formatted) {
 		/* Sanity check that the mft record is really not in use. */
 		if (!forced_reserved_record && ntfs_is_file_record(m->magic) &&
 		    (m->flags & MFT_RECORD_IN_USE)) {
+			bool mft_folio_dirty = folio_test_dirty(folio);
+
 			ntfs_warning(vol->sb,
-				"Mft record 0x%llx was marked free in mft bitmap but is marked used itself. Unmount and run chkdsk.",
-				bit);
+				"Mft record 0x%llx was marked free in mft bitmap but is marked used itself (flags 0x%x, sequence %u, LSN 0x%llx, base 0x%llx, MFT folio dirty %u). Unmount and run chkdsk.",
+				bit, le16_to_cpu(m->flags),
+				le16_to_cpu(m->sequence_number),
+				(unsigned long long)le64_to_cpu(m->lsn),
+				(unsigned long long)le64_to_cpu(m->base_mft_record),
+				mft_folio_dirty);
 			folio_mark_uptodate(folio);
 			folio_unlock(folio);
 			kunmap_local(m);
 			folio_put(folio);
 			NVolSetErrors(vol);
-			goto search_free_rec;
+			corrupt_mft_record = true;
+			err = -EIO;
+			goto undo_mftbmp_alloc;
 		}
 		/*
 		 * We need to (re-)format the mft record, preserving the
@@ -2796,6 +4385,8 @@ mft_rec_already_initialized:
 		if (unlikely(err)) {
 			ntfs_error(vol->sb, "Failed to layout allocated mft record 0x%llx.",
 					bit);
+			if (old_disk_mrec)
+				memcpy(m, old_disk_mrec, vol->mft_record_size);
 			folio_mark_uptodate(folio);
 			folio_unlock(folio);
 			kunmap_local(m);
@@ -2814,8 +4405,6 @@ mft_rec_already_initialized:
 		m->flags |= MFT_RECORD_IS_DIRECTORY;
 	folio_mark_uptodate(folio);
 	if (base_ni) {
-		struct mft_record *m_tmp;
-
 		/*
 		 * Setup the base mft record in the extent mft record.  This
 		 * completes initialization of the allocated extent mft record
@@ -2823,14 +4412,43 @@ mft_rec_already_initialized:
 		 */
 		m->base_mft_record = MK_LE_MREF(base_ni->mft_no,
 				base_ni->seq_no);
+	}
+	if (log_handle) {
+		log_mrec = kmemdup(m, vol->mft_record_size, GFP_NOFS);
+		if (!log_mrec) {
+			err = -ENOMEM;
+			goto restore_locked_record;
+		}
+		if (post_read_mst_fixup((struct ntfs_record *)log_mrec,
+				vol->mft_record_size)) {
+			err = -EIO;
+			goto restore_locked_record;
+		}
+		err = ntfs_log_mft_record_initialize(log_handle, bit, log_mrec,
+				&operation_lsn);
+		if (err)
+			goto restore_locked_record;
+		m->lsn = cpu_to_le64(operation_lsn);
+		kfree(log_mrec);
+		log_mrec = NULL;
+	}
+	if (base_ni) {
+		struct mft_record *m_tmp;
+		struct ntfs_mft_locked_record locked = {
+			.mrec = m,
+			.ofs = ofs,
+			.folio = folio,
+		};
+
 		/*
 		 * Allocate an extent inode structure for the new mft record,
-		 * attach it to the base inode @base_ni and map, pin, and lock
-		 * its, i.e. the allocated, mft record.
+		 * attach it to the base inode @base_ni and map and pin the
+		 * allocated mft record.  The folio is already locked here, so
+		 * pass that mapping through instead of acquiring the lock again.
 		 */
-		m_tmp = map_extent_mft_record(base_ni,
+		m_tmp = map_extent_mft_record_from_locked(base_ni,
 					      MK_MREF(bit, le16_to_cpu(m->sequence_number)),
-					      ni);
+					      ni, &locked);
 		if (IS_ERR(m_tmp)) {
 			ntfs_error(vol->sb, "Failed to map allocated extent mft record 0x%llx.",
 					bit);
@@ -2848,6 +4466,16 @@ mft_rec_already_initialized:
 			kunmap_local(m);
 			folio_put(folio);
 			goto undo_mftbmp_alloc;
+		}
+		if (caller_handle) {
+			err = ntfs_mft_alloc_register_home_undo(caller_handle, vol,
+					*ni, bit, old_disk_mrec, true, &alloc_undo);
+			if (err) {
+				unmap_mft_record(*ni);
+				ntfs_inode_close(*ni);
+				*ni = NULL;
+				goto restore_locked_record;
+			}
 		}
 
 		/*
@@ -2884,14 +4512,33 @@ mft_rec_already_initialized:
 
 		(*ni)->mrec = kmemdup(m, vol->mft_record_size, GFP_NOFS);
 		if (!(*ni)->mrec) {
+			err = -ENOMEM;
+			if (log_handle)
+				goto restore_locked_record;
 			folio_unlock(folio);
 			kunmap_local(m);
 			folio_put(folio);
-			err = -ENOMEM;
 			goto undo_mftbmp_alloc;
 		}
 
 		post_read_mst_fixup((struct ntfs_record *)(*ni)->mrec, vol->mft_record_size);
+		if (caller_handle) {
+			err = ntfs_mft_alloc_register_home_undo(caller_handle, vol,
+					*ni, bit, old_disk_mrec, false, &alloc_undo);
+			if (err)
+				goto restore_locked_record;
+			kfree(old_disk_mrec);
+			old_disk_mrec = NULL;
+		} else if (log_handle) {
+			err = ntfs_log_commit(log_handle);
+			log_handle = NULL;
+			if (err) {
+				log_commit_failed = true;
+				goto restore_locked_record;
+			}
+			kfree(old_disk_mrec);
+			old_disk_mrec = NULL;
+		}
 		ntfs_mft_mark_dirty(folio);
 		folio_unlock(folio);
 		(*ni)->folio = folio;
@@ -2913,9 +4560,27 @@ mft_rec_already_initialized:
 	(*ni)->mft_no = bit;
 	if (ni_mrec)
 		*ni_mrec = (*ni)->mrec;
-	if (!forced_reserved_record)
+	if (!forced_reserved_record) {
 		ntfs_dec_free_mft_records(vol, 1);
+		if (alloc_undo)
+			alloc_undo->counted = true;
+	}
 	return 0;
+
+restore_locked_record:
+	kfree(log_mrec);
+	log_mrec = NULL;
+	if (old_disk_mrec)
+		memcpy(m, old_disk_mrec, vol->mft_record_size);
+	if (!base_ni && *ni) {
+		kfree((*ni)->mrec);
+		(*ni)->mrec = NULL;
+	}
+	folio_mark_uptodate(folio);
+	folio_unlock(folio);
+	kunmap_local(m);
+	folio_put(folio);
+	goto undo_mftbmp_alloc;
 undo_data_init:
 	write_lock_irqsave(&mft_ni->size_lock, flags);
 	mft_ni->initialized_size = old_data_initialized;
@@ -2926,7 +4591,10 @@ undo_mftbmp_alloc:
 	if (!base_ni || base_ni->mft_no != FILE_MFT)
 		down_write(&vol->mftbmp_lock);
 undo_mftbmp_alloc_nolock:
-	if (!forced_reserved_record && ntfs_bitmap_clear_bit(vol->mftbmp_ino, bit)) {
+	if (!forced_reserved_record &&
+	    ((log_handle || log_commit_failed) ?
+	     __ntfs_bitmap_set_bits_in_run(vol->mftbmp_ino, bit, 1, 0, true) :
+	     ntfs_bitmap_clear_bit(vol->mftbmp_ino, bit))) {
 		ntfs_error(vol->sb, "Failed to clear bit in mft bitmap.%s", es);
 		NVolSetErrors(vol);
 	}
@@ -2936,6 +4604,38 @@ undo_mftbmp_alloc_nolock:
 	if (!base_ni || base_ni->mft_no != FILE_MFT)
 		up_write(&vol->mftbmp_lock);
 err_out:
+	if (growth_handle) {
+		int abort_err = ntfs_log_abort(growth_handle);
+
+		growth_handle = NULL;
+		if (abort_err) {
+			ntfs_error(vol->sb,
+				"Failed to abort MFT growth transaction (error %i).",
+				abort_err);
+			NVolSetErrors(vol);
+			err = abort_err;
+		}
+	}
+	if (own_log_handle && log_handle) {
+		int abort_err = ntfs_log_abort(log_handle);
+
+		log_handle = NULL;
+		if (abort_err) {
+			ntfs_error(vol->sb,
+				"Failed to abort MFT allocation transaction (error %i).",
+				abort_err);
+			NVolSetErrors(vol);
+		}
+	}
+	kfree(log_mrec);
+	kfree(old_disk_mrec);
+	if (corrupt_mft_record) {
+		NVolSetShutdown(vol);
+		vol->sb->s_flags |= SB_RDONLY;
+		ntfs_error(vol->sb,
+			"Stopping writes: MFT record 0x%llx is in use but its bitmap bit is free.",
+			(unsigned long long)bit);
+	}
 	if (!base_ni || base_ni->mft_no != FILE_MFT)
 		mutex_unlock(&mft_ni->mrec_lock);
 	memalloc_nofs_restore(memalloc_flags);
@@ -2951,6 +4651,569 @@ max_err_out:
 	return -ENOSPC;
 }
 
+static int ntfs_mft_record_alloc_credits_batch(struct ntfs_volume *vol,
+		u32 batch_records)
+{
+	struct ntfs_inode *mft_ni;
+	unsigned long flags;
+	s64 allocated_size;
+	s64 initialized_size;
+	u64 credits;
+	u64 growth_bytes;
+	u64 mft_clusters;
+	u64 record_count = 1 + MFT_RECORD_RESERVE;
+	u64 record_range_credits;
+	u64 required_bytes;
+	u64 required_clusters = 0;
+	int allocation_credits;
+	int bitmap_credits;
+	int data_allocation_credits;
+	int mapping_credits;
+	int record_credits;
+	int size_credits;
+	int value_credits;
+
+	if (!vol || !vol->mft_ino || !batch_records)
+		return -EINVAL;
+	mft_ni = NTFS_I(vol->mft_ino);
+	read_lock_irqsave(&mft_ni->size_lock, flags);
+	allocated_size = mft_ni->allocated_size;
+	initialized_size = mft_ni->initialized_size;
+	read_unlock_irqrestore(&mft_ni->size_lock, flags);
+	if (allocated_size <= 0 || initialized_size < 0 ||
+	    initialized_size > allocated_size)
+		return -EIO;
+	required_bytes = (u64)FIRST_NORMAL_MFT_RECORD + 1;
+	if (check_shl_overflow(required_bytes, vol->mft_record_size_bits,
+			       &required_bytes))
+		return -EOVERFLOW;
+	if (required_bytes > allocated_size) {
+		growth_bytes = required_bytes - allocated_size;
+		required_clusters = DIV_ROUND_UP_ULL(growth_bytes,
+						     vol->cluster_size);
+	}
+	if (required_bytes > initialized_size) {
+		growth_bytes = required_bytes - initialized_size;
+		record_count = DIV_ROUND_UP_ULL(growth_bytes,
+						vol->mft_record_size) +
+				MFT_RECORD_RESERVE;
+	}
+	record_count = max_t(u64, record_count, batch_records);
+	record_credits = ntfs_log_mft_record_credits(vol);
+	if (record_credits < 0)
+		return record_credits;
+	if (!record_credits)
+		return -EIO;
+	if (check_mul_overflow(record_count, (u64)record_credits - 1,
+			       &record_range_credits))
+		return -EOVERFLOW;
+	if (check_add_overflow(record_range_credits, 1,
+			       &record_range_credits))
+		return -EOVERFLOW;
+	bitmap_credits = ntfs_log_bitmap_update_credits(0, 1);
+	if (bitmap_credits < 0)
+		return bitmap_credits;
+	size_credits = ntfs_log_mft_attribute_sizes_credits(vol, false);
+	if (size_credits < 0)
+		return size_credits;
+	value_credits = ntfs_log_nonresident_value_update_credits(vol,
+			max_t(u32, MFT_BITMAP_INIT_MIN_BYTES,
+			      batch_records >> 3), false);
+	if (value_credits < 0)
+		return value_credits;
+	allocation_credits = ntfs_cluster_alloc_log_credits(1);
+	if (allocation_credits < 0)
+		return allocation_credits;
+	mapping_credits = ntfs_attr_update_mapping_pairs_log_credits(vol,
+			vol->mft_record_size, vol->mft_record_size, 0, 0);
+	if (mapping_credits < 0)
+		return mapping_credits;
+	growth_bytes = (u64)vol->mft_record_size * batch_records;
+	mft_clusters = DIV_ROUND_UP_ULL(growth_bytes, vol->cluster_size);
+	mft_clusters = max(mft_clusters, required_clusters);
+	data_allocation_credits = ntfs_cluster_alloc_log_credits(mft_clusters);
+	if (data_allocation_credits < 0)
+		return data_allocation_credits;
+	credits = record_range_credits;
+	if (check_add_overflow(credits, (u64)bitmap_credits, &credits) ||
+	    check_add_overflow(credits, (u64)size_credits * 2, &credits) ||
+	    check_add_overflow(credits, (u64)value_credits, &credits) ||
+	    check_add_overflow(credits, (u64)allocation_credits, &credits) ||
+	    check_add_overflow(credits, (u64)data_allocation_credits,
+			&credits) ||
+	    check_add_overflow(credits, (u64)mapping_credits * 2, &credits) ||
+	    credits > INT_MAX)
+		return -EOVERFLOW;
+	return credits;
+}
+
+int ntfs_mft_record_alloc_credits(struct ntfs_volume *vol)
+{
+	return ntfs_mft_record_alloc_credits_batch(vol, MFT_RECORD_INIT_BATCH);
+}
+
+int ntfs_mft_record_free_credits(struct ntfs_volume *vol)
+{
+	int bitmap_credits;
+	int record_credits;
+	int credits;
+
+	record_credits = ntfs_log_mft_record_credits(vol);
+	if (record_credits < 0)
+		return record_credits;
+	bitmap_credits = ntfs_log_bitmap_update_credits(0, 1);
+	if (bitmap_credits < 0)
+		return bitmap_credits;
+	if (check_add_overflow(record_credits, bitmap_credits, &credits))
+		return -EOVERFLOW;
+	return credits;
+}
+
+static int ntfs_mft_retire_records_validate(
+		const struct ntfs_mft_retire_record *records, u64 nr_records)
+{
+	u64 index;
+
+	if (!records || !nr_records)
+		return -EINVAL;
+	for (index = 0; index < nr_records; index++) {
+		if (!records[index].ni || records[index].mft_no >= S64_MAX ||
+		    records[index].ni->mft_no != records[index].mft_no ||
+		    (index && records[index].mft_no <=
+			    records[index - 1].mft_no))
+			return -EIO;
+	}
+	return 0;
+}
+
+static const struct ntfs_mft_retire_record *ntfs_mft_retire_record_find(
+		const struct ntfs_mft_retire_record *records, u64 nr_records,
+		u64 mft_no)
+{
+	u64 high = nr_records;
+	u64 low = 0;
+
+	while (low < high) {
+		u64 middle = low + (high - low) / 2;
+
+		if (records[middle].mft_no < mft_no)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	if (low < nr_records && records[low].mft_no == mft_no)
+		return &records[low];
+	return NULL;
+}
+
+int ntfs_mft_records_retire_credits(struct ntfs_volume *vol,
+		const struct ntfs_mft_retire_record *records, u64 nr_records)
+{
+	u64 bitmap_credits = 1;
+	u64 bitmap_end;
+	u64 credits;
+	u64 index;
+	int err;
+	int record_credits;
+	int range_credits;
+
+	if (!vol)
+		return -EINVAL;
+	err = ntfs_mft_retire_records_validate(records, nr_records);
+	if (err)
+		return err;
+	record_credits = ntfs_log_mft_record_credits(vol);
+	if (record_credits < 0)
+		return record_credits;
+	if (!record_credits)
+		return -EIO;
+	/* Every image operation shares one MFT data open record. */
+	if (check_mul_overflow(nr_records, (u64)record_credits - 1,
+			&credits) ||
+	    check_add_overflow(credits, 1ULL, &credits))
+		return -E2BIG;
+	for (index = 0; index < nr_records; index = bitmap_end) {
+		for (bitmap_end = index + 1;
+		     bitmap_end < nr_records &&
+		     records[bitmap_end].mft_no ==
+			     records[bitmap_end - 1].mft_no + 1;
+		     bitmap_end++)
+			;
+		range_credits = ntfs_log_bitmap_update_credits(
+				records[index].mft_no, bitmap_end - index);
+		if (range_credits < 0)
+			return range_credits;
+		if (!range_credits ||
+		    check_add_overflow(bitmap_credits,
+				(u64)range_credits - 1, &bitmap_credits))
+			return -E2BIG;
+	}
+	/* Every range operation shares one MFT bitmap open record. */
+	if (check_add_overflow(credits, bitmap_credits, &credits) ||
+	    credits > INT_MAX)
+		return -E2BIG;
+	return credits;
+}
+
+int ntfs_mft_record_alloc(struct ntfs_volume *vol, const int mode,
+		struct ntfs_inode **ni, struct ntfs_inode *base_ni,
+		struct mft_record **ni_mrec, const s64 mft_data_vcn)
+{
+	return __ntfs_mft_record_alloc(NULL, vol, mode, ni, base_ni, ni_mrec,
+			mft_data_vcn);
+}
+
+int ntfs_mft_base_record_alloc_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, int mode, struct ntfs_inode **ni,
+		struct mft_record **ni_mrec)
+{
+	if (!handle || !ni || !*ni || !mode)
+		return -EINVAL;
+	return __ntfs_mft_record_alloc(handle, vol, mode, ni, NULL, ni_mrec,
+			-1);
+}
+
+/*
+ * Allocate an already initialized extent record in a caller-owned journal
+ * transaction.  The caller must unmap the returned record before commit or
+ * abort.  Abort (including a failed commit) restores and detaches the extent.
+ * Commit leaves it attached to the base inode.  Physical growth of $MFT or
+ * its bitmap stays on this handle. Mapping-pairs tail growth may allocate a
+ * further attribute-list extent before the new record is published.
+ */
+int ntfs_mft_record_alloc_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_volume *vol, struct ntfs_inode **ni,
+		struct ntfs_inode *base_ni, struct mft_record **ni_mrec)
+{
+	int err;
+
+	if (!handle || !vol || !base_ni)
+		return -EINVAL;
+	err = __ntfs_mft_record_alloc(handle, vol, 0, ni, base_ni, ni_mrec,
+			-1);
+	if (err)
+		ntfs_error(vol->sb,
+			   "Transacted extent MFT record allocation failed for inode %llu (error %d).",
+			   (unsigned long long)base_ni->mft_no, err);
+	return err;
+}
+
+static int ntfs_mft_record_free_image_validate(u64 mft_no,
+		struct ntfs_inode *base_ni, const struct mft_record *mrec,
+		bool require_empty)
+{
+	u32 attrs_off;
+	u32 used;
+	bool is_extent;
+
+	if (!base_ni || !mrec)
+		return -EINVAL;
+	is_extent = !!mrec->base_mft_record;
+	if ((is_extent &&
+	     MREF_LE(mrec->base_mft_record) != base_ni->mft_no) ||
+	    (!is_extent && mft_no != base_ni->mft_no))
+		return -EINVAL;
+	used = le32_to_cpu(mrec->bytes_in_use);
+	attrs_off = le16_to_cpu(mrec->attrs_offset);
+	if (!(mrec->flags & MFT_RECORD_IN_USE) || attrs_off > used ||
+	    (require_empty && used - attrs_off != 8) ||
+	    (!is_extent && mrec->link_count))
+		return -EINVAL;
+	return 0;
+}
+
+static int ntfs_mft_record_retire_image_preflight(struct ntfs_inode *ni,
+		struct ntfs_inode *base_ni)
+{
+	struct mft_record *mrec;
+	int err;
+
+	mrec = map_mft_record(ni);
+	if (IS_ERR(mrec))
+		return PTR_ERR(mrec);
+	err = ntfs_mft_record_free_image_validate(ni->mft_no, base_ni, mrec,
+			false);
+	unmap_mft_record(ni);
+	return err;
+}
+
+/* Retire an MFT record while retaining its live inode until transaction end. */
+static int __ntfs_mft_record_free_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		bool require_empty, bool allow_base, bool update_bitmap)
+{
+	struct ntfs_mft_free_home_undo *undo;
+	struct ntfs_inode *base_ni;
+	struct mft_record *mrec;
+	unsigned int memalloc_flags;
+	u64 operation_lsn;
+	u16 seq_no;
+	bool close_on_commit;
+	bool is_extent;
+	int err;
+
+	if (!handle || !ni)
+		return -EINVAL;
+	if (ni->nr_extents == -1) {
+		base_ni = ni->ext.base_ntfs_ino;
+		is_extent = true;
+		if (!base_ni)
+			return -EINVAL;
+	} else {
+		base_ni = ni;
+		is_extent = false;
+		if (!allow_base || NInoAttr(ni))
+			return -EINVAL;
+	}
+	close_on_commit = is_extent && (require_empty || allow_base);
+	if (!require_empty && !NInoBeingDeleted(base_ni))
+		return -EOPNOTSUPP;
+	mrec = map_mft_record(ni);
+	if (IS_ERR(mrec))
+		return PTR_ERR(mrec);
+	err = ntfs_mft_record_free_image_validate(ni->mft_no, base_ni, mrec,
+			require_empty);
+	if (err)
+		goto out_unmap;
+	err = ntfs_mft_free_register_home_undo(handle, ni, mrec,
+			close_on_commit, &undo);
+	if (err)
+		goto out_unmap;
+	err = ntfs_log_mft_record_deallocate(handle, ni->mft_no, mrec,
+			&operation_lsn);
+	if (err)
+		goto out_unmap;
+	mrec->flags &= ~MFT_RECORD_IN_USE;
+	seq_no = le16_to_cpu(mrec->sequence_number);
+	if (seq_no == 0xffff)
+		seq_no = 1;
+	else if (seq_no)
+		seq_no++;
+	mrec->sequence_number = cpu_to_le16(seq_no);
+	mrec->lsn = cpu_to_le64(operation_lsn);
+	err = ntfs_prepare_mft_record_write(ni);
+	if (err)
+		goto out_unmap;
+	NInoSetDirty(ni);
+	err = write_mft_record(ni, mrec, 0);
+	if (err)
+		goto out_unmap;
+	unmap_mft_record(ni);
+
+	if (!update_bitmap)
+		return 0;
+	memalloc_flags = memalloc_nofs_save();
+	if (base_ni->mft_no != FILE_MFT)
+		down_write(&ni->vol->mftbmp_lock);
+	err = ntfs_bitmap_validate_run(ni->vol->mftbmp_ino, ni->mft_no, 1, 1);
+	if (!err)
+		err = ntfs_mft_bitmap_register_free_home_undo(handle,
+				ni->vol, ni->mft_no, 1,
+				base_ni->mft_no != FILE_MFT);
+	if (!err)
+		err = ntfs_log_bitmap_update(handle,
+				ni->vol->mftbmp_ino, ni->mft_no, 1, 0);
+	if (base_ni->mft_no != FILE_MFT)
+		up_write(&ni->vol->mftbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	if (err)
+		return err;
+	return 0;
+out_unmap:
+	unmap_mft_record(ni);
+	return err;
+}
+
+int ntfs_mft_record_free_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni)
+{
+	return __ntfs_mft_record_free_transacted(handle, ni, true, false,
+			true);
+}
+
+/* Retire a deleted base or attached extent record regardless of contents. */
+int ntfs_mft_record_retire_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni)
+{
+	return __ntfs_mft_record_free_transacted(handle, ni, false, true,
+			true);
+}
+
+static int ntfs_mft_record_retire_image_transacted(
+		struct ntfs_log_handle *handle,
+		struct ntfs_inode *ni)
+{
+	return __ntfs_mft_record_free_transacted(handle, ni, false, true,
+			false);
+}
+
+static int ntfs_mft_records_bitmap_validate(
+		struct ntfs_inode *base_ni,
+		const struct ntfs_mft_retire_record *records, u64 nr_records)
+{
+	u64 bitmap_end;
+	u64 index;
+	int err;
+
+	for (index = 0; index < nr_records; index = bitmap_end) {
+		for (bitmap_end = index + 1;
+		     bitmap_end < nr_records &&
+		     records[bitmap_end].mft_no ==
+			     records[bitmap_end - 1].mft_no + 1;
+		     bitmap_end++)
+			;
+		err = ntfs_bitmap_validate_run(base_ni->vol->mftbmp_ino,
+				records[index].mft_no, bitmap_end - index, 1);
+		if (err) {
+			ntfs_error(base_ni->vol->sb,
+				   "MFT retirement bitmap preflight failed for records 0x%llx-0x%llx (base 0x%llx, error %d).",
+				   (unsigned long long)records[index].mft_no,
+				   (unsigned long long)records[bitmap_end - 1].mft_no,
+				   (unsigned long long)base_ni->mft_no, err);
+			return err;
+		}
+	}
+	return 0;
+}
+
+static int ntfs_mft_records_bitmap_preflight(
+		struct ntfs_inode *base_ni,
+		const struct ntfs_mft_retire_record *records, u64 nr_records)
+{
+	unsigned int memalloc_flags;
+	int err;
+
+	memalloc_flags = memalloc_nofs_save();
+	if (base_ni->mft_no != FILE_MFT)
+		down_read(&base_ni->vol->mftbmp_lock);
+	err = ntfs_mft_records_bitmap_validate(base_ni, records, nr_records);
+	if (base_ni->mft_no != FILE_MFT)
+		up_read(&base_ni->vol->mftbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	return err;
+}
+
+static int ntfs_mft_records_bitmap_free_transacted(
+		struct ntfs_log_handle *handle,
+		struct ntfs_inode *base_ni,
+		const struct ntfs_mft_retire_record *records, u64 nr_records)
+{
+	unsigned int memalloc_flags;
+	u64 bitmap_end;
+	u64 index;
+	int err = 0;
+
+	if (!handle || !base_ni || !NInoBeingDeleted(base_ni))
+		return -EINVAL;
+	err = ntfs_mft_retire_records_validate(records, nr_records);
+	if (err)
+		return err;
+	memalloc_flags = memalloc_nofs_save();
+	if (base_ni->mft_no != FILE_MFT)
+		down_write(&base_ni->vol->mftbmp_lock);
+	err = ntfs_mft_records_bitmap_validate(base_ni, records, nr_records);
+	if (err)
+		goto out_unlock;
+	for (index = 0; index < nr_records; index = bitmap_end) {
+		for (bitmap_end = index + 1;
+		     bitmap_end < nr_records &&
+		     records[bitmap_end].mft_no ==
+			     records[bitmap_end - 1].mft_no + 1;
+		     bitmap_end++)
+			;
+		err = ntfs_mft_bitmap_register_free_home_undo(handle,
+				base_ni->vol, records[index].mft_no,
+				bitmap_end - index,
+				base_ni->mft_no != FILE_MFT);
+		if (err)
+			break;
+		err = ntfs_log_bitmap_update(handle,
+				base_ni->vol->mftbmp_ino,
+				records[index].mft_no,
+				bitmap_end - index, 0);
+		if (err)
+			break;
+	}
+out_unlock:
+	if (base_ni->mft_no != FILE_MFT)
+		up_write(&base_ni->vol->mftbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	return err;
+}
+
+/* Validate a retirement snapshot while the caller holds base mrec_lock. */
+int ntfs_mft_records_retire_preflight(struct ntfs_inode *base_ni,
+		const struct ntfs_mft_retire_record *records, u64 nr_records)
+{
+	const struct ntfs_mft_retire_record *record;
+	struct ntfs_inode *ext_ni;
+	u64 index;
+	int i;
+	int err;
+
+	if (!base_ni || !records || base_ni->nr_extents < 0 ||
+	    nr_records != (u64)base_ni->nr_extents + 1 ||
+	    !NInoBeingDeleted(base_ni))
+		return -EINVAL;
+	err = ntfs_mft_retire_records_validate(records, nr_records);
+	if (err)
+		return err;
+	record = ntfs_mft_retire_record_find(records, nr_records,
+			base_ni->mft_no);
+	if (!record || record->ni != base_ni)
+		return -EIO;
+	for (i = 0; i < base_ni->nr_extents; i++) {
+		ext_ni = base_ni->ext.extent_ntfs_inos[i];
+		if (!ext_ni)
+			return -EIO;
+		record = ntfs_mft_retire_record_find(records, nr_records,
+				ext_ni->mft_no);
+		if (!record || record->ni != ext_ni || ext_ni->nr_extents != -1 ||
+		    ext_ni->ext.base_ntfs_ino != base_ni)
+			return -EIO;
+	}
+	for (index = 0; index < nr_records; index++) {
+		err = ntfs_mft_record_retire_image_preflight(records[index].ni,
+				base_ni);
+		if (err) {
+			ntfs_error(base_ni->vol->sb,
+				   "MFT retirement image preflight failed for record 0x%llx (base 0x%llx, error %d).",
+				   (unsigned long long)records[index].mft_no,
+				   (unsigned long long)base_ni->mft_no, err);
+			return err;
+		}
+	}
+	return ntfs_mft_records_bitmap_preflight(base_ni, records,
+			nr_records);
+}
+
+int ntfs_mft_records_retire_transacted(struct ntfs_log_handle *handle,
+		struct ntfs_inode *base_ni,
+		const struct ntfs_mft_retire_record *records, u64 nr_records)
+{
+	u64 index;
+	int err;
+
+	if (!handle)
+		return -EINVAL;
+	err = ntfs_mft_records_retire_preflight(base_ni, records, nr_records);
+	if (err)
+		return err;
+	for (index = 0; index < nr_records; index++) {
+		if (records[index].ni == base_ni)
+			continue;
+		err = ntfs_mft_record_retire_image_transacted(handle,
+				records[index].ni);
+		if (err)
+			return err;
+	}
+	err = ntfs_mft_record_retire_image_transacted(handle, base_ni);
+	if (err)
+		return err;
+	return ntfs_mft_records_bitmap_free_transacted(handle, base_ni,
+			records, nr_records);
+}
+
 /*
  * ntfs_mft_record_free - free an mft record on an ntfs volume
  * @vol:	volume on which to free the mft record
@@ -2964,36 +5227,75 @@ max_err_out:
  */
 int ntfs_mft_record_free(struct ntfs_volume *vol, struct ntfs_inode *ni)
 {
-	u64 mft_no;
-	int err;
-	u16 seq_no;
-	__le16 old_seq_no;
-	__le64 old_base_mft_record;
+	struct ntfs_log_handle *log_handle = NULL;
+	struct mft_record *old_mrec = NULL;
 	struct mft_record *ni_mrec;
 	unsigned int memalloc_flags;
 	struct ntfs_inode *base_ni;
-	bool keep_reserved;
+	u64 operation_lsn = 0;
+	u64 mft_no;
+	bool bitmap_changed = false, keep_reserved;
+	int rollback_err = 0;
+	int credits;
+	int err;
+	u16 seq_no;
 
 	if (!vol || !ni)
 		return -EINVAL;
 
 	ntfs_debug("Entering for inode 0x%llx.\n", (long long)ni->mft_no);
-
-	ni_mrec = map_mft_record(ni);
-	if (IS_ERR(ni_mrec))
-		return -EIO;
-
-	/* Cache the mft reference for later. */
 	mft_no = ni->mft_no;
 	if (likely(ni->nr_extents >= 0))
 		base_ni = ni;
 	else
 		base_ni = ni->ext.base_ntfs_ino;
+	if (!base_ni)
+		return -EINVAL;
 	keep_reserved = mft_no >= FILE_reserved12 &&
 			mft_no <= FILE_reserved15 &&
 			base_ni->mft_no == FILE_MFT;
+	memalloc_flags = memalloc_nofs_save();
+	if (base_ni->mft_no != FILE_MFT)
+		down_read(&vol->mftbmp_lock);
+	err = ntfs_bitmap_validate_run(vol->mftbmp_ino, mft_no, 1, 1);
+	if (base_ni->mft_no != FILE_MFT)
+		up_read(&vol->mftbmp_lock);
+	memalloc_nofs_restore(memalloc_flags);
+	if (err)
+		goto out_abort;
 
-	old_base_mft_record = ni_mrec->base_mft_record;
+	ni_mrec = map_mft_record(ni);
+	if (IS_ERR(ni_mrec))
+		return -EIO;
+	err = ntfs_mft_record_free_image_validate(mft_no, base_ni, ni_mrec,
+			false);
+	if (err)
+		goto out_unmap_abort;
+	old_mrec = kmemdup(ni_mrec, vol->mft_record_size, GFP_NOFS);
+	if (!old_mrec) {
+		err = -ENOMEM;
+		goto out_unmap_abort;
+	}
+	if (!keep_reserved && vol->journal) {
+		credits = ntfs_mft_record_free_credits(vol);
+		if (credits < 0) {
+			err = credits;
+			goto out_unmap_abort;
+		}
+		log_handle = ntfs_log_begin(vol, credits);
+		if (IS_ERR(log_handle)) {
+			err = PTR_ERR(log_handle);
+			log_handle = NULL;
+			goto out_unmap_abort;
+		}
+	}
+	if (log_handle) {
+		err = ntfs_log_mft_record_deallocate(log_handle, mft_no,
+				old_mrec, &operation_lsn);
+		if (err)
+			goto out_unmap_abort;
+	}
+
 	if (keep_reserved) {
 		/* Restore the special, unnamed form used by reserved records. */
 		ni_mrec->base_mft_record = 0;
@@ -3004,21 +5306,18 @@ int ntfs_mft_record_free(struct ntfs_volume *vol, struct ntfs_inode *ni)
 	}
 
 	/* Increment the sequence number, skipping zero, if it is not zero. */
-	old_seq_no = ni_mrec->sequence_number;
-	seq_no = le16_to_cpu(old_seq_no);
+	seq_no = le16_to_cpu(ni_mrec->sequence_number);
 	if (seq_no == 0xffff)
 		seq_no = 1;
 	else if (seq_no)
 		seq_no++;
 	ni_mrec->sequence_number = cpu_to_le16(seq_no);
+	if (operation_lsn)
+		ni_mrec->lsn = cpu_to_le64(operation_lsn);
 
-	down_read(&NTFS_I(vol->mft_ino)->runlist.lock);
-	err = ntfs_get_block_mft_record(NTFS_I(vol->mft_ino), ni);
-	up_read(&NTFS_I(vol->mft_ino)->runlist.lock);
-	if (err) {
-		unmap_mft_record(ni);
-		return err;
-	}
+	err = ntfs_prepare_mft_record_write(ni);
+	if (err)
+		goto restore_record;
 
 	/*
 	 * Set the ntfs inode dirty and write it out.  We do not need to worry
@@ -3028,10 +5327,11 @@ int ntfs_mft_record_free(struct ntfs_volume *vol, struct ntfs_inode *ni)
 	NInoSetDirty(ni);
 	err = write_mft_record(ni, ni_mrec, 1);
 	if (err)
-		goto sync_rollback;
+		goto restore_record;
 
 	if (keep_reserved) {
 		unmap_mft_record(ni);
+		kfree(old_mrec);
 		return 0;
 	}
 
@@ -3039,44 +5339,73 @@ int ntfs_mft_record_free(struct ntfs_volume *vol, struct ntfs_inode *ni)
 	memalloc_flags = memalloc_nofs_save();
 	if (base_ni->mft_no != FILE_MFT)
 		down_write(&vol->mftbmp_lock);
-	err = ntfs_bitmap_clear_bit(vol->mftbmp_ino, mft_no);
-	if (!err)
-		ntfs_inc_free_mft_records(vol, 1);
-	if (!err && base_ni->mft_no == FILE_MFT &&
-	    mft_no + 1 == vol->mft_record_reserve_pos &&
-	    mft_no < vol->mft_record_reserve_end)
-		vol->mft_record_reserve_pos = mft_no;
+	err = ntfs_bitmap_validate_run(vol->mftbmp_ino, mft_no, 1, 1);
+	if (!err && log_handle)
+		err = ntfs_bitmap_set_bits_in_run_transacted(log_handle,
+				vol->mftbmp_ino, mft_no, 1, 0);
+	else if (!err)
+		err = ntfs_bitmap_clear_bit(vol->mftbmp_ino, mft_no);
 	if (base_ni->mft_no != FILE_MFT)
 		up_write(&vol->mftbmp_lock);
 	memalloc_nofs_restore(memalloc_flags);
 	if (err)
-		goto bitmap_rollback;
+		goto restore_record;
+	bitmap_changed = true;
+
+	if (log_handle) {
+		err = ntfs_log_commit(log_handle);
+		log_handle = NULL;
+		if (err)
+			goto restore_record;
+	}
+	ntfs_inc_free_mft_records(vol, 1);
+	if (base_ni->mft_no == FILE_MFT &&
+	    mft_no + 1 == vol->mft_record_reserve_pos &&
+	    mft_no < vol->mft_record_reserve_end)
+		vol->mft_record_reserve_pos = mft_no;
 	unmap_mft_record(ni);
+	kfree(old_mrec);
 	return 0;
 
-	/* Rollback what we did... */
-bitmap_rollback:
-	memalloc_flags = memalloc_nofs_save();
-	if (base_ni->mft_no != FILE_MFT)
-		down_write(&vol->mftbmp_lock);
-	if (ntfs_bitmap_set_bit(vol->mftbmp_ino, mft_no))
-		ntfs_error(vol->sb, "ntfs_bitmap_set_bit failed in bitmap_rollback\n");
-	if (base_ni->mft_no != FILE_MFT)
-		up_write(&vol->mftbmp_lock);
-	memalloc_nofs_restore(memalloc_flags);
-sync_rollback:
-	ntfs_error(vol->sb,
-		"Eeek! Rollback failed in %s. Leaving inconsistent metadata!\n", __func__);
-	ni_mrec->flags |= MFT_RECORD_IN_USE;
-	ni_mrec->sequence_number = old_seq_no;
-	ni_mrec->base_mft_record = old_base_mft_record;
+	/* Restore home metadata before emitting compensation records. */
+restore_record:
+	if (bitmap_changed) {
+		memalloc_flags = memalloc_nofs_save();
+		if (base_ni->mft_no != FILE_MFT)
+			down_write(&vol->mftbmp_lock);
+		rollback_err = __ntfs_bitmap_set_bits_in_run(vol->mftbmp_ino,
+				mft_no, 1, 1, true);
+		if (base_ni->mft_no != FILE_MFT)
+			up_write(&vol->mftbmp_lock);
+		memalloc_nofs_restore(memalloc_flags);
+	}
+	memcpy(ni_mrec, old_mrec, vol->mft_record_size);
 	NInoSetDirty(ni);
-	write_mft_record(ni, ni_mrec, 0);
+	if (write_mft_record(ni, ni_mrec, 0) && !rollback_err)
+		rollback_err = -EIO;
+	if (rollback_err) {
+		ntfs_error(vol->sb,
+			"Failed to rollback MFT record free (error %i).", rollback_err);
+		NVolSetErrors(vol);
+	}
+out_unmap_abort:
 	unmap_mft_record(ni);
+out_abort:
+	if (log_handle) {
+		int abort_err = ntfs_log_abort(log_handle);
+
+		if (abort_err) {
+			ntfs_error(vol->sb,
+				"Failed to abort MFT record free transaction (error %i).",
+				abort_err);
+			NVolSetErrors(vol);
+		}
+	}
+	kfree(old_mrec);
 	return err;
 }
 
-static bool ntfs_add_mft_io_unit(struct bio *bio, struct folio *folio,
+static bool ntfs_add_mft_io_unit(struct bio *bio, struct page *page,
 				 const struct ntfs_mft_io_unit *unit)
 {
 	if (!bio->bi_iter.bi_size)
@@ -3084,7 +5413,7 @@ static bool ntfs_add_mft_io_unit(struct bio *bio, struct folio *folio,
 	else if (bio_end_sector(bio) != unit->sector)
 		return false;
 
-	return bio_add_folio(bio, folio, unit->len, unit->folio_ofs);
+	return bio_add_page(bio, page, unit->len, unit->folio_ofs);
 }
 
 static void ntfs_release_mft_write_refs(struct ntfs_inode **locked_nis,
@@ -3222,6 +5551,47 @@ static void ntfs_mft_write_error(struct ntfs_volume *vol,
 	ntfs_error(vol->sb, "Error while writing MFT folio: %d", err);
 }
 
+/* Every MFT record in a submitted I/O unit must have durable WAL. */
+int ntfs_mft_wait_page_log(struct ntfs_volume *vol, const u8 *data,
+		pgoff_t index, u32 start, u32 len, bool sync)
+{
+	u32 off;
+	int err;
+
+	if (WARN_ON_ONCE(start > PAGE_SIZE || len > PAGE_SIZE - start ||
+			 !IS_ALIGNED(start, vol->mft_record_size) ||
+			 !IS_ALIGNED(len, vol->mft_record_size)))
+		return -EINVAL;
+
+	for (off = start; off < start + len;
+	     off += vol->mft_record_size) {
+		const struct mft_record *m = (const void *)(data + off);
+		u64 mft_no = (((u64)index << PAGE_SHIFT) + off) >>
+				vol->mft_record_size_bits;
+
+		if ((mft_no == FILE_MFT || mft_no == FILE_AttrDef ||
+		     mft_no == FILE_UpCase) &&
+		    (!ntfs_is_file_record(m->magic) ||
+		     !(m->flags & MFT_RECORD_IN_USE))) {
+			ntfs_error(vol->sb,
+				"Refusing to write invalid system MFT record 0x%llx (folio %lu, magic 0x%x, flags 0x%x).",
+				(unsigned long long)mft_no, (unsigned long)index,
+				le32_to_cpu(m->magic), le16_to_cpu(m->flags));
+			NVolSetErrors(vol);
+			NVolSetShutdown(vol);
+			vol->sb->s_flags |= SB_RDONLY;
+			return -EIO;
+		}
+
+		if (!ntfs_is_mft_record(m->magic))
+			continue;
+		err = ntfs_log_writeback_lsn(vol, le64_to_cpu(m->lsn), sync);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
 /*
  * ntfs_write_mft_block - Write back a folio containing MFT records
  * @folio:	The folio to write back (contains one or more MFT records)
@@ -3285,8 +5655,17 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 		err = -ENOMEM;
 		goto out_noio;
 	}
-
 	kaddr = kmap_local_folio(folio, 0);
+	err = ntfs_mft_wait_page_log(vol, kaddr, folio->index, 0, PAGE_SIZE,
+			wbc->sync_mode == WB_SYNC_ALL);
+	if (err) {
+		redirty = true;
+		if (err == -EAGAIN) {
+			defer = true;
+			err = 0;
+		}
+		goto out_noio;
+	}
 	folio_clear_uptodate(folio);
 
 	for (record = 0; record < nr_records; record++) {
@@ -3304,6 +5683,7 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 			    (struct mft_record *)(kaddr +
 						  record * vol->mft_record_size),
 			    &tni, &ref_vi)) {
+			defer = true;
 			if (ref_vi)
 				ref_inos[nr_ref_inos++] = ref_vi;
 			continue;
@@ -3313,8 +5693,10 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 		if (tni) {
 			locked_nis[nr_locked_nis++] = tni;
 			if (tni->nr_extents < 0 &&
-			    tni->ext.base_ntfs_ino == NTFS_I(vol->mft_ino))
+			    tni->ext.base_ntfs_ino == NTFS_I(vol->mft_ino)) {
+				defer = true;
 				continue;
+			}
 		}
 		__set_bit(record, record_selected);
 	}
@@ -3344,7 +5726,7 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 	}
 	ctx = container_of(parent, struct ntfs_mft_write_ctx, bio);
 
-	if (!ntfs_add_mft_io_unit(parent, folio, &units[0])) {
+	if (!ntfs_add_mft_io_unit(parent, ctx->io_page, &units[0])) {
 		err = -EIO;
 		goto out_noio;
 	}
@@ -3356,7 +5738,7 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 		if (unit_idx) {
 			struct bio *target = child ? child : parent;
 
-			if (!ntfs_add_mft_io_unit(target, folio, unit)) {
+			if (!ntfs_add_mft_io_unit(target, ctx->io_page, unit)) {
 				if (child) {
 					ntfs_start_mft_writeback(ctx);
 					bio_chain(child, parent);
@@ -3369,7 +5751,7 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 					defer = true;
 					break;
 				}
-				if (!ntfs_add_mft_io_unit(child, folio, unit)) {
+				if (!ntfs_add_mft_io_unit(child, ctx->io_page, unit)) {
 					bio_put(child);
 					child = NULL;
 					if (!ctx->error)
@@ -3382,7 +5764,7 @@ static int ntfs_write_mft_block(struct folio *folio, struct writeback_control *w
 		}
 		if (file_ofs < mirror_size) {
 			int mirror_err = ntfs_sync_mft_mirror_unit(
-				vol, folio, file_ofs, unit);
+				vol, page_folio(ctx->io_page), file_ofs, unit);
 
 			if (mirror_err && !ctx->error)
 				ctx->error = mirror_err;
@@ -3415,7 +5797,7 @@ out_noio:
 	if (err && err != -ENOMEM)
 		ntfs_mft_write_error(vol, mapping, err);
 	if (parent)
-		bio_put(parent);
+		ntfs_free_mft_parent_bio(parent);
 	if (redirty || defer || err == -ENOMEM)
 		folio_redirty_for_writepage(wbc, folio);
 	folio_unlock(folio);
