@@ -11,6 +11,7 @@ The Linux NTFS filesystem driver
    - Utilities support
    - Linux file attributes
    - Supported mount options
+   - Journal module parameters
 
 
 Overview
@@ -217,7 +218,61 @@ streams_interface=      Select the named-stream pathname interface:
                         the namespace; NTFS has no orphan-stream list, so a
                         crash can leave that stream's data unreachable on
                         disk.
+
+journal=on|off|reset|replay
+                        Select journal recovery and recording behavior:
+
+                        ``on`` (default) replays the log when needed and
+                        records metadata changes on a read-write mount.
+                        Recovery can write to the device even when the
+                        resulting mount is read-only.
+
+                        ``off`` disables replay and journal recording.
+                        A volume needing recovery cannot be mounted
+                        read-write in this mode.
+
+                        ``reset`` disables journaling and empties $LogFile
+                        on a read-write mount. This can discard uncompleted
+                        recovery and lose metadata changes. Use it only
+                        when intentionally abandoning recovery. An unclean
+                        volume remains dirty and should be checked with
+                        chkdsk or ntfsck.
+
+                        ``replay`` performs any needed recovery and leaves
+                        the volume mounted read-only without starting a
+                        journal writer. Recovery requires a writable device.
+
+norecovery              Skip journal recovery. Requires a read-only mount
+                        and cannot be combined with ``journal=replay``.
+                        The exposed filesystem may be inconsistent.
 ======================= ====================================================
+
+Journal module parameters
+=========================
+
+These parameters apply to all NTFS mounts and are set when the driver is
+loaded, for example ``modprobe ntfs journal_async_commit=N``.
+
+``journal_async_commit``
+  Batch journal flushes across buffered transactions when enabled (default
+  ``Y``). Ordinary asynchronous transactions share a private generation
+  marker rather than emitting individual commit and forget records.
+  Transactions with deferred frees, or with no remaining pending batch, still
+  emit a commit record.
+  Setting this to ``N`` waits for each commit to reach stable storage.
+  Explicit durability operations and synchronous mounts still wait when
+  batching is enabled.
+
+``journal_commit_interval``
+  Maximum age in seconds for buffered journal commits (default 5, clamped
+  to 1 through 3600). Earlier flushes can occur due to durability requests
+  or journal space pressure.
+
+``journal_stats``
+  Enable journal profiling counters and CPU timings (default ``N``). When
+  debugfs is available, the statistics can be read from
+  ``/sys/kernel/debug/ntfs/log_recording_stats`` and
+  ``/sys/kernel/debug/ntfs/log_replay_stats``.
 
 Named-stream ioctls
 ===================

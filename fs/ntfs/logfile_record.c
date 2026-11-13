@@ -278,6 +278,7 @@ int ntfs_log_build_operation_payload(
 	u32 undo_off;
 	u32 redo_off;
 	u32 payload_len;
+	u16 inline_undo_len;
 	u16 i;
 
 	if (!desc || !payload || desc->redo_op > ZeroEndOfFileRecord ||
@@ -286,7 +287,8 @@ int ntfs_log_build_operation_payload(
 	    (desc->lcns_follow && desc->target_vcn >
 		    S64_MAX - desc->lcns_follow + 1) ||
 	    (desc->lcns_follow && !desc->page_lcns) ||
-	    (desc->undo_len && !desc->undo_data) ||
+	    (desc->undo_op != CompensationLogRecord &&
+	     desc->undo_len && !desc->undo_data) ||
 	    (desc->redo_len && !desc->redo_data))
 		return -EINVAL;
 	for (i = 0; i < desc->lcns_follow; i++) {
@@ -296,8 +298,10 @@ int ntfs_log_build_operation_payload(
 
 	header_len = struct_size(lrh, page_lcns,
 			max_t(u16, 1, desc->lcns_follow));
+	inline_undo_len = desc->undo_op == CompensationLogRecord ?
+			0 : desc->undo_len;
 	undo_off = ALIGN(header_len, 8);
-	if (check_add_overflow(undo_off, (u32)desc->undo_len, &redo_off))
+	if (check_add_overflow(undo_off, (u32)inline_undo_len, &redo_off))
 		return -EOVERFLOW;
 	redo_off = ALIGN(redo_off, 8);
 	if (check_add_overflow(redo_off, (u32)desc->redo_len, &payload_len) ||
@@ -326,9 +330,9 @@ int ntfs_log_build_operation_payload(
 	for (i = 0; i < desc->lcns_follow; i++)
 		lrh->page_lcns[i] = cpu_to_le64(desc->page_lcns[i]);
 
-	if (desc->undo_len)
+	if (inline_undo_len)
 		memcpy((u8 *)data + undo_off, desc->undo_data,
-			desc->undo_len);
+			inline_undo_len);
 	if (desc->redo_len)
 		memcpy((u8 *)data + redo_off, desc->redo_data,
 			desc->redo_len);
@@ -7938,6 +7942,21 @@ int ntfs_log_commit(struct ntfs_log_handle *handle)
 	return err;
 }
 
+static void ntfs_log_init_compensation(
+		struct ntfs_log_operation_desc *clr,
+		const struct ntfs_log_operation_desc *operation)
+{
+	u16 redo_len = operation->redo_len;
+
+	*clr = *operation;
+	clr->redo_op = operation->undo_op;
+	clr->undo_op = CompensationLogRecord;
+	clr->redo_data = operation->undo_data;
+	clr->redo_len = operation->undo_len;
+	clr->undo_data = NULL;
+	clr->undo_len = clr->redo_op == UpdateResidentValue ? redo_len : 0;
+}
+
 int ntfs_log_abort(struct ntfs_log_handle *handle)
 {
 	struct ntfs_log_undo_entry *entry;
@@ -7995,13 +8014,7 @@ int ntfs_log_abort(struct ntfs_log_handle *handle)
 			packed.started = false;
 			packed_source_page = entry->packed_page_off;
 		}
-		clr = entry->operation;
-		clr.redo_op = entry->operation.undo_op;
-		clr.undo_op = CompensationLogRecord;
-		clr.redo_data = entry->operation.undo_data;
-		clr.redo_len = entry->operation.undo_len;
-		clr.undo_data = NULL;
-		clr.undo_len = 0;
+		ntfs_log_init_compensation(&clr, &entry->operation);
 		err = __ntfs_log_write_operation(handle, &clr,
 				entry->undo_next_lsn, false, false, NULL);
 		if (err)

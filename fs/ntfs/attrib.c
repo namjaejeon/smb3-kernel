@@ -8773,7 +8773,8 @@ int ntfs_attr_shrink_log_credits(struct ntfs_volume *vol,
 
 /* Holes and delayed allocations consume no cluster-bitmap log credits. */
 static int ntfs_attr_shrink_tail_vcn(struct ntfs_inode *ni, s64 start_vcn,
-		s64 end_vcn, u64 max_allocated_clusters, s64 *target_vcn)
+		s64 end_vcn, u64 max_allocated_clusters, u64 max_attr_extents,
+		s64 *target_vcn)
 {
 	const struct runlist_element *rl = ni->runlist.rl;
 	s64 expected = end_vcn;
@@ -8787,6 +8788,18 @@ static int ntfs_attr_shrink_tail_vcn(struct ntfs_inode *ni, s64 start_vcn,
 	if (i == ni->runlist.count || rl[i].vcn != end_vcn ||
 	    rl[i].lcn != LCN_ENOENT)
 		return -EIO;
+	/*
+	 * The mapping-pairs reservation covers at most max_allocated_clusters
+	 * removed extents.  Holes can otherwise span more extents than that
+	 * without consuming any of the physical-cluster budget.
+	 */
+	if (max_attr_extents > max_allocated_clusters &&
+	    (u64)(end_vcn - start_vcn) > max_allocated_clusters)
+		start_vcn = end_vcn - max_allocated_clusters;
+	if (start_vcn == end_vcn) {
+		*target_vcn = end_vcn;
+		return 0;
+	}
 	while (i) {
 		i--;
 		if (rl[i].length < 0 || rl[i].vcn < 0 ||
@@ -8972,9 +8985,21 @@ int ntfs_attr_shrink_transacted(struct ntfs_log_handle *handle,
 	down_write(&ni->runlist.lock);
 	if (!NInoCompressed(ni)) {
 		s64 target_vcn;
+		u64 max_attr_extents = 0;
+
+		if (NInoAttrList(base_ni)) {
+			if (base_ni->attr_list_size <
+			    sizeof(struct attr_list_entry)) {
+				err = -EIO;
+				goto out_unlock;
+			}
+			max_attr_extents = base_ni->attr_list_size /
+					sizeof(struct attr_list_entry);
+		}
 
 		err = ntfs_attr_shrink_tail_vcn(ni, required_clusters,
-				old_clusters, max_free_clusters, &target_vcn);
+				old_clusters, max_free_clusters, max_attr_extents,
+				&target_vcn);
 		if (err)
 			goto out_unlock;
 		target_clusters = target_vcn;

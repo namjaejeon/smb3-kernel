@@ -316,8 +316,14 @@ static int ntfs_ea_update_attr(struct ntfs_log_handle *handle,
 	if (!value)
 		return err == -ENOENT ? 0 :
 			ntfs_attr_remove(ni, type, AT_UNNAMED, 0, NULL);
-	if (err == -ENOENT)
-		return ntfs_attr_add(ni, type, AT_UNNAMED, 0, value, size);
+	if (err == -ENOENT) {
+		if (type != AT_EA)
+			return ntfs_attr_add(ni, type, AT_UNNAMED, 0,
+					value, size);
+		err = ntfs_attr_add(ni, type, AT_UNNAMED, 0, NULL, 0);
+		if (err)
+			return err;
+	}
 	return ntfs_write_ea(NULL, ni, type, value, 0, size, true);
 }
 

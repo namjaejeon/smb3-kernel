@@ -5310,13 +5310,6 @@ static int ntfs_redo_walk_undo_chain(struct ntfs_volume *vol,
 	}
 	ntfs_log_debug_redo_record("undo-walk record", &hdr, lrh, payload_len);
 
-	err = ntfs_undo_apply_record(vol, env, &hdr, lrh, payload_len);
-	if (err) {
-		pr_err("ntfs: %s: undo apply failed slot=0x%x lsn=%llu err=%d\n",
-		       __func__, tr->slot, (unsigned long long)lsn, err);
-		goto out;
-	}
-
 	next_lsn = le64_to_cpu(hdr.client_undo_next_lsn);
 	/* Undo chains must move strictly backwards inside the replay window. */
 	if (next_lsn &&
@@ -5328,6 +5321,14 @@ static int ntfs_redo_walk_undo_chain(struct ntfs_volume *vol,
 		       (unsigned long long)env->layout.current_lsn);
 		goto out;
 	}
+
+	err = ntfs_undo_apply_record(vol, env, &hdr, lrh, payload_len);
+	if (err) {
+		pr_err("ntfs: %s: undo apply failed slot=0x%x lsn=%llu err=%d\n",
+		       __func__, tr->slot, (unsigned long long)lsn, err);
+		goto out;
+	}
+
 	tr->undo_next_lsn = next_lsn;
 	err = 0;
 out:
