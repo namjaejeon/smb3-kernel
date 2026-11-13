@@ -6,9 +6,18 @@
  * Copyright (c) 2025 LG Electronics Co., Ltd.
  */
 
+#include <linux/blkdev.h>
 #include <linux/writeback.h>
 #include <linux/seq_file.h>
 #include <linux/mm.h>
+#include <linux/sched/signal.h>
+#include <linux/list.h>
+#include <linux/sort.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/version.h>
+#include <linux/vmalloc.h>
+#include <linux/xarray.h>
 
 #include "lcnalloc.h"
 #include "time.h"
@@ -19,15 +28,12 @@
 #include "ea.h"
 #include "attrib.h"
 #include "iomap.h"
+#include "logfile.h"
 #include "object_id.h"
 #include "stream.h"
+#include "bitmap.h"
 
-/* Existing-attribute writes are enabled with inode transaction integration. */
-s64 ntfs_inode_attr_pwrite_existing(struct inode *vi, s64 pos, s64 count,
-		u8 *buf, bool sync)
-{
-	return -EOPNOTSUPP;
-}
+#define ntfs_inode_kvmemdup kvmemdup
 
 /*
  * ntfs_test_inode - compare two (possibly fake) inodes for equality
@@ -145,6 +151,8 @@ static int ntfs_init_locked_inode(struct inode *vi, void *data)
 	ni->name_len = na->name_len;
 	ni->folio = NULL;
 	atomic_set(&ni->count, 1);
+	ni->nr_extents = 0;
+	ni->ext.base_ntfs_ino = NULL;
 
 	/* If initializing a normal inode, we are done. */
 	if (likely(na->type == AT_UNUSED))
@@ -173,7 +181,7 @@ static int ntfs_init_locked_inode(struct inode *vi, void *data)
 	return 0;
 }
 
-static int ntfs_read_locked_inode(struct inode *vi);
+static int ntfs_read_locked_inode(struct inode *vi, bool orphan);
 static int ntfs_read_locked_attr_inode(struct inode *base_vi, struct inode *vi);
 static int ntfs_read_locked_index_inode(struct inode *base_vi,
 		struct inode *vi);
@@ -214,7 +222,7 @@ struct inode *ntfs_iget(struct super_block *sb, u64 mft_no)
 
 	/* If this is a freshly allocated inode, need to read it now. */
 	if (inode_state_read_once(vi) & I_NEW) {
-		err = ntfs_read_locked_inode(vi);
+		err = ntfs_read_locked_inode(vi, false);
 		if (err) {
 			remove_inode_hash(vi);
 			discard_new_inode(vi);
@@ -386,80 +394,594 @@ struct inode *ntfs_alloc_big_inode(struct super_block *sb)
 	return NULL;
 }
 
+void ntfs_destroy_big_inode(struct inode *vi)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	struct ntfs_inode *base_ni;
+
+	if (!NInoAttr(ni) || ni->nr_extents != -1)
+		return;
+	/*
+	 * Final base iput can write back DATA and look up this attribute.
+	 * VFS has already unhashed it and woken freeing-inode waiters here.
+	 */
+	base_ni = ni->ext.base_ntfs_ino;
+	ni->nr_extents = 0;
+	ni->ext.base_ntfs_ino = NULL;
+	iput(VFS_I(base_ni));
+}
+
 void ntfs_free_big_inode(struct inode *inode)
 {
 	kmem_cache_free(ntfs_big_inode_cache, NTFS_I(inode));
+}
+
+struct ntfs_deleted_runlist {
+	struct list_head link;
+	struct runlist_element *rl;
+	u64 source_mft_no;
+	u64 source_lowest_vcn;
+	u32 source_type;
+	u8 source_name_len;
+	bool cached;
+};
+
+static void ntfs_deleted_runlists_free(struct list_head *runlists)
+{
+	struct ntfs_deleted_runlist *entry;
+	struct ntfs_deleted_runlist *next;
+
+	list_for_each_entry_safe(entry, next, runlists, link) {
+		list_del(&entry->link);
+		kvfree(entry->rl);
+		kfree(entry);
+	}
+}
+
+static int ntfs_deleted_runlist_add(struct ntfs_inode *ni,
+		struct list_head *runlists, struct runlist_element *rl,
+		size_t rl_count, bool allow_delalloc, bool allow_unmapped,
+		bool cached, u64 source_mft_no, u32 source_type,
+		u8 source_name_len, u64 source_lowest_vcn)
+{
+	struct ntfs_deleted_runlist *entry;
+	s64 clusters = 0;
+	size_t dst;
+	size_t src;
+	int err = 0;
+
+	for (src = dst = 0; src < rl_count && rl[src].length; src++) {
+		s64 length = rl[src].length;
+		s64 lcn = rl[src].lcn;
+
+		if (length < 0 ||
+		    (lcn == LCN_DELALLOC && !allow_delalloc) ||
+		    (lcn == LCN_RL_NOT_MAPPED && !allow_unmapped) ||
+		    (lcn < 0 && lcn != LCN_HOLE &&
+		     lcn != LCN_DELALLOC && lcn != LCN_RL_NOT_MAPPED)) {
+			err = -EIO;
+			break;
+		}
+		if (lcn == LCN_HOLE || lcn == LCN_DELALLOC ||
+		    lcn == LCN_RL_NOT_MAPPED)
+			continue;
+		if (lcn >= ni->vol->nr_clusters ||
+		    length > ni->vol->nr_clusters - lcn ||
+		    check_add_overflow(clusters, length, &clusters)) {
+			err = -EIO;
+			break;
+		}
+		rl[dst] = rl[src];
+		rl[dst++].vcn = clusters - length;
+	}
+	if (src == rl_count)
+		err = -EIO;
+	else if (!allow_unmapped && rl[src].lcn != LCN_ENOENT)
+		err = -EIO;
+	if (dst >= INT_MAX)
+		err = -E2BIG;
+	if (err)
+		goto out_free;
+	if (!dst) {
+		kvfree(rl);
+		return 0;
+	}
+	rl[dst].vcn = clusters;
+	rl[dst].lcn = LCN_ENOENT;
+	rl[dst].length = 0;
+	entry = kmalloc(sizeof(*entry), GFP_NOFS);
+	if (!entry) {
+		err = -ENOMEM;
+		goto out_free;
+	}
+	entry->rl = rl;
+	entry->source_mft_no = source_mft_no;
+	entry->source_lowest_vcn = source_lowest_vcn;
+	entry->source_type = source_type;
+	entry->source_name_len = source_name_len;
+	entry->cached = cached;
+	list_add_tail(&entry->link, runlists);
+	return 0;
+out_free:
+	kvfree(rl);
+	return err;
+}
+
+static int ntfs_deleted_cached_runlist_collect(struct ntfs_inode *ni,
+		struct list_head *runlists)
+{
+	struct runlist_element *rl;
+	size_t bytes;
+	size_t count;
+
+	down_read(&ni->runlist.lock);
+	count = ni->runlist.count;
+	if (!ni->runlist.rl || !count ||
+	    check_mul_overflow(count, sizeof(*rl), &bytes)) {
+		up_read(&ni->runlist.lock);
+		return -EIO;
+	}
+	rl = kvmalloc(bytes, GFP_NOFS);
+	if (rl)
+		memcpy(rl, ni->runlist.rl, bytes);
+	up_read(&ni->runlist.lock);
+	if (!rl)
+		return -ENOMEM;
+	return ntfs_deleted_runlist_add(ni, runlists, rl, count, true, false,
+			true, ni->mft_no, ni->type, ni->name_len, 0);
+}
+
+static int ntfs_deleted_runlists_collect(struct ntfs_inode *ni,
+		struct list_head *runlists, bool skip_unnamed_data)
+{
+	struct ntfs_attr_search_ctx *ctx;
+	struct runlist_element *rl;
+	size_t new_rl_count;
+	int err;
+
+	if (!runlists)
+		return -EINVAL;
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx)
+		return -ENOMEM;
+	while (!(err = ntfs_attrs_walk(ctx))) {
+		if (!ctx->attr->non_resident ||
+		    (skip_unnamed_data && ctx->attr->type == AT_DATA &&
+		     !ctx->attr->name_length))
+			continue;
+		rl = ntfs_mapping_pairs_decompress(ni->vol, ctx->attr, NULL,
+				&new_rl_count);
+		if (IS_ERR(rl)) {
+			err = PTR_ERR(rl);
+			break;
+		}
+		err = ntfs_deleted_runlist_add(ni, runlists, rl,
+				new_rl_count, false, true, false,
+				ctx->ntfs_ino->mft_no,
+				le32_to_cpu(ctx->attr->type),
+				ctx->attr->name_length,
+				le64_to_cpu(
+					ctx->attr->data.non_resident.lowest_vcn));
+		if (err)
+			break;
+	}
+	ntfs_attr_put_search_ctx(ctx);
+	if (err == -ENOENT)
+		return 0;
+	ntfs_deleted_runlists_free(runlists);
+	return err;
+}
+
+static int ntfs_deleted_run_compare(const void *left, const void *right)
+{
+	const struct runlist_element *a = left;
+	const struct runlist_element *b = right;
+
+	if (a->lcn < b->lcn)
+		return -1;
+	if (a->lcn > b->lcn)
+		return 1;
+	if (a->length < b->length)
+		return -1;
+	return a->length > b->length;
+}
+
+static int ntfs_deleted_mft_compare(const void *left, const void *right)
+{
+	const struct ntfs_mft_retire_record *a = left;
+	const struct ntfs_mft_retire_record *b = right;
+
+	if (a->mft_no < b->mft_no)
+		return -1;
+	return a->mft_no > b->mft_no;
+}
+
+static int ntfs_deleted_mft_records_collect(struct ntfs_inode *ni,
+		struct ntfs_mft_retire_record **mft_records_out,
+		u64 *records_out)
+{
+	struct ntfs_mft_retire_record *mft_records;
+	u64 records;
+	u64 index;
+	int i;
+
+	if (!ni || !mft_records_out || !records_out || ni->nr_extents < 0)
+		return -EINVAL;
+	records = (u64)ni->nr_extents + 1;
+	if (records > SIZE_MAX / sizeof(*mft_records))
+		return -E2BIG;
+	mft_records = kvmalloc_array(records, sizeof(*mft_records), GFP_NOFS);
+	if (!mft_records)
+		return -ENOMEM;
+	for (i = 0; i < ni->nr_extents; i++) {
+		if (!ni->ext.extent_ntfs_inos[i]) {
+			kvfree(mft_records);
+			return -EIO;
+		}
+		mft_records[i].ni = ni->ext.extent_ntfs_inos[i];
+		mft_records[i].mft_no = mft_records[i].ni->mft_no;
+		if (mft_records[i].mft_no >= S64_MAX) {
+			kvfree(mft_records);
+			return -EIO;
+		}
+	}
+	mft_records[ni->nr_extents].ni = ni;
+	mft_records[ni->nr_extents].mft_no = ni->mft_no;
+	if (mft_records[ni->nr_extents].mft_no >= S64_MAX) {
+		kvfree(mft_records);
+		return -EIO;
+	}
+	sort(mft_records, records, sizeof(*mft_records), ntfs_deleted_mft_compare,
+			NULL);
+	for (index = 1; index < records; index++) {
+		if (mft_records[index].mft_no ==
+		    mft_records[index - 1].mft_no) {
+			kvfree(mft_records);
+			return -EIO;
+		}
+	}
+	*mft_records_out = mft_records;
+	*records_out = records;
+	return 0;
+}
+
+static int ntfs_deleted_runlists_normalize(struct list_head *runlists,
+		struct runlist_element **normalized_out, u64 *credits_out)
+{
+	struct ntfs_deleted_runlist *entry;
+	struct runlist_element *rl;
+	s64 clusters = 0;
+	s64 previous_end = 0;
+	size_t nr_runs = 0;
+	size_t dst = 0;
+	size_t src;
+	int credits;
+
+	if (!runlists || !normalized_out || !credits_out)
+		return -EINVAL;
+	*normalized_out = NULL;
+	list_for_each_entry(entry, runlists, link) {
+		for (src = 0; entry->rl[src].length; src++) {
+			if (nr_runs == SIZE_MAX)
+				return -E2BIG;
+			nr_runs++;
+		}
+	}
+	if (!nr_runs) {
+		*credits_out = 0;
+		return 0;
+	}
+	if (nr_runs == SIZE_MAX)
+		return -E2BIG;
+	rl = kvmalloc_array(nr_runs + 1, sizeof(*rl), GFP_NOFS);
+	if (!rl)
+		return -ENOMEM;
+	list_for_each_entry(entry, runlists, link) {
+		for (src = 0; entry->rl[src].length; src++)
+			rl[dst++] = entry->rl[src];
+	}
+	sort(rl, nr_runs, sizeof(*rl), ntfs_deleted_run_compare, NULL);
+	dst = 0;
+	for (src = 0; src < nr_runs; src++) {
+		s64 end;
+
+		if (check_add_overflow(rl[src].lcn, rl[src].length, &end) ||
+		    (dst && rl[src].lcn < previous_end) ||
+		    check_add_overflow(clusters, rl[src].length, &clusters)) {
+			credits = -EIO;
+			goto out_free;
+		}
+		if (dst && rl[src].lcn == previous_end) {
+			if (check_add_overflow(rl[dst - 1].length,
+					rl[src].length, &rl[dst - 1].length)) {
+				credits = -EIO;
+				goto out_free;
+			}
+		} else {
+			rl[dst] = rl[src];
+			rl[dst++].vcn = clusters - rl[src].length;
+		}
+		previous_end = end;
+	}
+	if (dst >= INT_MAX) {
+		credits = -E2BIG;
+		goto out_free;
+	}
+	rl[dst].vcn = clusters;
+	rl[dst].lcn = LCN_ENOENT;
+	rl[dst].length = 0;
+	credits = ntfs_cluster_free_from_rl_log_credits(rl);
+	if (credits < 0)
+		goto out_free;
+	*normalized_out = rl;
+	*credits_out = credits;
+	return 0;
+out_free:
+	kvfree(rl);
+	return credits;
 }
 
 static int ntfs_non_resident_dealloc_clusters(struct ntfs_inode *ni)
 {
 	struct super_block *sb = ni->vol->sb;
 	struct ntfs_attr_search_ctx *actx;
-	int err = 0;
+	struct runlist_element *rl;
+	struct runlist_element *normalized_rl = NULL;
+	LIST_HEAD(runlists);
+	size_t new_rl_count;
+	u64 credits;
+	int walk_err;
+	int first_err = 0;
+	int err;
 
-	actx = ntfs_attr_get_search_ctx(ni, NULL);
-	if (!actx)
-		return -ENOMEM;
-	WARN_ON(actx->mrec->link_count != 0);
-
-	/**
-	 * ntfs_truncate_vfs cannot be called in evict() context due
-	 * to some limitations, which are the @ni vfs inode is marked
-	 * with I_FREEING, and etc.
+	/*
+	 * Truncation cannot run during eviction because the inode is I_FREEING.
+	 * Collect every run first because journal reservation may checkpoint.
+	 * Do not hold an MFT search context across the free.
 	 */
 	if (NInoRunlistDirty(ni)) {
-		err = ntfs_cluster_free_from_rl(ni->vol, ni->runlist.rl);
-		if (err)
+		err = ntfs_attr_map_whole_runlist(ni);
+		if (!err)
+			err = ntfs_deleted_cached_runlist_collect(ni, &runlists);
+		if (err) {
 			ntfs_error(sb,
-					"Failed to free clusters. Leaving inconsistent metadata.\n");
-	}
-
-	while ((err = ntfs_attrs_walk(actx)) == 0) {
-		if (actx->attr->non_resident &&
-				(!NInoRunlistDirty(ni) || actx->attr->type != AT_DATA)) {
-			struct runlist_element *rl;
-			size_t new_rl_count;
-
-			rl = ntfs_mapping_pairs_decompress(ni->vol, actx->attr, NULL,
-					&new_rl_count);
-			if (IS_ERR(rl)) {
-				err = PTR_ERR(rl);
-				ntfs_error(sb,
-					   "Failed to decompress runlist. Leaving inconsistent metadata.\n");
-				continue;
-			}
-
-			err = ntfs_cluster_free_from_rl(ni->vol, rl);
-			if (err)
-				ntfs_error(sb,
-					   "Failed to free attribute clusters. Leaving inconsistent metadata.\n");
-			kvfree(rl);
+				   "Failed to collect cached runlist. Leaving inconsistent metadata.\n");
+			first_err = err;
 		}
 	}
 
-	ntfs_release_dirty_clusters(ni->vol, ni->i_dealloc_clusters);
+	actx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!actx) {
+		if (!first_err)
+			first_err = -ENOMEM;
+		goto normalize_runlists;
+	}
+	WARN_ON(actx->mrec->link_count != 0);
+
+	while (!(walk_err = ntfs_attrs_walk(actx))) {
+		if (!actx->attr->non_resident ||
+		    (NInoRunlistDirty(ni) && actx->attr->type == AT_DATA))
+			continue;
+
+		rl = ntfs_mapping_pairs_decompress(ni->vol, actx->attr, NULL,
+				&new_rl_count);
+		if (IS_ERR(rl)) {
+			err = PTR_ERR(rl);
+			ntfs_error(sb,
+				   "Failed to decompress runlist. Leaving inconsistent metadata.\n");
+			if (!first_err)
+				first_err = err;
+			continue;
+		}
+		err = ntfs_deleted_runlist_add(ni, &runlists, rl,
+				new_rl_count, false, true, false,
+				actx->ntfs_ino->mft_no,
+				le32_to_cpu(actx->attr->type),
+				actx->attr->name_length,
+				le64_to_cpu(
+					actx->attr->data.non_resident.lowest_vcn));
+		if (err) {
+			ntfs_error(sb,
+				   "Failed to validate attribute runlist. Leaving inconsistent metadata.\n");
+			if (!first_err)
+				first_err = err;
+		}
+	}
 	ntfs_attr_put_search_ctx(actx);
-	return err;
+	if (walk_err != -ENOENT && !first_err)
+		first_err = walk_err;
+
+normalize_runlists:
+	err = ntfs_deleted_runlists_normalize(&runlists, &normalized_rl,
+			&credits);
+	if (err) {
+		ntfs_error(sb,
+			   "Failed to normalize deleted runlists. Leaving inconsistent metadata.\n");
+		if (!first_err)
+			first_err = err;
+	} else if (normalized_rl) {
+		err = ntfs_cluster_free_from_rl(ni->vol, normalized_rl);
+		if (err) {
+			ntfs_error(sb,
+				   "Failed to free attribute clusters. Leaving inconsistent metadata.\n");
+			if (!first_err)
+				first_err = err;
+		}
+	}
+
+	kvfree(normalized_rl);
+	ntfs_deleted_runlists_free(&runlists);
+	ntfs_release_dirty_clusters(ni->vol, ni->i_dealloc_clusters);
+	return first_err;
+}
+
+bool ntfs_deleted_attribute_reclaimable(__le32 type, u8 name_len)
+{
+	if (type == AT_DATA)
+		return name_len;
+	if (type == AT_INDEX_ALLOCATION)
+		return name_len;
+	if (type == AT_BITMAP || type == AT_PROPERTY_SET ||
+	    type == AT_LOGGED_UTILITY_STREAM)
+		return true;
+	return !name_len &&
+		(type == AT_OBJECT_ID || type == AT_SECURITY_DESCRIPTOR ||
+		 type == AT_REPARSE_POINT || type == AT_EA);
+}
+
+static bool ntfs_deleted_reclaim_inode(struct ntfs_inode *ni)
+{
+	struct ntfs_inode *base_ni;
+
+	if (VFS_I(ni)->i_nlink)
+		return false;
+	if (!NInoAttr(ni))
+		return ni->type == AT_DATA && S_ISREG(VFS_I(ni)->i_mode) &&
+			NInoBeingDeleted(ni);
+	base_ni = ni->ext.base_ntfs_ino;
+	if (!base_ni || !NInoBeingDeleted(base_ni))
+		return false;
+	return ntfs_deleted_attribute_reclaimable(ni->type, ni->name_len);
+}
+
+static int ntfs_retire_deleted_attribute(struct ntfs_inode *ni)
+{
+	struct ntfs_log_handle *handle;
+	struct ntfs_inode *base_ni;
+	int abort_err;
+	int credits;
+	int err;
+
+	base_ni = NInoAttr(ni) ? ni->ext.base_ntfs_ino : ni;
+	if (!base_ni)
+		return 0;
+	credits = ntfs_attr_rm_empty_log_credits(ni->vol,
+			NInoAttrList(base_ni),
+			NInoAttrListNonResident(base_ni));
+	if (credits < 0)
+		return credits;
+	handle = ntfs_log_begin(ni->vol, credits);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	mutex_lock(&base_ni->mrec_lock);
+	err = ntfs_attr_rm_empty_transacted(handle, ni);
+	mutex_unlock(&base_ni->mrec_lock);
+	if (err) {
+		abort_err = ntfs_log_abort(handle);
+		if (abort_err)
+			return abort_err;
+		if (err == -ENOENT || err == -EOPNOTSUPP)
+			return 0;
+		return err;
+	}
+	return ntfs_log_commit(handle);
+}
+
+static int __ntfs_truncate_vfs(struct inode *vi, loff_t new_size,
+		loff_t i_size, bool holes, bool initialize_delalloc,
+		bool update_timestamps);
+static int ntfs_preserve_deleted_inode(struct ntfs_inode *ni);
+
+int ntfs_reclaim_deleted_attribute(struct inode *vi)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	s64 allocated_before;
+	int err;
+
+	if (!ni->vol->journal || !ntfs_deleted_reclaim_inode(ni) ||
+	    !NInoNonResident(ni))
+		return -EOPNOTSUPP;
+	if (!ni->data_size && ni->allocated_size <= 0)
+		return ntfs_retire_deleted_attribute(ni);
+	truncate_setsize(vi, 0);
+	for (;;) {
+		allocated_before = ni->allocated_size;
+		err = __ntfs_truncate_vfs(vi, 0, 1, true, false, false);
+		if (err)
+			return err;
+		if (ni->allocated_size <= 0)
+			return ntfs_retire_deleted_attribute(ni);
+		if (ni->allocated_size >= allocated_before)
+			return 0;
+		cond_resched();
+	}
 }
 
 int ntfs_drop_big_inode(struct inode *inode)
 {
 	struct ntfs_inode *ni = NTFS_I(inode);
 
+	if (ni->vol->journal && !inode->i_nlink && NInoAttr(ni) &&
+	    ni->type == AT_ATTRIBUTE_LIST && NInoNonResident(ni) &&
+	    (mapping_tagged(inode->i_mapping, PAGECACHE_TAG_DIRTY) ||
+	     mapping_tagged(inode->i_mapping, PAGECACHE_TAG_WRITEBACK))) {
+		int err;
+
+		atomic_inc(&inode->i_count);
+		spin_unlock(&inode->i_lock);
+		err = ntfs_log_wait_inode(inode);
+		if (!err)
+			err = ntfs_write_and_wait_range(inode, 0, LLONG_MAX);
+		if (err) {
+			NVolSetRecoveryNeeded(ni->vol);
+			NVolSetErrors(ni->vol);
+			NVolSetShutdown(ni->vol);
+			inode->i_sb->s_flags |= SB_RDONLY;
+			ntfs_error(inode->i_sb,
+				   "Cannot preserve deleted attribute list (error %d).",
+				   err);
+		}
+		spin_lock(&inode->i_lock);
+		if (!atomic_dec_and_test(&inode->i_count))
+			return 0;
+	}
+
+	if (ni->vol->journal && !inode->i_nlink && !NInoAttr(ni) &&
+	    NInoBeingDeleted(ni) && !NVolShutdown(ni->vol)) {
+		int err;
+
+		atomic_inc(&inode->i_count);
+		spin_unlock(&inode->i_lock);
+		err = ntfs_preserve_deleted_inode(ni);
+		if (err) {
+			NVolSetRecoveryNeeded(ni->vol);
+			NVolSetErrors(ni->vol);
+			NVolSetShutdown(ni->vol);
+			inode->i_sb->s_flags |= SB_RDONLY;
+			ntfs_error(inode->i_sb,
+				   "Cannot preserve deleting inode 0x%llx (error %d).",
+				   (unsigned long long)ni->mft_no, err);
+		}
+		spin_lock(&inode->i_lock);
+		if (!atomic_dec_and_test(&inode->i_count))
+			return 0;
+	}
+
 	if (!inode_unhashed(inode) && inode_state_read_once(inode) & I_SYNC) {
-		if (ni->type == AT_DATA || ni->type == AT_INDEX_ALLOCATION) {
+		if (ni->type == AT_DATA || ni->type == AT_INDEX_ALLOCATION ||
+		    ni->type == AT_EA) {
 			if (!inode->i_nlink) {
 				struct ntfs_inode *ni = NTFS_I(inode);
+				bool reclaim_deleted_attr;
 
-				if (ni->data_size == 0)
+				reclaim_deleted_attr = ni->vol->journal &&
+					ntfs_deleted_reclaim_inode(ni) &&
+					NInoNonResident(ni) &&
+					(ni->data_size || ni->allocated_size > 0);
+				if (ni->data_size == 0 && !reclaim_deleted_attr)
 					return 0;
 
 				/* To avoid evict_inode call simultaneously */
 				atomic_inc(&inode->i_count);
 				spin_unlock(&inode->i_lock);
 
-				truncate_setsize(VFS_I(ni), 0);
-				ntfs_truncate_vfs(VFS_I(ni), 0, 1);
+				if (reclaim_deleted_attr)
+					ntfs_reclaim_deleted_attribute(VFS_I(ni));
+				else {
+					truncate_setsize(VFS_I(ni), 0);
+					__ntfs_truncate_vfs(VFS_I(ni), 0, 1,
+							true, false, false);
+				}
 
 				sb_start_intwrite(inode->i_sb);
 				i_size_write(inode, 0);
@@ -514,6 +1036,61 @@ static struct lock_class_key attr_list_inode_mrec_lock_class;
 static struct lock_class_key attr_list_rl_lock_class;
 
 /*
+ * Exclude writeback before it clears dirty tags.  Do not wait for another
+ * writeback while holding a journal transaction. The caller can fall back to
+ * the prezeroed append path instead.
+ */
+bool ntfs_ordered_append_enter(struct ntfs_inode *ni)
+{
+	bool entered = false;
+
+	spin_lock(&ni->ordered_lock);
+	if (!ni->ordered_active && !ni->ordered_writeback_users) {
+		WRITE_ONCE(ni->ordered_owner, current);
+		WRITE_ONCE(ni->ordered_active, true);
+		entered = true;
+	}
+	spin_unlock(&ni->ordered_lock);
+	return entered;
+}
+
+void ntfs_ordered_append_exit(struct ntfs_inode *ni)
+{
+	spin_lock(&ni->ordered_lock);
+	WARN_ON_ONCE(!ni->ordered_active || ni->ordered_owner != current ||
+			ni->ordered_writeback_users || ni->ordered_io);
+	WRITE_ONCE(ni->ordered_active, false);
+	WRITE_ONCE(ni->ordered_owner, NULL);
+	spin_unlock(&ni->ordered_lock);
+	wake_up_all(&ni->ordered_wait);
+}
+
+bool ntfs_ordered_writeback_enter(struct ntfs_inode *ni,
+		struct ntfs_ordered_io **ordered)
+{
+	bool entered = false;
+
+	spin_lock(&ni->ordered_lock);
+	if (!ni->ordered_active || ni->ordered_owner == current) {
+		ni->ordered_writeback_users++;
+		if (ni->ordered_active)
+			/* Pair with the owner's group publication. */
+			*ordered = smp_load_acquire(&ni->ordered_io);
+		entered = true;
+	}
+	spin_unlock(&ni->ordered_lock);
+	return entered;
+}
+
+void ntfs_ordered_writeback_exit(struct ntfs_inode *ni)
+{
+	spin_lock(&ni->ordered_lock);
+	if (!WARN_ON_ONCE(!ni->ordered_writeback_users))
+		ni->ordered_writeback_users--;
+	spin_unlock(&ni->ordered_lock);
+}
+
+/*
  * __ntfs_init_inode - initialize ntfs specific part of an inode
  * @sb:		super block of mounted volume
  * @ni:		freshly allocated ntfs inode which to initialize
@@ -530,6 +1107,12 @@ void __ntfs_init_inode(struct super_block *sb, struct ntfs_inode *ni)
 	spin_lock_init(&ni->journal_lsn_lock);
 	ni->journal_lsn = 0;
 	ni->initialized_size = ni->allocated_size = ni->zeroed_size = 0;
+	spin_lock_init(&ni->ordered_lock);
+	init_waitqueue_head(&ni->ordered_wait);
+	ni->ordered_io = NULL;
+	ni->ordered_owner = NULL;
+	ni->ordered_writeback_users = 0;
+	ni->ordered_active = false;
 	ni->seq_no = 0;
 	atomic_set(&ni->count, 1);
 	ni->vol = NTFS_SB(sb);
@@ -761,7 +1344,7 @@ static bool ntfs_non_resident_sizes_inconsistent(struct inode *vi,
  *
  * Return 0 on success and -errno on error.
  */
-static int ntfs_read_locked_inode(struct inode *vi)
+static int ntfs_read_locked_inode(struct inode *vi, bool orphan)
 {
 	struct ntfs_volume *vol = NTFS_SB(vi->i_sb);
 	struct ntfs_inode *ni = NTFS_I(vi);
@@ -834,10 +1417,18 @@ static int ntfs_read_locked_inode(struct inode *vi)
 	vi->i_generation = ni->seq_no = le16_to_cpu(m->sequence_number);
 
 	if (le16_to_cpu(m->link_count) < 1) {
-		ntfs_error(vi->i_sb, "Inode link count is 0!");
-		goto unm_err_out;
+		if (!orphan) {
+			ntfs_error(vi->i_sb, "Inode link count is 0!");
+			goto unm_err_out;
+		}
+	} else {
+		if (orphan) {
+			err = -ESTALE;
+			vol_err = false;
+			goto unm_err_out;
+		}
+		set_nlink(vi, le16_to_cpu(m->link_count));
 	}
-	set_nlink(vi, le16_to_cpu(m->link_count));
 
 	/* If read-only, no one gets write permissions. */
 	if (IS_RDONLY(vi))
@@ -964,6 +1555,21 @@ static int ntfs_read_locked_inode(struct inode *vi)
 		}
 	}
 skip_attr_list_load:
+	if (orphan) {
+		/*
+		 * Recovery only needs the attribute list and raw records.  In
+		 * particular, the unnamed DATA attribute may already be gone.
+		 * Keep the unhashed VFS inode linked until initialization and
+		 * retirement complete so a failed load cannot invoke deletion.
+		 */
+		vi->i_mode |= (m->flags & MFT_RECORD_IS_DIRECTORY) ?
+			S_IFDIR : S_IFREG;
+		ni->type = AT_DATA;
+		ni->data_size = 0;
+		ntfs_attr_put_search_ctx(ctx);
+		unmap_mft_record(ni);
+		return 0;
+	}
 	err = ntfs_attr_lookup(AT_EA_INFORMATION, NULL, 0, 0, 0, NULL, 0, ctx);
 	if (!err) {
 		NInoSetHasEA(ni);
@@ -1027,8 +1633,20 @@ view_index_meta:
 		err = ntfs_attr_lookup(AT_INDEX_ROOT, name, name_len, CASE_SENSITIVE,
 				0, NULL, 0, ctx);
 		if (unlikely(err)) {
-			if (err == -ENOENT)
-				ntfs_error(vi->i_sb, "$INDEX_ROOT attribute is missing.");
+			if (err == -ENOENT) {
+				/*
+				 * During $LogFile replay a directory record can be
+				 * momentarily inconsistent -- its $INDEX_ROOT was
+				 * just deleted and the replacement has not been
+				 * re-created yet.  ntfs_iget() tolerates this (see
+				 * the NVolReplaying() handling there), so do not
+				 * shout about an expected transient state.
+				 */
+				if (NVolReplaying(vol))
+					ntfs_debug("$INDEX_ROOT attribute is missing during replay.");
+				else
+					ntfs_error(vi->i_sb, "$INDEX_ROOT attribute is missing.");
+			}
 			goto unm_err_out;
 		}
 		a = ctx->attr;
@@ -1136,6 +1754,7 @@ view_index_meta:
 		ni->name_len = name_len;
 		vi->i_size = ni->initialized_size = ni->data_size =
 			le32_to_cpu(a->data.resident.value_length);
+		ni->zeroed_size = ni->data_size;
 		ni->allocated_size = (ni->data_size + 7) & ~7;
 		/* We are done with the mft record, so we release it. */
 		ntfs_attr_put_search_ctx(ctx);
@@ -1295,10 +1914,12 @@ view_index_meta:
 				goto unm_err_out;
 			vi->i_size = ni->data_size = le64_to_cpu(a->data.non_resident.data_size);
 			ni->initialized_size = le64_to_cpu(a->data.non_resident.initialized_size);
+			ni->zeroed_size = ni->initialized_size;
 			ni->allocated_size = le64_to_cpu(a->data.non_resident.allocated_size);
 		} else { /* Resident attribute. */
 			vi->i_size = ni->data_size = ni->initialized_size = le32_to_cpu(
 					a->data.resident.value_length);
+			ni->zeroed_size = ni->data_size;
 			ni->allocated_size = le32_to_cpu(a->length) -
 					le16_to_cpu(
 					a->data.resident.value_offset);
@@ -1362,7 +1983,8 @@ unm_err_out:
 		unmap_mft_record(ni);
 err_out:
 	if (err != -EOPNOTSUPP && err != -ENOMEM &&
-	    err != -EINTR && err != -ERESTARTSYS && vol_err == true) {
+	    err != -EINTR && err != -ERESTARTSYS && vol_err == true &&
+	    !NVolReplaying(vol)) {
 		ntfs_error(vol->sb,
 			"Failed with error code %i.  Marking corrupt inode 0x%llx as bad.  Run chkdsk.",
 			err, ni->mft_no);
@@ -1530,6 +2152,7 @@ static int ntfs_read_locked_attr_inode(struct inode *base_vi, struct inode *vi)
 		}
 		vi->i_size = ni->initialized_size = ni->data_size = le32_to_cpu(
 				a->data.resident.value_length);
+		ni->zeroed_size = ni->data_size;
 		ni->allocated_size = le32_to_cpu(a->length) -
 				le16_to_cpu(a->data.resident.value_offset);
 		if (vi->i_size > ni->allocated_size) {
@@ -1582,6 +2205,7 @@ static int ntfs_read_locked_attr_inode(struct inode *base_vi, struct inode *vi)
 			goto unm_err_out;
 		vi->i_size = ni->data_size = le64_to_cpu(a->data.non_resident.data_size);
 		ni->initialized_size = le64_to_cpu(a->data.non_resident.initialized_size);
+		ni->zeroed_size = ni->initialized_size;
 		ni->allocated_size = le64_to_cpu(a->data.non_resident.allocated_size);
 	}
 	vi->i_mapping->a_ops = &ntfs_aops;
@@ -1701,8 +2325,14 @@ static int ntfs_read_locked_index_inode(struct inode *base_vi, struct inode *vi)
 	err = ntfs_attr_lookup(AT_INDEX_ROOT, ni->name, ni->name_len,
 			CASE_SENSITIVE, 0, NULL, 0, ctx);
 	if (unlikely(err)) {
-		if (err == -ENOENT)
-			ntfs_error(vi->i_sb, "$INDEX_ROOT attribute is missing.");
+		if (err == -ENOENT) {
+			/* Expected transient state during replay. See the
+			 * matching handling in ntfs_read_locked_inode(). */
+			if (NVolReplaying(vol))
+				ntfs_debug("$INDEX_ROOT attribute is missing during replay.");
+			else
+				ntfs_error(vi->i_sb, "$INDEX_ROOT attribute is missing.");
+		}
 		goto unm_err_out;
 	}
 	a = ctx->attr;
@@ -1818,6 +2448,7 @@ static int ntfs_read_locked_index_inode(struct inode *base_vi, struct inode *vi)
 		goto unm_err_out;
 	vi->i_size = ni->data_size = le64_to_cpu(a->data.non_resident.data_size);
 	ni->initialized_size = le64_to_cpu(a->data.non_resident.initialized_size);
+	ni->zeroed_size = ni->initialized_size;
 	ni->allocated_size = le64_to_cpu(a->data.non_resident.allocated_size);
 	/*
 	 * We are done with the mft record, so we release it.  Otherwise
@@ -2278,6 +2909,7 @@ int ntfs_read_inode_mount(struct inode *vi)
 			/* Fill in the inode size. */
 			vi->i_size = le64_to_cpu(a->data.non_resident.data_size);
 			ni->initialized_size = le64_to_cpu(a->data.non_resident.initialized_size);
+			ni->zeroed_size = ni->initialized_size;
 			ni->allocated_size = le64_to_cpu(a->data.non_resident.allocated_size);
 			/*
 			 * Records between allocated_size and data_size are not
@@ -2317,7 +2949,7 @@ int ntfs_read_inode_mount(struct inode *vi)
 			 * ntfs_read_inode() on extents of $MFT/$DATA. But lets
 			 * hope this never happens...
 			 */
-			err = ntfs_read_locked_inode(vi);
+			err = ntfs_read_locked_inode(vi, false);
 			if (err) {
 				ntfs_error(sb, "ntfs_read_inode() of $MFT failed.\n");
 				NVolClearMftBootstrap(vol);
@@ -2428,14 +3060,229 @@ void ntfs_clear_extent_inode(struct ntfs_inode *ni)
 	ntfs_destroy_extent_inode(ni);
 }
 
-static int ntfs_delete_base_inode(struct ntfs_inode *ni)
+static int ntfs_preserve_deleted_record(struct ntfs_inode *ni)
 {
-	struct super_block *sb = ni->vol->sb;
+	struct mft_record *m;
 	int err;
+
+	if (!NInoDirty(ni))
+		return 0;
+	err = ntfs_prepare_mft_record_write(ni);
+	if (err)
+		return err;
+	m = map_mft_record(ni);
+	if (IS_ERR(m))
+		return PTR_ERR(m);
+	err = write_mft_record(ni, m, 1);
+	unmap_mft_record(ni);
+	return err;
+}
+
+/*
+ * Failed retirement leaves the records allocated.  Keep their dirty
+ * images before releasing the private buffers used by extent inodes.
+ */
+static int ntfs_preserve_deleted_inode(struct ntfs_inode *ni)
+{
+	int err, ret, i;
+
+	mutex_lock(&ni->mrec_lock);
+	err = ntfs_preserve_deleted_record(ni);
+	mutex_lock(&ni->extent_lock);
+	for (i = 0; i < ni->nr_extents; i++) {
+		struct ntfs_inode *ext_ni = ni->ext.extent_ntfs_inos[i];
+
+		mutex_lock(&ext_ni->mrec_lock);
+		ret = ntfs_preserve_deleted_record(ext_ni);
+		mutex_unlock(&ext_ni->mrec_lock);
+		if (!err)
+			err = ret;
+	}
+	mutex_unlock(&ni->extent_lock);
+	mutex_unlock(&ni->mrec_lock);
+	return err;
+}
+
+static void ntfs_preserve_failed_retirement(struct ntfs_inode *ni)
+{
+	int err;
+
+	NVolSetRecoveryNeeded(ni->vol);
+	NVolSetErrors(ni->vol);
+	if (NVolShutdown(ni->vol))
+		return;
+	err = ntfs_preserve_deleted_inode(ni);
+	if (err) {
+		NVolSetShutdown(ni->vol);
+		ni->vol->sb->s_flags |= SB_RDONLY;
+		ntfs_error(ni->vol->sb,
+			   "Cannot preserve deleted inode 0x%llx (error %d); stopping writes.",
+			   (unsigned long long)ni->mft_no, err);
+	}
+}
+
+static int __ntfs_delete_base_inode(struct ntfs_inode *ni, bool recovery)
+{
+	struct ntfs_deleted_runlist *runlist;
+	struct runlist_element *normalized_rl = NULL;
+	struct ntfs_mft_retire_record *mft_records = NULL;
+	struct super_block *sb = ni->vol->sb;
+	struct ntfs_log_handle *handle;
+	struct ntfs_inode *ext_ni;
+	LIST_HEAD(runlists);
+	u64 cluster_credits;
+	u64 credits64;
+	u64 records;
+	s64 first_mismatch = -1;
+	int abort_err;
+	unsigned int delayed_clusters;
+	int credit_limit;
+	int record_credits;
+	int err = -EOPNOTSUPP;
+	const char *retire_stage = "journal reservation";
 
 	if (NInoAttr(ni) || ni->nr_extents == -1)
 		return 0;
-
+	if (ni->vol->journal && NInoBeingDeleted(ni)) {
+		delayed_clusters = ni->i_dealloc_clusters;
+		cluster_credits = 0;
+		if (NInoRunlistDirty(ni)) {
+			err = ntfs_attr_map_whole_runlist(ni);
+			if (err)
+				goto retire_fallback;
+			err = ntfs_deleted_cached_runlist_collect(ni, &runlists);
+			if (err)
+				goto retire_fallback;
+		}
+		err = ntfs_deleted_runlists_collect(ni, &runlists,
+				NInoRunlistDirty(ni));
+		if (!err)
+			err = ntfs_deleted_runlists_normalize(&runlists,
+					&normalized_rl, &cluster_credits);
+		if (!err)
+			err = ntfs_deleted_mft_records_collect(ni, &mft_records,
+					&records);
+		if (!err) {
+			record_credits = ntfs_mft_records_retire_credits(ni->vol,
+					mft_records, records);
+			if (record_credits < 0) {
+				err = record_credits;
+				goto retire_fallback;
+			}
+			if (check_add_overflow(cluster_credits,
+					(u64)record_credits,
+					&credits64) || credits64 > UINT_MAX) {
+				err = -E2BIG;
+				goto retire_fallback;
+			}
+			credit_limit = ntfs_log_transaction_credits_limit(ni->vol);
+			if (credit_limit < 0) {
+				err = credit_limit;
+				goto retire_close;
+			}
+			if (credits64 > (u64)credit_limit) {
+				err = -E2BIG;
+				goto retire_fallback;
+			}
+			/*
+			 * Retirement is one indivisible transaction. Reserve its full
+			 * credit bound before the first bitmap or MFT record mutation.
+			 */
+			if (recovery)
+				handle = ntfs_log_begin_mount_full(ni->vol, credits64);
+			else
+				handle = ntfs_log_begin_full_reservation(ni->vol, credits64);
+			if (IS_ERR(handle)) {
+				err = PTR_ERR(handle);
+				if (err == -E2BIG)
+					goto retire_fallback;
+				goto retire_close;
+			}
+			mutex_lock(&ni->mrec_lock);
+			retire_stage = "MFT preflight";
+			err = ntfs_mft_records_retire_preflight(ni, mft_records,
+					records);
+			list_for_each_entry(runlist, &runlists, link) {
+				if (err)
+					break;
+				retire_stage = "cluster preflight";
+				err = ntfs_cluster_free_from_rl_preflight_with_mismatch(
+						ni->vol, runlist->rl,
+						&first_mismatch);
+				if (err && first_mismatch >= 0)
+					ntfs_error(sb,
+						"Deleted inode 0x%llx cluster mismatch in %s runlist (source MFT 0x%llx, attribute type 0x%x, name length %u, lowest VCN 0x%llx).",
+						(unsigned long long)ni->mft_no,
+						runlist->cached ? "cached" :
+							"on-disk",
+						(unsigned long long)
+							runlist->source_mft_no,
+						(unsigned int)
+							runlist->source_type,
+						(unsigned int)
+							runlist->source_name_len,
+						(unsigned long long)
+							runlist->source_lowest_vcn);
+			}
+			if (!err && normalized_rl) {
+				retire_stage = "cluster deallocation";
+				err = ntfs_cluster_free_from_rl_transacted(handle,
+						ni->vol, normalized_rl);
+			}
+			if (!err) {
+				retire_stage = "MFT retirement";
+				err = ntfs_mft_records_retire_transacted(handle,
+						ni, mft_records, records);
+			}
+			mutex_unlock(&ni->mrec_lock);
+			if (err) {
+				abort_err = ntfs_log_abort(handle);
+				if (abort_err) {
+					retire_stage = "journal abort";
+					err = abort_err;
+				}
+			} else {
+				retire_stage = "journal commit";
+				err = ntfs_log_commit(handle);
+			}
+retire_close:
+			if (first_mismatch >= 0) {
+				NVolSetErrors(ni->vol);
+				NVolSetShutdown(ni->vol);
+				sb->s_flags |= SB_RDONLY;
+				ntfs_error(sb,
+					"Stopping writes: deleted inode 0x%llx references free cluster LCN %lld.",
+					(unsigned long long)ni->mft_no,
+					(long long)first_mismatch);
+			}
+			if (err)
+				ntfs_preserve_failed_retirement(ni);
+			ntfs_deleted_runlists_free(&runlists);
+			kvfree(normalized_rl);
+			kvfree(mft_records);
+			ntfs_release_dirty_clusters(ni->vol, delayed_clusters);
+			ni->i_dealloc_clusters = 0;
+			while (ni->nr_extents) {
+				ext_ni = ni->ext.extent_ntfs_inos[0];
+				ntfs_inode_close(ext_ni);
+			}
+			if (err) {
+				ntfs_error(sb,
+					"Failed to retire deleted inode 0x%llx (%llu MFT records, stage %s, error %d).",
+					(unsigned long long)ni->mft_no,
+					(unsigned long long)records,
+					retire_stage, err);
+				NVolSetErrors(ni->vol);
+			}
+			return err;
+		}
+	}
+retire_fallback:
+	ntfs_deleted_runlists_free(&runlists);
+	kvfree(normalized_rl);
+	kvfree(mft_records);
+	if (recovery)
+		return err;
 	err = ntfs_non_resident_dealloc_clusters(ni);
 
 	/*
@@ -2457,6 +3304,407 @@ static int ntfs_delete_base_inode(struct ntfs_inode *ni)
 	return err;
 }
 
+static int ntfs_delete_base_inode(struct ntfs_inode *ni)
+{
+	return __ntfs_delete_base_inode(ni, false);
+}
+
+struct ntfs_recovery_attr_ref {
+	u64 mft_no;
+	u16 instance;
+	bool seen;
+};
+
+static int ntfs_recovery_attr_ref_compare(const void *left, const void *right)
+{
+	const struct ntfs_recovery_attr_ref *a = left;
+	const struct ntfs_recovery_attr_ref *b = right;
+
+	if (a->mft_no != b->mft_no)
+		return a->mft_no < b->mft_no ? -1 : 1;
+	if (a->instance != b->instance)
+		return a->instance < b->instance ? -1 : 1;
+	return 0;
+}
+
+/*
+ * The logical attribute-list walk must account for every physical attribute
+ * in the base and its extents before any runs or records can be freed.
+ */
+static int ntfs_recovery_check_physical_attrs(struct ntfs_inode *ni,
+		struct ntfs_recovery_attr_ref *refs, size_t count)
+{
+	struct ntfs_attr_search_ctx *ctx;
+	struct ntfs_inode *record_ni;
+	size_t found = 0, index, i;
+	int err = 0;
+
+	sort(refs, count, sizeof(*refs), ntfs_recovery_attr_ref_compare, NULL);
+	for (index = 1; index < count; index++) {
+		if (!ntfs_recovery_attr_ref_compare(&refs[index - 1],
+				&refs[index]))
+			return -EUCLEAN;
+	}
+	for (i = 0; i <= (size_t)ni->nr_extents; i++) {
+		record_ni = i ? ni->ext.extent_ntfs_inos[i - 1] : ni;
+		if (!record_ni)
+			return -EUCLEAN;
+		ctx = ntfs_attr_get_search_ctx(record_ni, NULL);
+		if (!ctx)
+			return -ENOMEM;
+		if (i && ctx->mrec->base_mft_record !=
+		    MK_LE_MREF(ni->mft_no, ni->seq_no)) {
+			err = -EUCLEAN;
+			goto put;
+		}
+		while (!(err = ntfs_attrs_walk_mft_record(ctx))) {
+			struct ntfs_recovery_attr_ref key = {
+				.mft_no = record_ni->mft_no,
+				.instance = le16_to_cpu(ctx->attr->instance),
+			};
+			size_t low = 0, high = count;
+
+			while (low < high) {
+				size_t mid = low + (high - low) / 2;
+				int cmp = ntfs_recovery_attr_ref_compare(&key,
+						&refs[mid]);
+
+				if (cmp > 0)
+					low = mid + 1;
+				else
+					high = mid;
+			}
+			if (low == count ||
+			    ntfs_recovery_attr_ref_compare(&key, &refs[low]) ||
+			    refs[low].seen) {
+				err = -EUCLEAN;
+				goto put;
+			}
+			refs[low].seen = true;
+			found++;
+		}
+		if (err == -ENOENT)
+			err = 0;
+put:
+		ntfs_attr_put_search_ctx(ctx);
+		if (err)
+			return err;
+	}
+	return found == count ? 0 : -EUCLEAN;
+}
+
+static int ntfs_recovery_check_empty_dir(struct ntfs_inode *ni,
+		const struct mft_record *mrec)
+{
+	struct ntfs_attr_search_ctx *ctx;
+	const struct attr_record *attr;
+	const struct index_root *root;
+	const struct index_entry_header *entry;
+	int err;
+
+	if (!(mrec->flags & MFT_RECORD_IS_DIRECTORY))
+		return 0;
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx)
+		return -ENOMEM;
+	err = ntfs_attr_lookup(AT_INDEX_ROOT, I30, 4, CASE_SENSITIVE, 0,
+			NULL, 0, ctx);
+	if (err)
+		goto out;
+	attr = ctx->attr;
+	if (attr->non_resident) {
+		err = -EUCLEAN;
+		goto out;
+	}
+	if (le32_to_cpu(attr->data.resident.value_length) !=
+	    sizeof(*root) + sizeof(*entry)) {
+		err = -ENOTEMPTY;
+		goto out;
+	}
+	root = (const struct index_root *)((const u8 *)attr +
+			le16_to_cpu(attr->data.resident.value_offset));
+	entry = (const struct index_entry_header *)((const u8 *)root +
+			sizeof(*root));
+	if (root->type != AT_FILE_NAME ||
+	    root->collation_rule != COLLATION_FILE_NAME ||
+	    root->index.flags != SMALL_INDEX ||
+	    le32_to_cpu(root->index.entries_offset) != sizeof(struct index_header) ||
+	    le32_to_cpu(root->index.index_length) !=
+			sizeof(struct index_header) + sizeof(*entry) ||
+	    le32_to_cpu(root->index.allocated_size) !=
+			sizeof(struct index_header) + sizeof(*entry) ||
+	    entry->flags != INDEX_ENTRY_END ||
+	    le16_to_cpu(entry->length) != sizeof(*entry) || entry->key_length)
+		err = -EUCLEAN;
+out:
+	ntfs_attr_put_search_ctx(ctx);
+	return err;
+}
+
+static int ntfs_reclaim_unlinked_inode_attributes(struct ntfs_inode *ni)
+{
+	struct inode *vi = VFS_I(ni);
+	int err;
+
+	if (NInoNonResident(ni) && ni->type == AT_DATA && !ni->name_len &&
+	    S_ISREG(vi->i_mode)) {
+		err = ntfs_reclaim_deleted_attribute(vi);
+		if (err)
+			return err;
+	}
+
+	/* Deleted-attribute reclaim is added with namespace integration. */
+	return -EOPNOTSUPP;
+}
+
+static int ntfs_recover_unlinked_inode(struct ntfs_volume *vol, u64 mft_no,
+		unsigned long expected_extents)
+{
+	struct ntfs_attr_search_ctx *ctx;
+	struct ntfs_recovery_attr_ref *refs = NULL;
+	struct ntfs_inode *ni;
+	struct mft_record *mrec;
+	struct inode *vi;
+	size_t count = 0, capacity = 0;
+	bool has_object_id = false, has_reparse = false;
+	int err;
+
+	vi = new_inode(vol->sb);
+	if (!vi)
+		return -ENOMEM;
+	vi->i_ino = mft_no;
+	ni = NTFS_I(vi);
+	ni->type = AT_UNUSED;
+	ni->name = NULL;
+	ni->name_len = 0;
+	err = ntfs_read_locked_inode(vi, true);
+	if (err)
+		goto out_put;
+
+	if (NInoAttrList(ni)) {
+		capacity = ni->attr_list_size /
+				offsetof(struct attr_list_entry, name) + 1;
+		refs = kvmalloc_array(capacity, sizeof(*refs), GFP_NOFS);
+		if (!refs) {
+			err = -ENOMEM;
+			goto out_put;
+		}
+	}
+	ctx = ntfs_attr_get_search_ctx(ni, NULL);
+	if (!ctx) {
+		err = -ENOMEM;
+		goto out_put;
+	}
+	while (!(err = ntfs_attrs_walk(ctx))) {
+		if (refs) {
+			if (count == capacity) {
+				err = -EUCLEAN;
+				break;
+			}
+			refs[count].mft_no = ctx->ntfs_ino->mft_no;
+			refs[count].instance = le16_to_cpu(ctx->attr->instance);
+			refs[count++].seen = false;
+		}
+		if (ctx->attr->type == AT_FILE_NAME) {
+			err = -EUCLEAN;
+			break;
+		}
+		if (ctx->attr->type == AT_OBJECT_ID)
+			has_object_id = true;
+		else if (ctx->attr->type == AT_REPARSE_POINT)
+			has_reparse = true;
+	}
+	ntfs_attr_put_search_ctx(ctx);
+	if (err == -ENOENT)
+		err = 0;
+	if (err)
+		goto out_put;
+	if (ni->nr_extents < 0 ||
+	    (unsigned long)ni->nr_extents != expected_extents) {
+		err = -EUCLEAN;
+		goto out_put;
+	}
+	if (refs) {
+		err = ntfs_recovery_check_physical_attrs(ni, refs, count);
+		if (err)
+			goto out_put;
+	}
+
+	mrec = map_mft_record(ni);
+	if (IS_ERR(mrec)) {
+		err = PTR_ERR(mrec);
+		goto out_put;
+	}
+	err = ntfs_recovery_check_empty_dir(ni, mrec);
+	unmap_mft_record(ni);
+	if (err)
+		goto out_put;
+	if (has_reparse) {
+		/* Index recovery is added with namespace integration. */
+		err = -EOPNOTSUPP;
+		if (err)
+			goto out_put;
+	}
+	if (has_object_id) {
+		err = -EOPNOTSUPP;
+		if (err)
+			goto out_put;
+	}
+
+	NInoSetBeingDeleted(ni);
+	err = __ntfs_delete_base_inode(ni, true);
+	if (err == -E2BIG) {
+		err = ntfs_reclaim_unlinked_inode_attributes(ni);
+		if (!err)
+			err = __ntfs_delete_base_inode(ni, true);
+	}
+out_put:
+	kvfree(refs);
+	iput(vi);
+	return err;
+}
+
+static int ntfs_unlinked_record_candidate(struct ntfs_volume *vol, u64 mft_no,
+		bool *candidate, bool *extent, u64 *base_mft_no)
+{
+	struct ntfs_inode *ni;
+	struct mft_record *mrec;
+	int err = 0;
+
+	ni = ntfs_new_extent_inode(vol->sb, mft_no);
+	if (!ni)
+		return -ENOMEM;
+	ni->nr_extents = -1;
+	ni->ext.base_ntfs_ino = NTFS_I(vol->mft_ino);
+	mrec = map_mft_record(ni);
+	if (IS_ERR(mrec)) {
+		err = PTR_ERR(mrec);
+	} else {
+		*candidate = (mrec->flags & MFT_RECORD_IN_USE) &&
+			!mrec->base_mft_record && !mrec->link_count;
+		*extent = (mrec->flags & MFT_RECORD_IN_USE) &&
+			mrec->base_mft_record;
+		*base_mft_no = le64_to_cpu(mrec->base_mft_record) &
+			MFT_REF_MASK_CPU;
+		unmap_mft_record(ni);
+	}
+	ntfs_clear_extent_inode(ni);
+	return err;
+}
+
+static int ntfs_recovery_scan_mft(struct ntfs_volume *vol, u64 nr_records,
+		u8 *bitmap, struct xarray *extent_counts, bool count_extents,
+		u64 *recovered)
+{
+	struct address_space *mapping = vol->mftbmp_ino->i_mapping;
+	const u64 bits_per_page = (u64)PAGE_SIZE * BITS_PER_BYTE;
+	u64 first, end, mft_no;
+	int err = 0;
+
+	for (first = count_extents ? 0 : FILE_first_user;
+	     first < nr_records; first = end) {
+		pgoff_t index = first / bits_per_page;
+		struct folio *folio;
+
+		folio = read_mapping_folio(mapping, index, NULL);
+		if (IS_ERR(folio)) {
+			err = PTR_ERR(folio);
+			break;
+		}
+		memcpy_from_folio(bitmap, folio, 0, PAGE_SIZE);
+		folio_put(folio);
+		end = min_t(u64, nr_records, (index + 1) * bits_per_page);
+		for (mft_no = first; mft_no < end; mft_no++) {
+			u64 bit = mft_no % bits_per_page;
+			u64 base_mft_no;
+			bool candidate, extent;
+
+			if (!(bitmap[bit / BITS_PER_BYTE] &
+			      (1U << (bit % BITS_PER_BYTE))))
+				continue;
+			err = ntfs_unlinked_record_candidate(vol, mft_no,
+					&candidate, &extent, &base_mft_no);
+			if (!err && count_extents && extent) {
+				void *entry;
+				unsigned long count;
+
+				if (base_mft_no >= nr_records) {
+					err = -EUCLEAN;
+					goto record_error;
+				}
+				entry = xa_load(extent_counts, base_mft_no);
+				count = entry ? xa_to_value(entry) : 0;
+				if (count >= INT_MAX) {
+					err = -E2BIG;
+					goto record_error;
+				}
+				entry = xa_store(extent_counts, base_mft_no,
+						xa_mk_value(count + 1), GFP_NOFS);
+				err = xa_err(entry);
+			} else if (!err && !count_extents && candidate) {
+				void *entry = xa_load(extent_counts, mft_no);
+				unsigned long count = entry ? xa_to_value(entry) : 0;
+
+				err = ntfs_recover_unlinked_inode(vol, mft_no, count);
+				if (!err)
+					(*recovered)++;
+			}
+record_error:
+			if (err) {
+				ntfs_error(vol->sb,
+					"Cannot recover unlinked MFT record 0x%llx (error %d).",
+					(unsigned long long)mft_no, err);
+				return err;
+			}
+			if (!(mft_no & 255))
+				cond_resched();
+		}
+	}
+	return err;
+}
+
+/*
+ * Recovery runs before the mount is visible.  Count all allocated extents
+ * first so an attribute list cannot hide one from retirement.  Snapshot each
+ * bitmap page so retirement does not hold a page lock across transactions.
+ */
+int ntfs_recover_unlinked_inodes(struct ntfs_volume *vol)
+{
+	struct ntfs_inode *mft_ni = NTFS_I(vol->mft_ino);
+	DEFINE_XARRAY(extent_counts);
+	u64 nr_records, recovered = 0;
+	s64 initialized_size, bitmap_size;
+	unsigned long flags;
+	u8 *bitmap;
+	int err;
+
+	read_lock_irqsave(&mft_ni->size_lock, flags);
+	initialized_size = mft_ni->initialized_size;
+	read_unlock_irqrestore(&mft_ni->size_lock, flags);
+	bitmap_size = i_size_read(vol->mftbmp_ino);
+	if (initialized_size < 0 || bitmap_size < 0 ||
+	    !IS_ALIGNED(initialized_size, vol->mft_record_size))
+		return -EIO;
+	nr_records = initialized_size >> vol->mft_record_size_bits;
+	if (nr_records > ULONG_MAX ||
+	    DIV_ROUND_UP_ULL(nr_records, BITS_PER_BYTE) > (u64)bitmap_size)
+		return -EIO;
+	bitmap = kmalloc(PAGE_SIZE, GFP_NOFS);
+	if (!bitmap)
+		return -ENOMEM;
+	err = ntfs_recovery_scan_mft(vol, nr_records, bitmap, &extent_counts,
+			true, &recovered);
+	if (!err)
+		err = ntfs_recovery_scan_mft(vol, nr_records, bitmap,
+				&extent_counts, false, &recovered);
+	xa_destroy(&extent_counts);
+	kfree(bitmap);
+	if (!err && recovered)
+		pr_info("ntfs: (device %s): Recovered %llu unlinked inode(s).\n",
+			vol->sb->s_id, (unsigned long long)recovered);
+	return err;
+}
+
 /*
  * ntfs_evict_big_inode - clean up the ntfs specific part of an inode
  * @vi:		vfs inode pending annihilation
@@ -2470,6 +3718,7 @@ static int ntfs_delete_base_inode(struct ntfs_inode *ni)
 void ntfs_evict_big_inode(struct inode *vi)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
+	int err;
 
 	truncate_inode_pages_final(&vi->i_data);
 
@@ -2483,17 +3732,31 @@ void ntfs_evict_big_inode(struct inode *vi)
 	}
 
 	if (NInoDirty(ni)) {
+		/* Forced shutdown leaves durable metadata to journal recovery. */
+		if (NVolShutdown(ni->vol)) {
+			NInoClearAttrListDirty(ni);
+			NInoClearDirty(ni);
+			goto clear_extents;
+		}
 		/* Committing the inode also commits all extent inodes. */
-		ntfs_commit_inode(vi);
+		err = ntfs_commit_inode(vi);
 
-		if (NInoDirty(ni)) {
-			ntfs_debug("Failed to commit dirty inode 0x%llx.  Losing data!",
-				   ni->mft_no);
+		if (err || NInoDirty(ni)) {
+			NVolSetErrors(ni->vol);
+			if (err)
+				ntfs_error(vi->i_sb,
+					   "Failed to commit dirty inode 0x%llx (error %d). Losing data.",
+					   (unsigned long long)ni->mft_no, err);
+			else
+				ntfs_error(vi->i_sb,
+					   "Inode 0x%llx remains dirty after commit. Losing data.",
+					   (unsigned long long)ni->mft_no);
 			NInoClearAttrListDirty(ni);
 			NInoClearDirty(ni);
 		}
 	}
 
+clear_extents:
 	/* No need to lock at this stage as no one else has a reference. */
 	if (ni->nr_extents > 0) {
 		int i;
@@ -2509,15 +3772,6 @@ void ntfs_evict_big_inode(struct inode *vi)
 release:
 	clear_inode(vi);
 	__ntfs_clear_inode(ni);
-
-	if (NInoAttr(ni)) {
-		/* Release the base inode if we are holding it. */
-		if (ni->nr_extents == -1) {
-			iput(VFS_I(ni->ext.base_ntfs_ino));
-			ni->nr_extents = 0;
-			ni->ext.base_ntfs_ino = NULL;
-		}
-	}
 
 	if (!atomic_dec_and_test(&ni->count))
 		WARN_ON(1);
@@ -2576,6 +3830,22 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 		seq_puts(sf, ",discard");
 	if (NVolDisableSparse(vol))
 		seq_puts(sf, ",disable_sparse");
+	if (NVolNoRecovery(vol))
+		seq_puts(sf, ",norecovery");
+	switch (vol->journal_mode) {
+	case NTFS_JOURNAL_ON:
+		seq_puts(sf, ",journal=on");
+		break;
+	case NTFS_JOURNAL_OFF:
+		seq_puts(sf, ",journal=off");
+		break;
+	case NTFS_JOURNAL_RESET:
+		seq_puts(sf, ",journal=reset");
+		break;
+	case NTFS_JOURNAL_REPLAY:
+		seq_puts(sf, ",journal=replay");
+		break;
+	}
 	if (NVolNativeSymlinkRel(vol))
 		seq_puts(sf, ",native_symlink=rel");
 	else
@@ -2593,88 +3863,804 @@ int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 	return 0;
 }
 
-/*
- * The caller must hold @vi's mapping invalidate lock.
- */
-static int __ntfs_extend_initialized_size(struct inode *vi,
-					  const loff_t offset,
-					  const loff_t new_size)
+static int __ntfs_set_initialized_size_journaled(struct ntfs_inode *ni,
+		loff_t new_size, bool ordered_data, bool pagefault)
+{
+	struct ntfs_inode *mrec_ni;
+	struct ntfs_log_handle *handle;
+	int abort_err;
+	int credits;
+	int err;
+
+	if (!ni)
+		return -EINVAL;
+	mrec_ni = ntfs_base_inode(ni);
+	if (!mrec_ni)
+		return -EINVAL;
+	if (!ni->vol->journal) {
+		mutex_lock(&mrec_ni->mrec_lock);
+		err = ntfs_attr_set_initialized_size(ni, new_size);
+		mutex_unlock(&mrec_ni->mrec_lock);
+		return err;
+	}
+	credits = ntfs_attr_initialized_grow_log_credits(ni->vol,
+			NInoSparse(ni) || NInoCompressed(ni));
+	if (credits < 0)
+		return credits;
+	handle = pagefault ? ntfs_log_begin_locked(ni->vol, credits) :
+		ntfs_log_begin_bounded(ni->vol, credits);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	if (ordered_data) {
+		err = ntfs_log_ordered_data(handle);
+		if (err) {
+			abort_err = ntfs_log_abort(handle);
+			return abort_err ? abort_err : err;
+		}
+	}
+	mutex_lock(&mrec_ni->mrec_lock);
+	err = ntfs_attr_initialized_grow_transacted(handle, ni, new_size);
+	if (err) {
+		abort_err = ntfs_log_abort(handle);
+		if (abort_err)
+			err = abort_err;
+	} else {
+		err = ntfs_log_commit(handle);
+	}
+	mutex_unlock(&mrec_ni->mrec_lock);
+	return err;
+}
+
+int ntfs_set_initialized_size_journaled(struct ntfs_inode *ni,
+		loff_t new_size)
+{
+	return __ntfs_set_initialized_size_journaled(ni, new_size, false, false);
+}
+
+int ntfs_set_initialized_size_fault(struct ntfs_inode *ni,
+		loff_t new_size, bool ordered_data)
+{
+	return __ntfs_set_initialized_size_journaled(ni, new_size, ordered_data, true);
+}
+
+int ntfs_write_and_wait_range(struct inode *vi, loff_t start, loff_t end)
+{
+	int err, wait_err;
+
+	/* A retryable submission error must not hide a completion error. */
+	err = filemap_fdatawrite_range(vi->i_mapping, start, end);
+	if (err == -EIO) {
+		filemap_check_errors(vi->i_mapping);
+		return err;
+	}
+	wait_err = filemap_fdatawait_range(vi->i_mapping, start, end);
+	if (wait_err && (!err || err == -EAGAIN))
+		err = wait_err;
+	return err;
+}
+
+int ntfs_extend_initialized_size_locked(struct inode *vi, const loff_t offset,
+		const loff_t new_size, bool sync_before_write)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
-	struct ntfs_inode *mrec_ni = ntfs_base_inode(ni);
-	loff_t old_init_size, clear_size;
+	loff_t old_init_size, zero_end, clear_size;
+	bool ordered_data = false;
 	unsigned long flags;
-	int err = 0;
+	int err;
 
 	lockdep_assert_held_write(&vi->i_mapping->invalidate_lock);
-
-	if (!NInoNonResident(ni))
-		return -EINVAL;
 
 	read_lock_irqsave(&ni->size_lock, flags);
 	old_init_size = ni->initialized_size;
 	read_unlock_irqrestore(&ni->size_lock, flags);
 
+	if (!NInoNonResident(ni))
+		return -EINVAL;
 	if (old_init_size >= new_size)
-		goto out;
+		return 0;
 
 	err = ntfs_attr_map_whole_runlist(ni);
 	if (err)
-		goto out;
+		return err;
 
+	/*
+	 * Async or short writes can leave part of their target unwritten, so
+	 * initialize that tail as well as the gap before publishing its size.
+	 */
+	zero_end = (sync_before_write || !ni->vol->journal) ? new_size : offset;
 	if (!NInoCompressed(ni)) {
-		/*
-		 * Zeroing skips holes, so discard cached uninitialized bytes
-		 * before making them visible to writes or shared mappings.
-		 */
 		clear_size = max_t(loff_t, i_size_read(vi), new_size);
 		truncate_pagecache_range(vi, old_init_size, clear_size - 1);
-
-		if (old_init_size < offset) {
+		if (old_init_size < zero_end) {
 			err = iomap_zero_range(vi, old_init_size,
-					       offset - old_init_size,
+					       zero_end - old_init_size,
 					       NULL, ntfs_seek_iomap_next,
 					       &ntfs_iomap_folio_ops, NULL);
 			if (err)
-				goto out;
+				return err;
+			if (sync_before_write) {
+				err = ntfs_write_and_wait_range(vi,
+						old_init_size, zero_end - 1);
+				if (err)
+					return err;
+				ordered_data = true;
+			}
 		}
 	}
 
-	mutex_lock(&mrec_ni->mrec_lock);
-	err = ntfs_attr_set_initialized_size(ni, new_size);
-	mutex_unlock(&mrec_ni->mrec_lock);
-out:
-	return err;
+	return __ntfs_set_initialized_size_journaled(ni, new_size, ordered_data, false);
 }
 
 int ntfs_extend_initialized_size(struct inode *vi, const loff_t offset,
-				 const loff_t new_size, bool sync_before_write)
+		const loff_t new_size, bool sync_before_write)
 {
 	int err;
 
 	filemap_invalidate_lock(vi->i_mapping);
-	err = __ntfs_extend_initialized_size(vi, offset, new_size);
+	err = ntfs_extend_initialized_size_locked(vi, offset, new_size,
+			sync_before_write);
 	filemap_invalidate_unlock(vi->i_mapping);
 	return err;
 }
 
-int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
+static int ntfs_truncate_physical_grow_chunks(struct ntfs_inode *ni,
+		loff_t new_size)
+{
+	struct ntfs_inode *mrec_ni = NInoAttr(ni) ?
+			ni->ext.base_ntfs_ino : ni;
+	struct ntfs_log_handle *handle;
+	u64 old_clusters;
+	u64 target_clusters;
+	u64 chunk_clusters;
+	s64 allocation_size;
+	int abort_err;
+	int credits;
+	int err;
+
+	if (!ni || !mrec_ni || new_size <= ni->data_size ||
+	    !NInoNonResident(ni) || NInoEncrypted(ni) ||
+	    NInoCompressed(ni) || NInoSparse(ni) ||
+	    ni->allocated_size < 0 ||
+	    !IS_ALIGNED(ni->allocated_size, ni->vol->cluster_size))
+		return -EINVAL;
+	target_clusters = DIV_ROUND_UP_ULL((u64)new_size,
+			ni->vol->cluster_size);
+	for (;;) {
+		if (signal_pending(current))
+			return -EINTR;
+		old_clusters = ni->allocated_size >> ni->vol->cluster_size_bits;
+		if (old_clusters >= target_clusters)
+			break;
+		chunk_clusters = min_t(u64, target_clusters - old_clusters,
+				NTFS_ATTR_GROW_MAX_CLUSTERS);
+		for (;;) {
+			credits = ntfs_attr_physical_grow_log_credits(ni->vol,
+					chunk_clusters);
+			if (credits >= 0 && credits <= (U16_MAX - 2) / 2)
+				break;
+			if (chunk_clusters == 1)
+				return credits < 0 ? credits : -E2BIG;
+			chunk_clusters >>= 1;
+		}
+		if (old_clusters > (S64_MAX >> ni->vol->cluster_size_bits) -
+				chunk_clusters)
+			return -EFBIG;
+		allocation_size = (old_clusters + chunk_clusters) <<
+				ni->vol->cluster_size_bits;
+		handle = ntfs_log_begin(ni->vol, credits);
+		if (IS_ERR(handle))
+			return PTR_ERR(handle);
+		mutex_lock(&mrec_ni->mrec_lock);
+		err = ntfs_attr_physical_prealloc_transacted(handle, ni,
+				allocation_size, chunk_clusters);
+		if (err) {
+			abort_err = ntfs_log_abort(handle);
+			mutex_unlock(&mrec_ni->mrec_lock);
+			return abort_err ? abort_err : err;
+		}
+		err = ntfs_log_commit(handle);
+		mutex_unlock(&mrec_ni->mrec_lock);
+		if (err)
+			return err;
+		cond_resched();
+	}
+
+	credits = ntfs_attr_logical_grow_log_credits(ni->vol, false);
+	if (credits < 0)
+		return credits;
+	handle = ntfs_log_begin(ni->vol, credits);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	mutex_lock(&mrec_ni->mrec_lock);
+	err = ntfs_attr_logical_grow_transacted(handle, ni, new_size);
+	if (err) {
+		abort_err = ntfs_log_abort(handle);
+		if (abort_err)
+			err = abort_err;
+	} else {
+		err = ntfs_log_commit(handle);
+	}
+	mutex_unlock(&mrec_ni->mrec_lock);
+	return err;
+}
+
+static int ntfs_truncate_relocate_stream(struct ntfs_inode *ni, u32 required_len)
+{
+	struct ntfs_inode *base_ni = ntfs_base_inode(ni);
+	struct ntfs_log_handle *handle;
+	int alloc, extent, list, record, credits, err, abort_err;
+
+	extent = ntfs_attrlist_extent_log_credits(ni->vol);
+	if (extent < 0)
+		return extent;
+	list = ntfs_attrlist_nonresident_log_credits(ni->vol);
+	if (list < 0)
+		return list;
+	alloc = ntfs_mft_record_alloc_credits(ni->vol);
+	if (alloc < 0)
+		return alloc;
+	record = ntfs_log_mft_record_credits(ni->vol);
+	if (record < 0)
+		return record;
+	if (check_mul_overflow(record, 2, &record) ||
+	    check_add_overflow(max(extent, list), alloc, &credits) ||
+	    check_add_overflow(credits, record, &credits))
+		return -EOVERFLOW;
+	handle = ntfs_log_begin(ni->vol, credits);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	mutex_lock(&base_ni->mrec_lock);
+	err = ntfs_attr_relocate_resident_transacted(handle, ni, required_len);
+	if (err) {
+		abort_err = ntfs_log_abort(handle);
+		if (abort_err)
+			err = abort_err;
+	} else {
+		err = ntfs_log_commit(handle);
+	}
+	mutex_unlock(&base_ni->mrec_lock);
+	return err;
+}
+
+static int ntfs_truncate_resident_grow(struct ntfs_inode *ni,
+		loff_t new_size, bool holes)
+{
+	struct ntfs_inode *mrec_ni = NInoAttr(ni) ?
+			ni->ext.base_ntfs_ino : ni;
+	struct ntfs_log_handle *handle;
+	u64 allocated_clusters;
+	u64 grow_clusters;
+	u64 target_clusters;
+	unsigned int combined_credits;
+	int abort_err;
+	int credits;
+	int err;
+	int grow_credits;
+	int logical_credits;
+	bool relocated = false;
+
+	if (!ni || !mrec_ni || new_size <= ni->data_size ||
+	    NInoNonResident(ni) || ni->data_size < 0 ||
+	    ni->data_size > U16_MAX || NInoEncrypted(ni) ||
+	    NInoCompressed(ni) || NInoSparse(ni))
+		return -EINVAL;
+retry_resize:
+	if (new_size <= U16_MAX) {
+		credits = ntfs_resident_attr_resize_log_credits(ni->vol,
+				ni->data_size, new_size);
+		if (credits < 0)
+			return credits;
+		if (credits <= (U16_MAX - 2) / 2) {
+			handle = ntfs_log_begin(ni->vol, credits);
+			if (IS_ERR(handle))
+				return PTR_ERR(handle);
+			mutex_lock(&mrec_ni->mrec_lock);
+			err = ntfs_resident_attr_resize_transacted(handle, ni,
+					new_size);
+			if (!err) {
+				err = ntfs_log_commit(handle);
+				mutex_unlock(&mrec_ni->mrec_lock);
+				return err;
+			}
+			abort_err = ntfs_log_abort(handle);
+			mutex_unlock(&mrec_ni->mrec_lock);
+			if (abort_err)
+				return abort_err;
+			if (err != -ENOSPC)
+				return err;
+			if (ntfs_inode_is_named_stream(ni) && !relocated) {
+				u64 len = offsetof(struct attr_record,
+						data.resident.reserved) + 1 +
+					ALIGN(ni->name_len * sizeof(__le16), 8) +
+					new_size;
+
+				len = ALIGN(len, 8);
+				if (len <= ni->vol->mft_record_size &&
+				    len <= U16_MAX) {
+					err = ntfs_truncate_relocate_stream(ni, len);
+					if (!err) {
+						relocated = true;
+						goto retry_resize;
+					}
+					if (err != -ENOSPC)
+						return err;
+				}
+			}
+		}
+	}
+
+	if (ntfs_inode_is_named_stream(ni)) {
+		u64 clusters = DIV_ROUND_UP_ULL(ni->data_size,
+				ni->vol->cluster_size);
+		u64 len = offsetof(struct attr_record,
+				data.non_resident.compressed_size) +
+			ALIGN(ni->name_len * sizeof(__le16), 8) +
+			ALIGN(clusters * (1 + 2 * sizeof(s64)) + 1, 8);
+
+		if (len > U16_MAX)
+			return -E2BIG;
+		err = ntfs_truncate_relocate_stream(ni, len);
+		if (err)
+			return err;
+	}
+
+	if (ni->data_size)
+		credits = ntfs_attr_make_nonresident_log_credits(ni->vol,
+				ni->name_len, ni->data_size);
+	else
+		credits = ntfs_attr_empty_make_nonresident_log_credits(ni->vol,
+				ni->name_len);
+	if (credits < 0)
+		return credits;
+	target_clusters = DIV_ROUND_UP_ULL((u64)new_size,
+			ni->vol->cluster_size);
+	if (holes || target_clusters <= NTFS_ATTR_GROW_MAX_CLUSTERS) {
+		grow_credits = holes ?
+			ntfs_attr_sparse_grow_log_credits(ni->vol) :
+			ntfs_attr_physical_grow_log_credits(ni->vol,
+					target_clusters);
+		if (grow_credits < 0)
+			return grow_credits;
+		logical_credits = ntfs_attr_logical_grow_log_credits(ni->vol,
+				false);
+		if (logical_credits < 0)
+			return logical_credits;
+		grow_credits = max(grow_credits, logical_credits);
+		/*
+		 * Ordinary reservations grow dynamically.  For an empty file,
+		 * try the bounded physical allocation in one transaction even
+		 * when its worst-case estimate exceeds the old u16 limit.
+		 */
+		if (!check_add_overflow((unsigned int)credits,
+				(unsigned int)grow_credits, &combined_credits) &&
+		    (combined_credits <= (U16_MAX - 2) / 2 ||
+		     (!holes && !ni->data_size &&
+		      ntfs_can_speculate_allocation(ni->vol)))) {
+			bool speculative = combined_credits > (U16_MAX - 2) / 2;
+			bool converted;
+
+			handle = ntfs_log_begin(ni->vol, combined_credits);
+			if (IS_ERR(handle))
+				return PTR_ERR(handle);
+			mutex_lock(&mrec_ni->mrec_lock);
+			if (ni->data_size)
+				err = ntfs_attr_make_nonresident_transacted(handle,
+						ni);
+			else
+				err = ntfs_attr_empty_make_nonresident_transacted(
+						handle, ni);
+			converted = !err;
+			if (!err && (ni->allocated_size < 0 ||
+			    !IS_ALIGNED(ni->allocated_size,
+					ni->vol->cluster_size)))
+				err = -EIO;
+			if (!err) {
+				allocated_clusters = ni->allocated_size >>
+						ni->vol->cluster_size_bits;
+				if (target_clusters > allocated_clusters) {
+					grow_clusters = target_clusters -
+						allocated_clusters;
+					if (holes)
+						err = ntfs_attr_sparse_grow_transacted(
+								handle, ni, new_size);
+					else
+						err = ntfs_attr_physical_grow_transacted(
+								handle, ni, new_size,
+								grow_clusters);
+				} else {
+					err = ntfs_attr_logical_grow_transacted(handle,
+							ni, new_size);
+				}
+			}
+			if (err) {
+				bool retry_split = speculative && converted &&
+					(err == -ENOSPC || err == -E2BIG);
+
+				abort_err = ntfs_log_abort(handle);
+				mutex_unlock(&mrec_ni->mrec_lock);
+				if (abort_err)
+					return abort_err;
+				if (!retry_split)
+					return err;
+			} else {
+				err = ntfs_log_commit(handle);
+				mutex_unlock(&mrec_ni->mrec_lock);
+				return err;
+			}
+		}
+	}
+	handle = ntfs_log_begin(ni->vol, credits);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	mutex_lock(&mrec_ni->mrec_lock);
+	if (ni->data_size)
+		err = ntfs_attr_make_nonresident_transacted(handle, ni);
+	else
+		err = ntfs_attr_empty_make_nonresident_transacted(handle, ni);
+	if (err) {
+		abort_err = ntfs_log_abort(handle);
+		mutex_unlock(&mrec_ni->mrec_lock);
+		return abort_err ? abort_err : err;
+	}
+	err = ntfs_log_commit(handle);
+	mutex_unlock(&mrec_ni->mrec_lock);
+	if (err)
+		return err;
+
+	if (holes)
+		return ntfs_truncate_vfs(VFS_I(ni), new_size,
+				i_size_read(VFS_I(ni)));
+	return ntfs_truncate_physical_grow_chunks(ni, new_size);
+}
+
+/* mrec_lock must be held. Count all possible entries, not only this stream. */
+static u64 ntfs_truncate_extent_bound(struct ntfs_inode *base_ni)
+{
+	if (!NInoAttrList(base_ni))
+		return 0;
+	if (base_ni->attr_list_size < sizeof(struct attr_list_entry))
+		return U64_MAX;
+	return base_ni->attr_list_size / sizeof(struct attr_list_entry);
+}
+
+static int ntfs_truncate_reclaim_credits(struct ntfs_inode *ni,
+		u64 max_attr_extents, u64 *max_free_clusters)
+{
+	int limit;
+	int credits;
+
+	limit = ntfs_log_transaction_credits_limit(ni->vol);
+	if (limit < 0)
+		return limit;
+	limit = min_t(int, limit, (U16_MAX - 2) / 2);
+	for (;;) {
+		credits = ntfs_attr_shrink_log_credits_bound(ni->vol,
+				*max_free_clusters,
+				NInoSparse(ni) || NInoCompressed(ni),
+				max_attr_extents);
+		if (credits >= 0 && credits <= limit)
+			return credits;
+		if (credits < 0 && credits != -E2BIG && credits != -EOVERFLOW)
+			return credits;
+		if (!*max_free_clusters)
+			return credits < 0 ? credits : -E2BIG;
+		*max_free_clusters >>= 1;
+		if (NInoCompressed(ni))
+			*max_free_clusters = round_down(*max_free_clusters,
+					(u64)ni->itype.compressed.block_clusters);
+		if (!*max_free_clusters)
+			return credits < 0 ? credits : -E2BIG;
+	}
+}
+
+static struct ntfs_log_handle *ntfs_truncate_begin_reclaim(
+		struct ntfs_inode *ni, u64 max_attr_extents,
+		u64 *max_free_clusters)
+{
+	struct ntfs_log_handle *handle;
+	u64 smaller;
+	int credits;
+
+	for (;;) {
+		credits = ntfs_truncate_reclaim_credits(ni, max_attr_extents,
+				max_free_clusters);
+		if (credits < 0)
+			return ERR_PTR(credits);
+		handle = ntfs_log_begin_full_reservation(ni->vol, credits);
+		if (!IS_ERR(handle) || PTR_ERR(handle) != -ENOSPC)
+			return handle;
+		smaller = *max_free_clusters >> 1;
+		if (NInoCompressed(ni))
+			smaller = round_down(smaller,
+					(u64)ni->itype.compressed.block_clusters);
+		if (!smaller)
+			return handle;
+		*max_free_clusters = smaller;
+	}
+}
+
+static int __ntfs_truncate_vfs(struct inode *vi, loff_t new_size,
+		loff_t i_size, bool holes, bool initialize_delalloc,
+		bool update_timestamps)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_inode *mrec_ni = ntfs_base_inode(ni);
+	struct ntfs_log_handle *log_handle = NULL;
+	struct ntfs_log *coalesce_log = NULL;
+	u64 max_free_clusters = 0;
+	u64 max_attr_extents = U64_MAX;
+	u64 old_clusters;
+	u64 required_clusters;
+	u64 compression_units;
+	u64 grow_clusters = 0;
+	int abort_err;
+	int credits;
 	int err;
+	bool deleted_attr;
+	bool logical_grow = false;
+	bool resident_resize = false;
+	bool sparse_grow = false;
+	bool physical_grow = false;
+	bool chunked_physical_grow = false;
+
+	if (initialize_delalloc &&
+	    (!holes || !NInoGapAppend(ni) || !NInoNonResident(ni) ||
+	     !ntfs_iomap_can_share_delalloc(ni) || NVolDisableSparse(ni->vol) ||
+	     NInoSparseDisabled(ni) || ni->vol->major_ver < 3 ||
+	     ni->initialized_size != ni->data_size ||
+	     i_size_read(vi) != ni->data_size || new_size <= ni->data_size))
+		return -EINVAL;
+
+	if (new_size > ni->data_size &&
+	    new_size > S64_MAX - ni->vol->cluster_size_mask)
+		return -EFBIG;
+
+	if (initialize_delalloc && vi->i_nlink && !NInoAttr(ni) &&
+	    (new_size <= ni->allocated_size ||
+	     (NInoSparse(ni) && NInoFullyMapped(ni))))
+		coalesce_log = ntfs_log_try_pin_size_update(ni->vol);
+	if (coalesce_log) {
+		mutex_lock(&ni->mrec_lock);
+		err = new_size <= ni->allocated_size ?
+			ntfs_attr_delalloc_grow_coalesced(coalesce_log, ni, new_size) :
+			ntfs_attr_delalloc_mapping_grow_coalesced(coalesce_log, ni,
+					new_size);
+		mutex_unlock(&ni->mrec_lock);
+		ntfs_log_unpin_size_update(coalesce_log);
+		if (!err)
+			goto update_times;
+		if (err != -EAGAIN)
+			return err;
+	}
+
+	holes = holes && ni->type == AT_DATA &&
+		!NVolDisableSparse(ni->vol) && !NInoSparseDisabled(ni) &&
+		ni->vol->major_ver >= 3;
+	deleted_attr = ntfs_deleted_reclaim_inode(ni);
+	if (ni->vol->journal && S_ISREG(vi->i_mode) && vi->i_nlink &&
+	    new_size > ni->data_size && !NInoNonResident(ni) &&
+	    !NInoEncrypted(ni) && !NInoCompressed(ni) && !NInoSparse(ni)) {
+		err = ntfs_truncate_resident_grow(ni, new_size, holes);
+		if (err)
+			return err;
+		goto update_times;
+	}
+	if (!holes && new_size > ni->data_size && new_size >= 0 &&
+	    NInoNonResident(ni) && !NInoEncrypted(ni) &&
+	    !NInoCompressed(ni) && !NInoSparse(ni) &&
+	    ni->allocated_size >= 0 &&
+	    IS_ALIGNED(ni->allocated_size, ni->vol->cluster_size)) {
+		required_clusters = DIV_ROUND_UP_ULL((u64)new_size,
+				ni->vol->cluster_size);
+		old_clusters = ni->allocated_size >> ni->vol->cluster_size_bits;
+		if (required_clusters > old_clusters) {
+			grow_clusters = required_clusters - old_clusters;
+			physical_grow = grow_clusters <=
+					NTFS_ATTR_GROW_MAX_CLUSTERS;
+			chunked_physical_grow = !physical_grow;
+		}
+	}
+	if (ni->vol->journal && chunked_physical_grow &&
+	    S_ISREG(vi->i_mode) && vi->i_nlink) {
+		err = ntfs_truncate_physical_grow_chunks(ni, new_size);
+		if (err)
+			return err;
+		goto update_times;
+	}
+
+reclaim_tail:
+	/*
+	 * Reserve before mrec_lock: checkpoint writeback must never wait for a
+	 * lock held by the task asking the journal for space.  After the final
+	 * filename transaction commits, drop_inode may also shrink deleted base,
+	 * named data, and EA inodes before evict handles the remainder.
+	 */
+	if (ni->vol->journal && (S_ISREG(vi->i_mode) || deleted_attr) &&
+	    (vi->i_nlink || deleted_attr) && new_size >= 0 &&
+	    new_size < ni->data_size && !NInoNonResident(ni) &&
+	    ni->data_size <= U16_MAX &&
+	    (!NInoEncrypted(ni) || deleted_attr)) {
+		credits = ntfs_resident_attr_resize_log_credits(ni->vol,
+				ni->data_size, new_size);
+		if (credits < 0)
+			return credits;
+		log_handle = ntfs_log_begin(ni->vol, credits);
+		if (IS_ERR(log_handle))
+			return PTR_ERR(log_handle);
+		resident_resize = true;
+		if (NInoAttr(ni))
+			mrec_ni = ni->ext.base_ntfs_ino;
+	} else if (ni->vol->journal &&
+	    (S_ISREG(vi->i_mode) || deleted_attr) &&
+	    (vi->i_nlink || deleted_attr) && new_size >= 0 &&
+	    (new_size < ni->data_size ||
+	     (new_size == ni->data_size && ni->allocated_size >= 0 &&
+	      DIV_ROUND_UP_ULL((u64)new_size, ni->vol->cluster_size) <
+			((u64)ni->allocated_size >> ni->vol->cluster_size_bits)) ||
+	     (new_size > ni->data_size && new_size <= ni->allocated_size) ||
+	     (new_size > ni->data_size && (holes || NInoSparse(ni)) &&
+	      !NInoCompressed(ni)) ||
+	     physical_grow ||
+	     (deleted_attr && !new_size && !ni->data_size &&
+	      ni->allocated_size > 0)) &&
+	    NInoNonResident(ni) &&
+	    (!NInoEncrypted(ni) || deleted_attr)) {
+		if (ni->allocated_size < 0 ||
+		    !IS_ALIGNED(ni->allocated_size, ni->vol->cluster_size) ||
+		    ((NInoSparse(ni) || NInoCompressed(ni)) &&
+		     (ni->itype.compressed.size < 0 ||
+		     !IS_ALIGNED(ni->itype.compressed.size,
+				ni->vol->cluster_size))))
+			return -EIO;
+		logical_grow = new_size > ni->data_size;
+		if (logical_grow) {
+			sparse_grow = new_size > ni->allocated_size;
+			if (physical_grow)
+				credits = ntfs_attr_physical_grow_log_credits(ni->vol,
+						grow_clusters);
+			else if (sparse_grow)
+				credits = ntfs_attr_sparse_grow_log_credits(ni->vol);
+			else
+				credits = ntfs_attr_logical_grow_log_credits(ni->vol,
+						NInoSparse(ni) || NInoCompressed(ni));
+			if (credits < 0)
+				return credits;
+			goto reserve;
+		}
+		old_clusters = ni->allocated_size >>
+				ni->vol->cluster_size_bits;
+		if (NInoCompressed(ni)) {
+			if (ni->itype.compressed.block_clusters !=
+					(1U << STANDARD_COMPRESSION_UNIT) ||
+			    ni->itype.compressed.block_size !=
+					(ni->vol->cluster_size <<
+					 STANDARD_COMPRESSION_UNIT) ||
+			    !IS_ALIGNED(ni->allocated_size,
+					ni->itype.compressed.block_size))
+				return -EIO;
+			compression_units = DIV_ROUND_UP_ULL((u64)new_size,
+					ni->itype.compressed.block_size);
+			if (check_mul_overflow(compression_units,
+					(u64)ni->itype.compressed.block_clusters,
+					&required_clusters))
+				return -EOVERFLOW;
+		} else {
+			required_clusters = DIV_ROUND_UP_ULL(new_size,
+					ni->vol->cluster_size);
+		}
+		if (required_clusters > old_clusters)
+			return -EIO;
+		if (NInoAttr(ni))
+			mrec_ni = ni->ext.base_ntfs_ino;
+		mutex_lock(&mrec_ni->mrec_lock);
+		max_attr_extents = ntfs_truncate_extent_bound(mrec_ni);
+		mutex_unlock(&mrec_ni->mrec_lock);
+		max_free_clusters = min_t(u64,
+				old_clusters - required_clusters,
+				NTFS_ATTR_TRUNCATE_MAX_CLUSTERS);
+		if (NInoCompressed(ni))
+			max_free_clusters = round_down(max_free_clusters,
+					(u64)ni->itype.compressed.block_clusters);
+		log_handle = ntfs_truncate_begin_reclaim(ni, max_attr_extents,
+				&max_free_clusters);
+		goto reserved;
+reserve:
+		log_handle = logical_grow && !sparse_grow && !physical_grow ?
+			ntfs_log_begin_bounded(ni->vol, credits) :
+			ntfs_log_begin(ni->vol, credits);
+reserved:
+		if (IS_ERR(log_handle))
+			return PTR_ERR(log_handle);
+		if (NInoAttr(ni))
+			mrec_ni = ni->ext.base_ntfs_ino;
+	}
 
 	mutex_lock(&mrec_ni->mrec_lock);
-	err = __ntfs_attr_truncate_vfs(ni, new_size, i_size);
+	/* Admission can run writeback that adds or grows the attribute list. */
+	if (log_handle && !resident_resize && !logical_grow &&
+	    ntfs_truncate_extent_bound(mrec_ni) > max_attr_extents) {
+		mutex_unlock(&mrec_ni->mrec_lock);
+		err = ntfs_log_abort(log_handle);
+		log_handle = NULL;
+		if (err)
+			return err;
+		goto reclaim_tail;
+	}
+	if (log_handle) {
+		if (resident_resize)
+			err = ntfs_resident_attr_resize_transacted(log_handle, ni,
+					new_size);
+		else if (initialize_delalloc)
+			err = ntfs_attr_delalloc_grow_transacted(log_handle, ni,
+					new_size);
+		else if (physical_grow)
+			err = ntfs_attr_physical_grow_transacted(log_handle, ni,
+					new_size, grow_clusters);
+		else if (sparse_grow)
+			err = ntfs_attr_sparse_grow_transacted(log_handle, ni,
+					new_size);
+		else if (logical_grow)
+			err = ntfs_attr_logical_grow_transacted(log_handle, ni,
+					new_size);
+		else
+			err = ntfs_attr_shrink_transacted(log_handle, ni, new_size,
+					max_free_clusters);
+	} else
+		err = __ntfs_attr_truncate_vfs(ni, new_size, i_size);
+	if (log_handle) {
+		if (err) {
+			abort_err = ntfs_log_abort(log_handle);
+			if (abort_err)
+				err = abort_err;
+		} else {
+			err = ntfs_log_commit(log_handle);
+		}
+	}
 	mutex_unlock(&mrec_ni->mrec_lock);
 	if (err < 0)
 		return err;
+	/*
+	 * A shrink transaction can reclaim only its reserved bitmap budget.
+	 * Keep removing the remaining allocation after EOF has been committed,
+	 * including when a caller truncates a preallocated file to the same size.
+	 */
+	if (log_handle && !resident_resize && !logical_grow &&
+	    ((u64)ni->allocated_size >> ni->vol->cluster_size_bits) >
+			required_clusters) {
+		if (((u64)ni->allocated_size >> ni->vol->cluster_size_bits) >=
+				old_clusters)
+			return -EIO;
+		log_handle = NULL;
+		cond_resched();
+		goto reclaim_tail;
+	}
 
+update_times:
+	if (!update_timestamps)
+		return 0;
 	if (ntfs_inode_is_named_stream(ni))
 		ntfs_stream_update_base_time(mrec_ni);
 	else
 		inode_set_mtime_to_ts(vi, inode_set_ctime_current(vi));
 	return 0;
+}
+
+int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
+{
+	return __ntfs_truncate_vfs(vi, new_size, i_size, true, false, true);
+}
+
+/* Write growth reserves physical space before buffered or direct I/O. */
+int ntfs_extend_vfs(struct inode *vi, loff_t new_size)
+{
+	return __ntfs_truncate_vfs(vi, new_size, i_size_read(vi), false, false,
+			true);
+}
+
+int ntfs_extend_delalloc_vfs(struct inode *vi, loff_t new_size)
+{
+	return __ntfs_truncate_vfs(vi, new_size, i_size_read(vi), true, true,
+			true);
 }
 
 /*
@@ -2684,11 +4670,21 @@ int ntfs_truncate_vfs(struct inode *vi, loff_t new_size, loff_t i_size)
  *
  * Return 0 on success or -errno on error.
  */
-static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_record *m)
+static int ntfs_inode_sync_standard_information(
+		struct ntfs_log_handle *handle, struct inode *vi,
+		struct mft_record *m)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_attr_search_ctx *ctx;
 	struct standard_information *si;
+	struct standard_information *disk_si;
+	struct standard_information new_si = { };
+	/* Only the common v1/v3 prefix is changed here. */
+	const u16 si_bytes = offsetof(struct standard_information, ver);
+	ptrdiff_t record_pos;
+	u64 operation_lsn;
+	u16 attr_off;
+	u16 record_off;
 	__le64 nt;
 	int err = 0;
 	bool modified = false;
@@ -2703,8 +4699,17 @@ static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_rec
 		ntfs_attr_put_search_ctx(ctx);
 		return err;
 	}
-	si = (struct standard_information *)((u8 *)ctx->attr +
-			le16_to_cpu(ctx->attr->data.resident.value_offset));
+	attr_off = le16_to_cpu(ctx->attr->data.resident.value_offset);
+	if (ctx->attr->non_resident ||
+	    attr_off > le32_to_cpu(ctx->attr->length) ||
+	    si_bytes > le32_to_cpu(ctx->attr->length) - attr_off ||
+	    le32_to_cpu(ctx->attr->data.resident.value_length) < si_bytes) {
+		err = -EIO;
+		goto out;
+	}
+	disk_si = (struct standard_information *)((u8 *)ctx->attr + attr_off);
+	memcpy(&new_si, disk_si, si_bytes);
+	si = &new_si;
 	if (si->file_attributes != ni->flags) {
 		si->file_attributes = ni->flags;
 		modified = true;
@@ -2764,8 +4769,32 @@ static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_rec
 	 * record will be cleaned and written out to disk below, i.e. before
 	 * this function returns.
 	 */
-	if (modified)
+	if (modified && handle) {
+		record_pos = (u8 *)ctx->attr - (u8 *)ctx->mrec;
+		attr_off = le16_to_cpu(ctx->attr->data.resident.value_offset);
+		if (record_pos < 0 || record_pos > U16_MAX ||
+		    attr_off > U16_MAX - si_bytes) {
+			err = -EIO;
+			goto out;
+		}
+		record_off = record_pos;
+		err = ntfs_attr_mft_register_home_undo(handle, ctx->ntfs_ino,
+				ctx->mrec);
+		if (err)
+			goto out;
+		err = ntfs_log_mft_resident_update(handle,
+				ctx->ntfs_ino->mft_no, record_off, attr_off,
+				disk_si, si_bytes, si, si_bytes,
+				&operation_lsn);
+		if (err)
+			goto out;
+		ctx->mrec->lsn = cpu_to_le64(operation_lsn);
+	}
+	if (modified) {
+		memcpy(disk_si, si, si_bytes);
 		NInoSetDirty(ctx->ntfs_ino);
+	}
+out:
 	ntfs_attr_put_search_ctx(ctx);
 
 	return err;
@@ -2779,17 +4808,30 @@ static int ntfs_inode_sync_standard_information(struct inode *vi, struct mft_rec
  *
  * Return 0 on success or error.
  */
-int ntfs_inode_sync_filename(struct ntfs_inode *ni)
+static int __ntfs_inode_sync_filename(struct ntfs_log_handle *parent,
+		struct ntfs_log_handle **handlep, unsigned int link_credits,
+		struct ntfs_inode *ni)
 {
+	struct ntfs_log_handle *handle = parent ? *handlep : NULL;
 	struct inode *index_vi;
 	struct super_block *sb = VFS_I(ni)->i_sb;
 	struct ntfs_attr_search_ctx *ctx = NULL;
-	struct ntfs_index_context *ictx;
+	struct ntfs_index_context *ictx = NULL;
 	struct ntfs_inode *index_ni;
+	struct index_entry *new_ie = NULL;
 	struct file_name_attr *fn;
 	struct file_name_attr *fnx;
+	struct file_name_attr *new_fn = NULL;
 	struct reparse_point *rpp;
+	ptrdiff_t record_pos;
+	u64 operation_lsn;
+	u32 attr_len;
+	u32 fn_len;
+	u16 entry_len;
+	u16 record_off;
+	u16 value_off;
 	__le32 reparse_tag;
+	int abort_err;
 	int err = 0;
 	unsigned long flags;
 
@@ -2812,7 +4854,8 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
 	}
 
 	/* Walk through all FILE_NAME attributes and update them. */
-	while (!(err = ntfs_attr_lookup(AT_FILE_NAME, NULL, 0, 0, 0, NULL, 0, ctx))) {
+	while (!(err = ntfs_attr_lookup(AT_FILE_NAME, NULL, 0, 0, 0, NULL, 0,
+			ctx))) {
 		fn = (struct file_name_attr *)((u8 *)ctx->attr +
 				le16_to_cpu(ctx->attr->data.resident.value_offset));
 		if (MREF_LE(fn->parent_directory) == ni->mft_no)
@@ -2822,11 +4865,26 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
 		if (IS_ERR(index_vi)) {
 			ntfs_error(sb, "Failed to open inode %lld with index",
 					(long long)MREF_LE(fn->parent_directory));
+			if (parent) {
+				err = PTR_ERR(index_vi);
+				goto out;
+			}
 			continue;
 		}
 
 		index_ni = NTFS_I(index_vi);
 
+		if (parent && !handle) {
+			handle = ntfs_log_begin_independent_writeback(parent,
+					link_credits);
+			if (IS_ERR(handle)) {
+				err = PTR_ERR(handle);
+				handle = NULL;
+				iput(index_vi);
+				goto out;
+			}
+			*handlep = handle;
+		}
 		mutex_lock_nested(&index_ni->mrec_lock, NTFS_INODE_MUTEX_PARENT);
 		if (NInoBeingDeleted(ni)) {
 			mutex_unlock(&index_ni->mrec_lock);
@@ -2838,34 +4896,68 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
 		if (!ictx) {
 			ntfs_error(sb, "Failed to get index ctx, inode %llu",
 					index_ni->mft_no);
-			mutex_unlock(&index_ni->mrec_lock);
-			iput(index_vi);
-			continue;
+			err = -ENOMEM;
+			goto out_link;
 		}
 
 		err = ntfs_index_lookup(fn, sizeof(struct file_name_attr), ictx);
 		if (err) {
 			ntfs_debug("Index lookup failed, inode %llu",
 					index_ni->mft_no);
-			ntfs_index_ctx_put(ictx);
-			mutex_unlock(&index_ni->mrec_lock);
-			iput(index_vi);
-			continue;
+			goto out_link;
+		}
+		if (handle) {
+			attr_len = le32_to_cpu(ctx->attr->length);
+			value_off = le16_to_cpu(
+					ctx->attr->data.resident.value_offset);
+			fn_len = le32_to_cpu(
+					ctx->attr->data.resident.value_length);
+			record_pos = (u8 *)ctx->attr - (u8 *)ctx->mrec;
+			entry_len = le16_to_cpu(ictx->entry->length);
+			if (ctx->attr->non_resident ||
+			    record_pos < 0 || record_pos > U16_MAX ||
+			    value_off > attr_len || fn_len > attr_len - value_off ||
+			    fn_len < sizeof(*fn) || fn_len > U16_MAX ||
+			    fn->file_name_length >
+				(fn_len - sizeof(*fn)) / sizeof(__le16) ||
+			    entry_len < sizeof(struct index_entry_header) ||
+			    le16_to_cpu(ictx->entry->key_length) >
+				entry_len - sizeof(struct index_entry_header)) {
+				err = -EIO;
+				goto out_link;
+			}
+			record_off = record_pos;
+			new_ie = ntfs_inode_kvmemdup(ictx->entry, entry_len,
+					GFP_NOFS);
+			new_fn = kmemdup(fn, fn_len, GFP_NOFS);
+			if (!new_ie || !new_fn) {
+				err = -ENOMEM;
+				goto out_link;
+			}
+			fnx = &new_ie->key.file_name;
+			fn = new_fn;
+		} else {
+			fnx = (struct file_name_attr *)ictx->data;
 		}
 		/* Update flags and file size. */
-		fnx = (struct file_name_attr *)ictx->data;
 		fnx->file_attributes =
 			(fnx->file_attributes & ~FILE_ATTR_VALID_FLAGS) |
 			(ni->flags & FILE_ATTR_VALID_FLAGS);
-		if (ctx->mrec->flags & MFT_RECORD_IS_DIRECTORY)
+		fn->file_attributes =
+			(fn->file_attributes & ~FILE_ATTR_VALID_FLAGS) |
+			(ni->flags & FILE_ATTR_VALID_FLAGS);
+		/* Extent records do not carry the base directory flag. */
+		if ((ctx->base_mrec ? ctx->base_mrec : ctx->mrec)->flags &
+		    MFT_RECORD_IS_DIRECTORY) {
 			fnx->data_size = fnx->allocated_size = 0;
-		else {
+			fn->data_size = fn->allocated_size = 0;
+		} else {
 			read_lock_irqsave(&ni->size_lock, flags);
 			if (NInoSparse(ni) || NInoCompressed(ni))
 				fnx->allocated_size = cpu_to_le64(ni->itype.compressed.size);
 			else
 				fnx->allocated_size = cpu_to_le64(ni->allocated_size);
-			fnx->data_size = cpu_to_le64(ni->data_size);
+			fnx->data_size = cpu_to_le64(ntfs_inode_recorded_data_size(ni));
 
 			/*
 			 * The file name record has also to be fixed if some
@@ -2883,12 +4975,57 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
 		fnx->last_data_change_time = fn->last_data_change_time;
 		fnx->last_mft_change_time = fn->last_mft_change_time;
 		fnx->last_access_time = fn->last_access_time;
-		ntfs_index_entry_mark_dirty(ictx);
-		ntfs_icx_ib_sync_write(ictx);
-		NInoSetDirty(ctx->ntfs_ino);
-		ntfs_index_ctx_put(ictx);
+		if (handle) {
+			if (memcmp(ictx->entry, new_ie, entry_len)) {
+				err = -EOPNOTSUPP;
+				if (err)
+					goto out_link;
+			}
+			if (!memcmp((u8 *)ctx->attr + value_off, new_fn, fn_len))
+				goto out_link;
+			err = ntfs_attr_mft_register_home_undo(handle,
+					ctx->ntfs_ino, ctx->mrec);
+			if (err)
+				goto out_link;
+			err = ntfs_log_mft_resident_update(handle,
+					ctx->ntfs_ino->mft_no, record_off,
+					value_off, (u8 *)ctx->attr + value_off,
+					fn_len, new_fn, fn_len, &operation_lsn);
+			if (err)
+				goto out_link;
+			memcpy((u8 *)ctx->attr + value_off, new_fn, fn_len);
+			ctx->mrec->lsn = cpu_to_le64(operation_lsn);
+			NInoSetDirty(ctx->ntfs_ino);
+		} else {
+			ntfs_index_entry_mark_dirty(ictx);
+			ntfs_icx_ib_sync_write(ictx);
+			NInoSetDirty(ctx->ntfs_ino);
+		}
+out_link:
+		kvfree(new_ie);
+		new_ie = NULL;
+		kfree(new_fn);
+		new_fn = NULL;
+		if (ictx) {
+			ntfs_index_ctx_put(ictx);
+			ictx = NULL;
+		}
+		/* The index before-image must not outlive its parent lock. */
+		if (parent) {
+			if (err) {
+				abort_err = ntfs_log_abort(handle);
+				if (abort_err)
+					err = abort_err;
+			} else {
+				err = ntfs_log_commit(handle);
+			}
+			handle = NULL;
+			*handlep = NULL;
+		}
 		mutex_unlock(&index_ni->mrec_lock);
 		iput(index_vi);
+		if (err && parent)
+			goto out;
 	}
 	/* Check for real error occurred. */
 	if (err != -ENOENT) {
@@ -2897,7 +5034,129 @@ int ntfs_inode_sync_filename(struct ntfs_inode *ni)
 	} else
 		err = 0;
 
+out:
+	kvfree(new_ie);
+	kfree(new_fn);
 	ntfs_attr_put_search_ctx(ctx);
+	return err;
+}
+
+int ntfs_inode_sync_filename(struct ntfs_inode *ni)
+{
+	return __ntfs_inode_sync_filename(NULL, NULL, 0, ni);
+}
+
+static int ntfs_inode_filename_log_credits(struct ntfs_inode *ni,
+		int *per_link_out)
+{
+	struct ntfs_volume *vol = ni->vol;
+	unsigned int links = max_t(unsigned int, VFS_I(ni)->i_nlink, 1);
+	int child_credits;
+	int index_credits;
+	int root_credits;
+	int per_link;
+	int credits;
+
+	/* A link can carry separate DOS and Win32 FILE_NAME attributes. */
+	if (check_mul_overflow(links, 2U, &links))
+		return -EOVERFLOW;
+	if (vol->mft_record_size > U16_MAX)
+		return -E2BIG;
+	child_credits = ntfs_log_mft_attribute_credits(vol,
+			vol->mft_record_size, vol->mft_record_size);
+	if (child_credits < 0)
+		return child_credits;
+	root_credits = ntfs_log_mft_attribute_credits(vol,
+			vol->mft_record_size, vol->mft_record_size);
+	if (root_credits < 0)
+		return root_credits;
+	index_credits = ntfs_log_index_allocation_update_credits(vol,
+			vol->index_record_size);
+	if (index_credits < 0)
+		return index_credits;
+	if (check_add_overflow(child_credits,
+			max(root_credits, index_credits), &per_link) ||
+	    check_mul_overflow(per_link, links, &credits))
+		return -EOVERFLOW;
+	*per_link_out = per_link;
+	return credits;
+}
+
+/* Journal inode metadata, serializing each filename update with its parent. */
+static int ntfs_inode_journal_metadata(struct inode *vi,
+		bool filename_dirty, struct ntfs_log **deferred_log)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	struct ntfs_log_handle *parent = NULL;
+	struct ntfs_log_handle *handle;
+	unsigned int credits;
+	unsigned int first_credits;
+	int standard_credits;
+	int filename_credits = 0;
+	int link_credits = 0;
+	int abort_err;
+	int err;
+
+	*deferred_log = NULL;
+	if (!ni->vol->journal)
+		return 0;
+	standard_credits = ntfs_log_mft_attribute_credits(ni->vol,
+			sizeof(struct standard_information),
+			sizeof(struct standard_information));
+	if (standard_credits < 0)
+		return standard_credits;
+	credits = standard_credits;
+	first_credits = credits;
+	if (filename_dirty) {
+		filename_credits = ntfs_inode_filename_log_credits(ni,
+				&link_credits);
+		if (filename_credits < 0)
+			return filename_credits;
+		if (check_add_overflow(credits, (unsigned int)filename_credits,
+				&credits) ||
+		    check_add_overflow(first_credits, (unsigned int)link_credits,
+				&first_credits))
+			return -EOVERFLOW;
+	}
+	handle = ntfs_log_begin_inode_writeback(ni->vol, credits, deferred_log);
+	if (IS_ERR(handle))
+		return PTR_ERR(handle);
+	mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
+	if (filename_dirty) {
+		parent = handle;
+		handle = ntfs_log_begin_independent_writeback(parent,
+				first_credits);
+		if (IS_ERR(handle)) {
+			err = PTR_ERR(handle);
+			handle = NULL;
+			goto finish;
+		}
+	}
+	err = ntfs_inode_sync_standard_information(handle, vi, NULL);
+	if (!err && filename_dirty)
+		err = __ntfs_inode_sync_filename(parent, &handle, link_credits,
+				ni);
+finish:
+	/* Keep the MFT before-images and attribute offsets stable until finish. */
+	if (handle) {
+		if (err) {
+			abort_err = ntfs_log_abort(handle);
+			if (abort_err)
+				err = abort_err;
+		} else {
+			err = ntfs_log_commit(handle);
+		}
+	}
+	if (parent) {
+		if (err) {
+			abort_err = ntfs_log_abort(parent);
+			if (abort_err)
+				err = abort_err;
+		} else {
+			err = ntfs_log_commit(parent);
+		}
+	}
+	mutex_unlock(&ni->mrec_lock);
 	return err;
 }
 
@@ -2955,6 +5214,9 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 	struct mft_record *m;
 	int err = 0;
 	bool need_iput = false;
+	struct ntfs_log *deferred_log = NULL;
+	bool home_deferred = false;
+	bool filename_dirty;
 
 	ntfs_debug("Entering for %sinode 0x%llx.", NInoAttr(ni) ? "attr " : "",
 			ni->mft_no);
@@ -2972,6 +5234,22 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 		ntfs_debug("Done.");
 		return 0;
 	}
+	filename_dirty = ni->vol->journal &&
+		(vi->i_sb->s_flags & SB_ACTIVE) &&
+		NInoTestClearFileNameDirty(ni);
+	err = ntfs_inode_journal_metadata(vi, filename_dirty,
+			&deferred_log);
+	if (err) {
+		if (filename_dirty)
+			NInoSetFileNameDirty(ni);
+		if (!deferred_log)
+			goto err_out;
+		/*
+		 * Admission failed before changing the MFT record.  Its existing
+		 * journaled image can still be written home to make reclaim progress.
+		 */
+		err = 0;
+	}
 
 	/* igrab prevents vi from being evicted while mrec_lock is hold. */
 	if (igrab(vi) != NULL)
@@ -2987,6 +5265,14 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 	}
 
 	if (NInoNonResident(ni) && NInoRunlistDirty(ni)) {
+		if (ni->vol->journal) {
+			ntfs_error(vi->i_sb,
+				"Refusing an unjournaled mapping-pairs write for inode 0x%llx.",
+				ni->mft_no);
+			NVolSetErrors(ni->vol);
+			err = -EIO;
+			goto unm_err_out;
+		}
 		down_write(&ni->runlist.lock);
 		err = ntfs_attr_update_mapping_pairs_locked(ni, 0, ni);
 		if (!err)
@@ -2994,7 +5280,8 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 		up_write(&ni->runlist.lock);
 	}
 
-	err = ntfs_inode_sync_standard_information(vi, m);
+	err = ni->vol->journal ? 0 :
+		ntfs_inode_sync_standard_information(NULL, vi, m);
 	if (err)
 		goto unm_err_out;
 
@@ -3006,7 +5293,8 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 	 * from umount fails because of a disk unplug and etc.
 	 * the absent of SB_ACTIVE means umounting.
 	 */
-	if ((vi->i_sb->s_flags & SB_ACTIVE) && NInoTestClearFileNameDirty(ni))
+	if (!ni->vol->journal && (vi->i_sb->s_flags & SB_ACTIVE) &&
+	    NInoTestClearFileNameDirty(ni))
 		ntfs_inode_sync_filename(ni);
 
 	/* Now the access times are updated, write the base mft record. */
@@ -3020,6 +5308,8 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 		err = write_mft_record(ni, m, sync);
 		if (err)
 			ntfs_error(vi->i_sb, "write_mft_record failed, err : %d\n", err);
+		if (deferred_log && NInoDirty(ni))
+			home_deferred = true;
 	}
 	unmap_mft_record(ni);
 
@@ -3030,12 +5320,14 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 		int i;
 
 		for (i = 0; i < ni->nr_extents; i++) {
-			err = ntfs_get_block_mft_record(mft_ni,
+			int ret = ntfs_get_block_mft_record(mft_ni,
 						   ni->ext.extent_ntfs_inos[i]);
-			if (err) {
+			if (ret) {
 				mutex_unlock(&ni->extent_lock);
 				up_read(&mft_ni->runlist.lock);
 				mutex_unlock(&ni->mrec_lock);
+				if (!err || err == -ENOMEM || err == -EAGAIN)
+					err = ret;
 				goto err_out;
 			}
 		}
@@ -3061,17 +5353,19 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 				tm = map_mft_record(tni);
 				if (IS_ERR(tm)) {
 					mutex_unlock(&tni->mrec_lock);
-					if (!err || err == -ENOMEM)
+					if (!err || err == -ENOMEM || err == -EAGAIN)
 						err = PTR_ERR(tm);
 					continue;
 				}
 
 				ret = write_mft_record(tni, tm, sync);
+				if (deferred_log && NInoDirty(tni))
+					home_deferred = true;
 				unmap_mft_record(tni);
 				mutex_unlock(&tni->mrec_lock);
 
 				if (unlikely(ret)) {
-					if (!err || err == -ENOMEM)
+					if (!err || err == -ENOMEM || err == -EAGAIN)
 						err = ret;
 				}
 			}
@@ -3082,6 +5376,13 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 
 	if (unlikely(err))
 		goto err_out;
+	if (deferred_log) {
+		__mark_mft_record_dirty(ni);
+		ntfs_log_end_inode_writeback(deferred_log, home_deferred);
+		if (need_iput)
+			iput(vi);
+		return -EAGAIN;
+	}
 	if (need_iput)
 		iput(vi);
 	ntfs_debug("Done.");
@@ -3090,11 +5391,18 @@ unm_err_out:
 	unmap_mft_record(ni);
 	mutex_unlock(&ni->mrec_lock);
 err_out:
-	if (err == -ENOMEM)
-		mark_inode_dirty(vi);
-	else {
+	/* Requeue the VFS inode even when its private MFT record stayed dirty. */
+	if (err == -ENOMEM || err == -EAGAIN) {
+		__mark_mft_record_dirty(ni);
+		if (deferred_log)
+			ntfs_log_end_inode_writeback(deferred_log, true);
+		else
+			ntfs_log_inode_writeback_deferred(ni->vol);
+	} else {
 		ntfs_error(vi->i_sb, "Failed (error %i):  Run chkdsk.", -err);
 		NVolSetErrors(ni->vol);
+		if (deferred_log)
+			ntfs_log_end_inode_writeback(deferred_log, true);
 	}
 	if (need_iput)
 		iput(vi);
@@ -4052,6 +6360,25 @@ static s64 __ntfs_inode_non_resident_attr_pwrite(struct inode *vi,
 					goto err_unlock_folio;
 				}
 
+				/*
+				 * The write range was allocated by
+				 * ntfs_enlarge_attribute() above, so a negative
+				 * lcn here means a hole, an out-of-bounds vcn, or
+				 * a runlist that could not be mapped.  Bail with
+				 * an error instead of deriving a bogus bi_sector
+				 * from the sentinel and tripping the block layer's
+				 * bio_add_page() WARN_ON.
+				 */
+				if (lcn < 0) {
+					ntfs_error(vi->i_sb,
+						"Invalid lcn %lld for vcn %lld of attr %#x; refusing to write.",
+						(long long)lcn, (long long)vcn,
+						ni->type);
+					ret = -EIO;
+					up_write(&ni->runlist.lock);
+					goto err_unlock_folio;
+				}
+
 				rl_length = rl->length - (vcn - rl->vcn);
 				if (rl_length < lcn_count) {
 					lcn_count -= rl_length;
@@ -4118,7 +6445,8 @@ err_unlock_folio:
 	return ret ? ret : written;
 }
 
-s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf, bool sync)
+static s64 __ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count,
+		u8 *buf, bool sync, bool grow)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_inode *base_ni = ni->ext.base_ntfs_ino;
@@ -4130,6 +6458,15 @@ s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf, bool s
 	bool modified = false;
 
 	WARN_ON(!NInoAttr(ni));
+	/* The journal already recorded the allocation and size change. */
+	if (!grow && (pos < 0 || count < 0 || pos > ni->data_size ||
+	    count > ni->data_size - pos || !NInoNonResident(ni)))
+		return -EINVAL;
+	if (sync && NInoNonResident(ni)) {
+		ret = ntfs_log_wait_inode(vi);
+		if (ret)
+			return ret;
+	}
 
 	if (ntfs_inode_is_named_stream(ni)) {
 		if (NInoEncrypted(ni))
@@ -4163,11 +6500,13 @@ s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf, bool s
 
 	old_data_size = ni->data_size;
 	old_init_size = ni->initialized_size;
-	ret = ntfs_enlarge_attribute(vi, pos, count, ctx);
-	modified = ni->data_size != old_data_size ||
-		   ni->initialized_size != old_init_size;
-	if (ret)
-		goto out_ctx;
+	if (grow) {
+		ret = ntfs_enlarge_attribute(vi, pos, count, ctx);
+		modified = ni->data_size != old_data_size ||
+			   ni->initialized_size != old_init_size;
+		if (ret)
+			goto out_ctx;
+	}
 
 	if (!NInoNonResident(ni)) {
 		ret = __ntfs_inode_resident_attr_pwrite(vi, pos, count, buf, ctx,
@@ -4180,14 +6519,14 @@ s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf, bool s
 	ntfs_attr_put_search_ctx(ctx);
 	mutex_unlock(&mrec_ni->mrec_lock);
 	/* Attribute writes bypass iomap's delayed-allocation preparation. */
-	if (ntfs_inode_is_named_stream(ni)) {
+	if (grow && ntfs_inode_is_named_stream(ni)) {
 		/*
 		 * A failed write must not expose any newly initialized
 		 * data.  The stream ioctl caller holds the mapping
 		 * invalidate lock.
 		 */
-		ret = __ntfs_extend_initialized_size(vi, pos + count,
-				pos + count);
+		ret = ntfs_extend_initialized_size_locked(vi, pos + count,
+				pos + count, !!ni->vol->journal);
 		modified |= ni->initialized_size != old_init_size;
 		if (!ret)
 			ret = ntfs_attr_fallocate(ni, pos, count, true);
@@ -4209,6 +6548,18 @@ out_unlock:
 	if (modified && ntfs_inode_is_named_stream(ni))
 		ntfs_stream_update_base_time(base_ni);
 	return ret;
+}
+
+s64 ntfs_inode_attr_pwrite(struct inode *vi, s64 pos, s64 count, u8 *buf,
+		bool sync)
+{
+	return __ntfs_inode_attr_pwrite(vi, pos, count, buf, sync, true);
+}
+
+s64 ntfs_inode_attr_pwrite_existing(struct inode *vi, s64 pos, s64 count,
+		u8 *buf, bool sync)
+{
+	return __ntfs_inode_attr_pwrite(vi, pos, count, buf, sync, false);
 }
 
 struct folio *ntfs_get_locked_folio(struct address_space *mapping,

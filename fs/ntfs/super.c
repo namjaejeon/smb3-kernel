@@ -2328,6 +2328,23 @@ start_writer:
 				-err);
 			NVolSetErrors(vol);
 			sb->s_flags |= SB_RDONLY;
+		} else if (NVolRecoveryNeeded(vol)) {
+			err = ntfs_recover_unlinked_inodes(vol);
+			if (err) {
+				int stop_err = ntfs_log_stop(vol, false);
+
+				ntfs_error(sb,
+					"Unlinked inode recovery failed (%d). Mounting read-only.",
+					-err);
+				if (stop_err)
+					ntfs_error(sb,
+						"Failed to stop $LogFile writer (%d).",
+						-stop_err);
+				NVolSetErrors(vol);
+				sb->s_flags |= SB_RDONLY;
+			} else if (!readonly_recovery) {
+				NVolClearRecoveryNeeded(vol);
+			}
 		}
 	} else if (!sb_rdonly(sb) && !NVolErrors(vol)) {
 		err = ntfs_start_unjournaled(vol);
@@ -2428,11 +2445,11 @@ static int ntfs_commit_inode_unmount(struct ntfs_volume *vol,
 
 	if (!vi || NVolShutdown(vol))
 		return 0;
-	err = __ntfs_write_inode(vi, 1);
+	err = ntfs_commit_inode(vi);
 	if (err == -EAGAIN && vol->journal) {
 		err = ntfs_log_reclaim_locked(vol);
 		if (!err)
-			err = __ntfs_write_inode(vi, 1);
+			err = ntfs_commit_inode(vi);
 	}
 	if (err) {
 		NVolSetErrors(vol);
@@ -3049,6 +3066,7 @@ static int ntfs_write_inode(struct inode *vi, struct writeback_control *wbc)
  */
 static const struct super_operations ntfs_sops = {
 	.alloc_inode	= ntfs_alloc_big_inode,	  /* VFS: Allocate new inode. */
+	.destroy_inode	= ntfs_destroy_big_inode,
 	.free_inode	= ntfs_free_big_inode, /* VFS: Deallocate inode. */
 	.drop_inode	= ntfs_drop_big_inode,
 	.write_inode	= ntfs_write_inode,	/* VFS: Write dirty inode to disk. */
