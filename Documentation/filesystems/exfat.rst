@@ -115,3 +115,81 @@ The following options are accepted for compatibility but should not be used:
 
 ``debug``, ``namecase=``, ``codepage=``
   Deprecated and ignored by the exFAT driver.
+
+
+Online allocation queries and relocation
+=======================================
+
+The UAPI in ``linux/exfat.h`` defines three native Linux ioctls for querying the
+volume bitmap, querying file extents and relocating file clusters. Issue them
+on an open file/directory in mounted exFAT, not on its block device. They
+require ``CAP_SYS_ADMIN`` in the initial user namespace. These operations
+correspond to Windows defragmentation FSCTLs, using a native Linux binary ABI.
+
+LCNs are zero-based offsets in the cluster heap: LCN zero is on-disk cluster
+two. VCNs are zero-based cluster offsets within a file. Positions and quantities
+are in clusters except explicitly named byte fields. All flags and reserved
+fields must be zero. Fixed-width fields and aligned 64-bit user pointers
+preserve the layout for compat ioctls.
+
+``EXFAT_IOC_GET_VOLUME_BITMAP``
+  Pass ``struct exfat_volume_bitmap`` on any exFAT file or directory fd.
+  ``start_lcn`` is rounded down to a byte boundary, except that a request at
+  ``total_clusters`` returns zero bytes. ``bitmap`` points to a byte array and
+  ``bitmap_bytes`` is its capacity, from 1 through 1 MiB. The least significant
+  bit represents the first cluster; one means allocated. Last-byte padding is
+  allocated. The header reports the actual start, total clusters, bytes
+  returned, cluster size and maximum clusters per move. Continue at
+  ``start_lcn + bytes_returned * 8`` until reaching the volume's end.
+
+``EXFAT_IOC_GET_RETRIEVAL_POINTERS``
+  Pass ``struct exfat_retrieval_pointers`` on a regular file fd. ``start_vcn``
+  selects the first cluster. ``extents`` points to an array of
+  ``struct exfat_extent`` and ``extent_capacity`` is from 1 through 4096.
+  Each extent gives its VCN, LCN and cluster count. The first starts at the
+  requested VCN; adjacent physical clusters are coalesced. Continue at
+  ``next_vcn`` while less than ``total_clusters``. Empty files return no extents;
+  allocation beyond VDL is included.
+
+``EXFAT_IOC_MOVE_FILE``
+  Pass ``struct exfat_move_file`` on a writable, linked regular file fd. Move
+  ``cluster_count`` clusters at ``start_vcn`` to the free range at ``target_lcn``.
+  ``expected_lcn`` must match the current first source cluster or the request
+  fails with ``ESTALE``. An occupied destination fails with ``EBUSY``.
+  A move is bounded to 32 MiB; split larger ranges using the bitmap query's
+  ``max_move_clusters``. Partial FAT-chain moves are supported. Materialising a
+  NoFatChain file's original FAT is bounded to 32 MiB of allocation; larger
+  NoFatChain files return ``E2BIG`` and already need no defragmentation.
+  Directories, swap files, unlinked files, vendor-extension files, TexFAT,
+  read-only mounts and persistent dirty/media failure flags are rejected.
+  An identical source/destination range is a no-op.
+
+Queries are snapshots. Different pages can observe different states as files
+change. Callers must handle stale mappings, changed sizes and newly occupied
+destinations. The driver revalidates moves and reserves exact destinations.
+
+Relocation takes the inode lock, waits for direct I/O, and holds the mapping's
+invalidate lock while revoking mmap PTEs, writing back and invalidating folios.
+Renames, allocation and FAT/directory updates are serialised by ``s_lock``;
+bitmap changes also use ``bitmap_lock``. Destination data and allocation are
+flushed before switching the file reference. The reference is flushed before
+releasing source bitmap bits. FAT caches and inode hints are invalidated.
+Source blocks are not discarded by this operation.
+
+No on-disk journal is added. This does not make exFAT transactional or guarantee
+atomic recovery from power loss or torn sectors. Interruption can leave orphan
+allocations or a directory checksum requiring fsck. Once publication may have
+started, an I/O error keeps both allocations. Metadata I/O errors preserve
+VolumeDirty and force filesystem shutdown to prevent further writes. Unmount
+and run fsck before reuse. An ioctl error does not prove that no metadata
+reached disk.
+
+If a directory entry write or flush fails, the driver tries once to complete
+the same entry set. Destination data and allocation are already durable at
+publication, or the entry still names the original allocation during
+NoFatChain conversion. This bounded repair includes the checksum, since fsck
+can delete an entry with an invalid checksum. It does not release uncertain
+allocations, suppress the original error or allow further filesystem writes.
+Persistent failures and power loss can still damage directory entries.
+
+The exfatprogs defrag.exfat utility supplies placement policy.

@@ -679,6 +679,12 @@ long exfat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return exfat_ioctl_get_volume_label(inode->i_sb, arg);
 	case FS_IOC_SETFSLABEL:
 		return exfat_ioctl_set_volume_label(inode->i_sb, arg);
+	case EXFAT_IOC_GET_VOLUME_BITMAP:
+		return exfat_ioctl_get_volume_bitmap(filp, (void __user *)arg);
+	case EXFAT_IOC_GET_RETRIEVAL_POINTERS:
+		return exfat_ioctl_get_retrieval_pointers(filp, (void __user *)arg);
+	case EXFAT_IOC_MOVE_FILE:
+		return exfat_ioctl_move_file(filp, (void __user *)arg);
 	default:
 		return -ENOTTY;
 	}

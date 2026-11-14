@@ -10033,6 +10033,7 @@ S:	Maintained
 T:	git git://git.kernel.org/pub/scm/linux/kernel/git/linkinjeon/exfat.git
 F:	Documentation/filesystems/exfat.rst
 F:	fs/exfat/
+F:	include/uapi/linux/exfat.h
 
 EXPRESSWIRE PROTOCOL LIBRARY
 M:	Duje Mihanović <duje.mihanovic@skole.hr>

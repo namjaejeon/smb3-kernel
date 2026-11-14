@@ -625,6 +625,11 @@ long exfat_compat_ioctl(struct file *filp, unsigned int cmd,
 				unsigned long arg);
 int exfat_force_shutdown(struct super_block *sb, u32 flags);
 
+/* defrag.c */
+long exfat_ioctl_get_volume_bitmap(struct file *file, void __user *arg);
+long exfat_ioctl_get_retrieval_pointers(struct file *file, void __user *arg);
+long exfat_ioctl_move_file(struct file *file, void __user *arg);
+
 /* namei.c */
 extern const struct dentry_operations exfat_dentry_ops;
 extern const struct dentry_operations exfat_utf8_dentry_ops;
