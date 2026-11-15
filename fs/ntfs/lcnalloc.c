@@ -844,12 +844,16 @@ done:
 
 		if (!used_zone_pos) {
 			/*
-			 * The run at @start_lcn reached the end of the buffer
-			 * or the zone.  A contiguous request gets that run
-			 * alone, not a second one from the zone position.
+			 * Continue a contiguous hinted run on the next bitmap
+			 * page, but do not switch zones after finding a run.
 			 */
-			if (is_contig && rlpos)
+			if (is_contig && rlpos) {
+				if (lcn == buf_size && bmp_pos + lcn < zone_end) {
+					bmp_pos += buf_size;
+					continue;
+				}
 				goto out;
+			}
 			/*
 			 * Leaving @start_lcn for the zone position starts the
 			 * zone over as if no hint had been given, even if the
