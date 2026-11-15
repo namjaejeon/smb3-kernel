@@ -734,9 +734,11 @@ long exfat_ioctl_move_file(struct file *file, void __user *arg)
 	ret = filemap_write_and_wait(mapping);
 	if (ret)
 		goto unlock;
-	ret = invalidate_inode_pages2(mapping);
-	if (ret)
+	invalidate_mapping_pages(mapping, 0, -1);
+	if (mapping->nrpages) {
+		ret = -EBUSY;
 		goto unlock;
+	}
 	ret = write_inode_now(inode, 1);
 	if (ret)
 		goto unlock;
