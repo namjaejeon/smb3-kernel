@@ -16,6 +16,7 @@
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/sizes.h>
+#include <linux/swap.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/vmalloc.h>
@@ -734,6 +735,8 @@ long exfat_ioctl_move_file(struct file *file, void __user *arg)
 	ret = filemap_write_and_wait(mapping);
 	if (ret)
 		goto unlock;
+	/* Drop temporary LRU references before checking for external pins. */
+	lru_add_drain_all();
 	invalidate_mapping_pages(mapping, 0, -1);
 	if (mapping->nrpages) {
 		ret = -EBUSY;
