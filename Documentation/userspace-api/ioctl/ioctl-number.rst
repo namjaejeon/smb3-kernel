@@ -225,6 +225,7 @@ Code  Seq#    Include File                                             Comments
              include/linux/falloc.h,
              linux/fs.h,
 'X'   all    fs/ocfs2/ocfs_fs.h                                        conflict!
+'X'   7D-81  linux/exfat.h                                            conflict!
 'Z'   14-15  drivers/message/fusion/mptctl.h
 '['   00-3F  linux/usb/tmc.h                                           USB Test and Measurement Devices
                                                                        <mailto:gregkh@linuxfoundation.org>

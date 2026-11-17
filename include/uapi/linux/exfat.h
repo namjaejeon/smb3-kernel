@@ -68,13 +68,16 @@ struct exfat_move_file {
 
 /*
  * Issued on an open file/directory in the mounted filesystem, not its block
- * device. All require CAP_SYS_ADMIN. MOVE_FILE also requires a writable,
- * linked regular file. Bitmap snapshots can become stale immediately.
+ * device. All require CAP_SYS_ADMIN. MOVE_FILE and SET_NO_FAT_CHAIN also
+ * require a writable, linked regular file. Bitmap snapshots can become stale
+ * immediately.
  */
 #define EXFAT_IOC_GET_VOLUME_BITMAP \
 	_IOWR('X', 126, struct exfat_volume_bitmap)
 #define EXFAT_IOC_GET_RETRIEVAL_POINTERS \
 	_IOWR('X', 127, struct exfat_retrieval_pointers)
 #define EXFAT_IOC_MOVE_FILE _IOW('X', 128, struct exfat_move_file)
+/* No argument. Verify the complete allocation; EAGAIN if not contiguous. */
+#define EXFAT_IOC_SET_NO_FAT_CHAIN _IO('X', 129)
 
 #endif /* _UAPI_LINUX_EXFAT_H */

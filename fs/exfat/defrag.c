@@ -222,6 +222,7 @@ struct exfat_move {
 	bool reserved;
 	bool publishing;
 	bool metadata_error;
+	bool no_fat_chain;
 };
 
 static int exfat_compare_cluster(const void *a, const void *b)
@@ -600,8 +601,12 @@ static int exfat_move_publish(struct exfat_move *move)
 	} else {
 		stream = exfat_get_dentry_cached(&move->es, ES_IDX_STREAM);
 		stream->dentry.stream.start_clu = cpu_to_le32(move->target);
+		if (move->no_fat_chain)
+			stream->dentry.stream.flags = ALLOC_NO_FAT_CHAIN;
 		ret = exfat_move_commit_entries(move);
 		ei->start_clu = move->target;
+		if (move->no_fat_chain)
+			ei->flags = ALLOC_NO_FAT_CHAIN;
 	}
 	exfat_cache_inval_inode(inode);
 	ei->hint_bmap.off = 0;
@@ -609,14 +614,10 @@ static int exfat_move_publish(struct exfat_move *move)
 	return ret;
 }
 
-static int exfat_move_locked(struct exfat_move *move,
-			     const struct exfat_move_file *req)
+static int exfat_move_check_inode(struct inode *inode)
 {
-	struct inode *inode = move->inode;
 	struct super_block *sb = inode->i_sb;
 	struct exfat_sb_info *sbi = EXFAT_SB(sb);
-	unsigned int i;
-	int ret, cleanup;
 
 	if (exfat_forced_shutdown(sb))
 		return -EIO;
@@ -630,6 +631,21 @@ static int exfat_move_locked(struct exfat_move *move,
 		return -EOPNOTSUPP;
 	if (sbi->vol_flags_persistent & (VOLUME_DIRTY | MEDIA_FAILURE))
 		return -EUCLEAN;
+	return 0;
+}
+
+static int exfat_move_locked(struct exfat_move *move,
+			     const struct exfat_move_file *req)
+{
+	struct inode *inode = move->inode;
+	struct super_block *sb = inode->i_sb;
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	unsigned int i;
+	int ret, cleanup;
+
+	ret = exfat_move_check_inode(inode);
+	if (ret)
+		return ret;
 	ret = exfat_move_read_source(move, req);
 	if (ret)
 		return ret;
@@ -638,8 +654,9 @@ static int exfat_move_locked(struct exfat_move *move,
 			break;
 	if (i == move->count)
 		return 0;
+	move->no_fat_chain = !req->start_vcn && move->count == move->total;
 	/* Bound the FAT materialisation needed for partial NoFatChain moves. */
-	if (EXFAT_I(inode)->flags == ALLOC_NO_FAT_CHAIN &&
+	if (!move->no_fat_chain && EXFAT_I(inode)->flags == ALLOC_NO_FAT_CHAIN &&
 	    move->total > exfat_max_move_clusters(sbi))
 		return -E2BIG;
 	ret = exfat_move_get_entries(move);
@@ -648,11 +665,6 @@ static int exfat_move_locked(struct exfat_move *move,
 	ret = exfat_move_reserve(move);
 	if (ret)
 		goto out;
-	ret = exfat_move_convert_chain(move);
-	if (ret) {
-		move->metadata_error = true;
-		goto out;
-	}
 	ret = exfat_move_copy(move, req->start_vcn);
 	if (ret)
 		goto out;
@@ -660,7 +672,16 @@ static int exfat_move_locked(struct exfat_move *move,
 		ret = -EINTR;
 		goto out;
 	}
-	ret = exfat_move_fat_run(sb, move->target, move->count, move->after);
+	if (!move->no_fat_chain) {
+		ret = exfat_move_convert_chain(move);
+		if (ret) {
+			move->metadata_error = true;
+			goto out;
+		}
+	}
+	ret = 0;
+	if (!move->no_fat_chain)
+		ret = exfat_move_fat_run(sb, move->target, move->count, move->after);
 	if (!ret)
 		ret = exfat_move_sync_bitmap(move, true);
 	if (ret) {
@@ -684,15 +705,72 @@ out:
 			move->metadata_error = true;
 		}
 	}
-	if (move->metadata_error) {
-		sbi->vol_flags_persistent |= VOLUME_DIRTY;
-		exfat_force_shutdown(sb, EXFAT_GOING_DOWN_NOSYNC);
-		exfat_fs_error(sb, "relocation metadata write failed; run fsck before reuse");
-	}
 	return ret;
 }
 
-long exfat_ioctl_move_file(struct file *file, void __user *arg)
+/* Check once after a placement plan, rather than after every bounded move. */
+static int exfat_set_no_fat_chain_locked(struct exfat_move *move)
+{
+	struct inode *inode = move->inode;
+	struct super_block *sb = inode->i_sb;
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	struct exfat_inode_info *ei = EXFAT_I(inode);
+	struct exfat_dentry *stream;
+	struct buffer_head *bh = NULL;
+	unsigned int total, i, next, expected;
+	int ret;
+
+	ret = exfat_move_check_inode(inode);
+	if (ret)
+		return ret;
+	if (ei->flags == ALLOC_NO_FAT_CHAIN)
+		return 0;
+	total = exfat_bytes_to_cluster(sbi, exfat_ondisk_size(inode));
+	if (!total)
+		return 0;
+	if (!is_valid_cluster(sbi, ei->start_clu))
+		return -EIO;
+	if (total > sbi->num_clusters - ei->start_clu)
+		return -EAGAIN;
+	for (i = 0; i < total; i++) {
+		if (signal_pending(current)) {
+			ret = -EINTR;
+			goto out;
+		}
+		ret = exfat_ent_get(sb, ei->start_clu + i, &next, &bh);
+		if (ret)
+			goto out;
+		expected = i + 1 < total ? ei->start_clu + i + 1 : EXFAT_EOF_CLUSTER;
+		if (next != expected) {
+			ret = -EAGAIN;
+			goto out;
+		}
+		cond_resched();
+	}
+	ret = exfat_move_get_entries(move);
+	if (ret)
+		goto out;
+	exfat_set_volume_dirty(sb);
+	ret = buffer_write_io_error(sbi->boot_bh) ? -EIO :
+		blkdev_issue_flush(sb->s_bdev);
+	if (ret) {
+		move->metadata_error = true;
+		goto out;
+	}
+	stream = exfat_get_dentry_cached(&move->es, ES_IDX_STREAM);
+	stream->dentry.stream.flags = ALLOC_NO_FAT_CHAIN;
+	ret = exfat_move_commit_entries(move);
+	/* Both representations name the same clusters, including on write error. */
+	ei->flags = ALLOC_NO_FAT_CHAIN;
+	exfat_cache_inval_inode(inode);
+	ei->hint_bmap.off = 0;
+	ei->hint_bmap.clu = ei->start_clu;
+out:
+	brelse(bh);
+	return ret;
+}
+
+static long exfat_ioctl_relocate(struct file *file, void __user *arg, bool convert)
 {
 	struct inode *inode = file_inode(file);
 	struct address_space *mapping = inode->i_mapping;
@@ -707,22 +785,24 @@ long exfat_ioctl_move_file(struct file *file, void __user *arg)
 		return -EOPNOTSUPP;
 	if (!(file->f_mode & FMODE_WRITE))
 		return -EBADF;
-	if (copy_from_user(&req, arg, sizeof(req)))
-		return -EFAULT;
-	if (req.flags || req.reserved || !req.cluster_count ||
-	    req.cluster_count > exfat_max_move_clusters(sbi) ||
-	    req.target_lcn >= EXFAT_DATA_CLUSTER_COUNT(sbi) ||
-	    req.cluster_count > EXFAT_DATA_CLUSTER_COUNT(sbi) - req.target_lcn)
-		return -EINVAL;
+	if (!convert) {
+		if (copy_from_user(&req, arg, sizeof(req)))
+			return -EFAULT;
+		if (req.flags || req.reserved || !req.cluster_count ||
+		    req.cluster_count > exfat_max_move_clusters(sbi) ||
+		    req.target_lcn >= EXFAT_DATA_CLUSTER_COUNT(sbi) ||
+		    req.cluster_count > EXFAT_DATA_CLUSTER_COUNT(sbi) - req.target_lcn)
+			return -EINVAL;
 
-	move.count = req.cluster_count;
-	move.target = req.target_lcn + EXFAT_RESERVED_CLUSTERS;
-	move.source = kvmalloc_objs(*move.source, move.count, GFP_KERNEL);
-	move.sorted = kvmalloc_objs(*move.sorted, move.count, GFP_KERNEL);
-	move.buffer = kmalloc(EXFAT_COPY_BYTES, GFP_KERNEL);
-	if (!move.source || !move.sorted || !move.buffer) {
-		ret = -ENOMEM;
-		goto free;
+		move.count = req.cluster_count;
+		move.target = req.target_lcn + EXFAT_RESERVED_CLUSTERS;
+		move.source = kvmalloc_objs(*move.source, move.count, GFP_KERNEL);
+		move.sorted = kvmalloc_objs(*move.sorted, move.count, GFP_KERNEL);
+		move.buffer = kmalloc(EXFAT_COPY_BYTES, GFP_KERNEL);
+		if (!move.source || !move.sorted || !move.buffer) {
+			ret = -ENOMEM;
+			goto free;
+		}
 	}
 	ret = mnt_want_write_file(file);
 	if (ret)
@@ -731,16 +811,19 @@ long exfat_ioctl_move_file(struct file *file, void __user *arg)
 	inode_dio_wait(inode);
 	filemap_invalidate_lock(mapping);
 	/* Revoke writable PTEs; new read/write faults wait on invalidate_lock. */
-	unmap_mapping_range(mapping, 0, 0, 0);
+	if (!convert)
+		unmap_mapping_range(mapping, 0, 0, 0);
 	ret = filemap_write_and_wait(mapping);
 	if (ret)
 		goto unlock;
 	/* Drop temporary LRU references before checking for external pins. */
-	lru_add_drain_all();
-	invalidate_mapping_pages(mapping, 0, -1);
-	if (mapping->nrpages) {
-		ret = -EBUSY;
-		goto unlock;
+	if (!convert) {
+		lru_add_drain_all();
+		invalidate_mapping_pages(mapping, 0, -1);
+		if (mapping->nrpages) {
+			ret = -EBUSY;
+			goto unlock;
+		}
 	}
 	ret = write_inode_now(inode, 1);
 	if (ret)
@@ -753,7 +836,14 @@ long exfat_ioctl_move_file(struct file *file, void __user *arg)
 		goto unlock;
 
 	mutex_lock(&sbi->s_lock);
-	ret = exfat_move_locked(&move, &req);
+	ret = convert ? exfat_set_no_fat_chain_locked(&move) :
+		exfat_move_locked(&move, &req);
+	if (move.metadata_error) {
+		sbi->vol_flags_persistent |= VOLUME_DIRTY;
+		exfat_force_shutdown(inode->i_sb, EXFAT_GOING_DOWN_NOSYNC);
+		exfat_fs_error(inode->i_sb,
+			       "relocation metadata write failed; run fsck before reuse");
+	}
 	if (move.have_entries)
 		exfat_put_dentry_set(&move.es, false);
 	mutex_unlock(&sbi->s_lock);
@@ -766,4 +856,14 @@ free:
 	kvfree(move.sorted);
 	kvfree(move.source);
 	return ret;
+}
+
+long exfat_ioctl_move_file(struct file *file, void __user *arg)
+{
+	return exfat_ioctl_relocate(file, arg, false);
+}
+
+long exfat_ioctl_set_no_fat_chain(struct file *file)
+{
+	return exfat_ioctl_relocate(file, NULL, true);
 }

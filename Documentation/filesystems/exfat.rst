@@ -120,7 +120,7 @@ The following options are accepted for compatibility but should not be used:
 Online allocation queries and relocation
 =======================================
 
-The UAPI in ``linux/exfat.h`` defines three native Linux ioctls for querying the
+The UAPI in ``linux/exfat.h`` defines native Linux ioctls for querying the
 volume bitmap, querying file extents and relocating file clusters. Issue them
 on an open file/directory in mounted exFAT, not on its block device. They
 require ``CAP_SYS_ADMIN`` in the initial user namespace. These operations
@@ -160,9 +160,26 @@ preserve the layout for compat ioctls.
   ``max_move_clusters``. Partial FAT-chain moves are supported. Materialising a
   NoFatChain file's original FAT is bounded to 32 MiB of allocation; larger
   NoFatChain files return ``E2BIG`` and already need no defragmentation.
+  Moving the complete allocation in one request publishes a NoFatChain stream
+  directly, without materialising either the source or destination FAT chain.
   Directories, swap files, unlinked files, vendor-extension files, TexFAT,
   read-only mounts and persistent dirty/media failure flags are rejected.
   An identical source/destination range is a no-op.
+
+``EXFAT_IOC_SET_NO_FAT_CHAIN``
+  Takes no argument and requires a writable, linked regular file fd. The kernel
+  verifies the complete allocation, including the FAT end marker, while holding
+  the inode and filesystem locks. If contiguous, it commits the NoFatChain flag
+  and directory checksum without moving data or clearing existing FAT entries.
+  An empty or already NoFatChain file is a no-op. A fragmented allocation returns
+  ``EAGAIN`` without changing its representation. The restrictions on files
+  eligible for relocation also apply to this operation.
+
+  Call once after a placement plan has produced a single extent, including when
+  the plan required several bounded moves. Verification takes time proportional
+  to the file's allocated clusters; it is not repeated by individual moves and
+  can be interrupted before the metadata update. A stale userspace extent
+  snapshot cannot cause a fragmented file to acquire the NoFatChain flag.
 
 Queries are snapshots. Different pages can observe different states as files
 change. Callers must handle stale mappings, changed sizes and newly occupied

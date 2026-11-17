@@ -629,6 +629,7 @@ int exfat_force_shutdown(struct super_block *sb, u32 flags);
 long exfat_ioctl_get_volume_bitmap(struct file *file, void __user *arg);
 long exfat_ioctl_get_retrieval_pointers(struct file *file, void __user *arg);
 long exfat_ioctl_move_file(struct file *file, void __user *arg);
+long exfat_ioctl_set_no_fat_chain(struct file *file);
 
 /* namei.c */
 extern const struct dentry_operations exfat_dentry_ops;

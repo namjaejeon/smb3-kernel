@@ -685,6 +685,8 @@ long exfat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return exfat_ioctl_get_retrieval_pointers(filp, (void __user *)arg);
 	case EXFAT_IOC_MOVE_FILE:
 		return exfat_ioctl_move_file(filp, (void __user *)arg);
+	case EXFAT_IOC_SET_NO_FAT_CHAIN:
+		return exfat_ioctl_set_no_fat_chain(filp);
 	default:
 		return -ENOTTY;
 	}
