@@ -28,6 +28,7 @@
 #define EXFAT_BITMAP_MAX_BYTES	SZ_1M
 #define EXFAT_EXTENTS_MAX	4096
 #define EXFAT_COPY_BYTES		SZ_64K
+#define EXFAT_FAT_BATCH_BYTES	SZ_64K
 
 static unsigned int exfat_max_move_clusters(struct exfat_sb_info *sbi)
 {
@@ -564,6 +565,70 @@ static int exfat_move_copy(struct exfat_move *move, unsigned int start_vcn)
 	return blkdev_issue_flush(sb->s_bdev);
 }
 
+static int exfat_move_check_inode(struct inode *inode);
+
+/* Keep the stream NoFatChain until every source FAT entry is durable. */
+static int exfat_move_materialize_chain(struct exfat_move *move)
+{
+	struct inode *inode = move->inode;
+	struct super_block *sb = inode->i_sb;
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	struct exfat_inode_info *ei = EXFAT_I(inode);
+	unsigned int first = ei->start_clu, done = 0, count, i, after;
+	int ret;
+
+	if (!is_valid_cluster(sbi, first) || move->total > sbi->num_clusters - first)
+		return -EIO;
+	/* Do not retain a directory entry set across the s_lock handoffs. */
+	exfat_put_dentry_set(&move->es, false);
+	move->have_entries = false;
+	while (done < move->total) {
+		ret = exfat_move_check_inode(inode);
+		if (ret) {
+			if (exfat_forced_shutdown(sb) || sb_rdonly(sb))
+				move->metadata_error = true;
+			return ret;
+		}
+		if (signal_pending(current))
+			return -EINTR;
+		if (ei->flags != ALLOC_NO_FAT_CHAIN || ei->start_clu != first ||
+		    exfat_bytes_to_cluster(sbi, exfat_ondisk_size(inode)) != move->total)
+			return -ESTALE;
+		count = min_t(unsigned int, move->total - done,
+			      EXFAT_FAT_BATCH_BYTES / sizeof(__le32));
+		ret = 0;
+		mutex_lock(&sbi->bitmap_lock);
+		for (i = 0; i < count; i++) {
+			if (!exfat_test_bitmap(sb, first + done + i)) {
+				ret = -EUCLEAN;
+				break;
+			}
+		}
+		mutex_unlock(&sbi->bitmap_lock);
+		if (ret)
+			return ret;
+		after = done + count < move->total ? first + done + count : EXFAT_EOF_CLUSTER;
+		ret = exfat_move_fat_run(sb, first + done, count, after);
+		if (ret) {
+			move->metadata_error = true;
+			return ret;
+		}
+		done += count;
+		if (done < move->total) {
+			/* inode_lock and invalidate_lock keep this allocation fixed. */
+			mutex_unlock(&sbi->s_lock);
+			cond_resched();
+			mutex_lock(&sbi->s_lock);
+		}
+	}
+	if (signal_pending(current))
+		return -EINTR;
+	ret = exfat_move_check_inode(inode);
+	if (ret && (exfat_forced_shutdown(sb) || sb_rdonly(sb)))
+		move->metadata_error = true;
+	return ret;
+}
+
 static int exfat_move_convert_chain(struct exfat_move *move)
 {
 	struct inode *inode = move->inode;
@@ -573,10 +638,15 @@ static int exfat_move_convert_chain(struct exfat_move *move)
 
 	if (ei->flags != ALLOC_NO_FAT_CHAIN)
 		return 0;
-	ret = exfat_move_fat_run(inode->i_sb, ei->start_clu, move->total,
-				 EXFAT_EOF_CLUSTER);
+	ret = exfat_move_materialize_chain(move);
 	if (ret)
 		return ret;
+	ret = exfat_move_get_entries(move);
+	if (ret) {
+		if (ret == -EIO)
+			move->metadata_error = true;
+		return ret;
+	}
 	stream = exfat_get_dentry_cached(&move->es, ES_IDX_STREAM);
 	stream->dentry.stream.flags = ALLOC_FAT_CHAIN;
 	ret = exfat_move_commit_entries(move);
@@ -639,7 +709,6 @@ static int exfat_move_locked(struct exfat_move *move,
 {
 	struct inode *inode = move->inode;
 	struct super_block *sb = inode->i_sb;
-	struct exfat_sb_info *sbi = EXFAT_SB(sb);
 	unsigned int i;
 	int ret, cleanup;
 
@@ -655,10 +724,6 @@ static int exfat_move_locked(struct exfat_move *move,
 	if (i == move->count)
 		return 0;
 	move->no_fat_chain = !req->start_vcn && move->count == move->total;
-	/* Bound the FAT materialisation needed for partial NoFatChain moves. */
-	if (!move->no_fat_chain && EXFAT_I(inode)->flags == ALLOC_NO_FAT_CHAIN &&
-	    move->total > exfat_max_move_clusters(sbi))
-		return -E2BIG;
 	ret = exfat_move_get_entries(move);
 	if (ret)
 		return ret;
@@ -674,10 +739,12 @@ static int exfat_move_locked(struct exfat_move *move,
 	}
 	if (!move->no_fat_chain) {
 		ret = exfat_move_convert_chain(move);
-		if (ret) {
-			move->metadata_error = true;
+		if (ret)
 			goto out;
-		}
+	}
+	if (signal_pending(current)) {
+		ret = -EINTR;
+		goto out;
 	}
 	ret = 0;
 	if (!move->no_fat_chain)

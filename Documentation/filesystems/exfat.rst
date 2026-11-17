@@ -157,9 +157,13 @@ preserve the layout for compat ioctls.
   ``expected_lcn`` must match the current first source cluster or the request
   fails with ``ESTALE``. An occupied destination fails with ``EBUSY``.
   A move is bounded to 32 MiB; split larger ranges using the bitmap query's
-  ``max_move_clusters``. Partial FAT-chain moves are supported. Materialising a
-  NoFatChain file's original FAT is bounded to 32 MiB of allocation; larger
-  NoFatChain files return ``E2BIG`` and already need no defragmentation.
+  ``max_move_clusters``. Partial FAT-chain and NoFatChain moves are supported
+  regardless of the complete allocation's size. Before a partial NoFatChain
+  move, the kernel materialises the original FAT chain in batches of at most
+  64 KiB of FAT entries. The stream remains NoFatChain until the complete chain
+  is durable. Construction takes time proportional to the file's allocated
+  clusters, uses bounded memory and can be interrupted before the flag update.
+  Later partial moves reuse the FAT chain.
   Moving the complete allocation in one request publishes a NoFatChain stream
   directly, without materialising either the source or destination FAT chain.
   Directories, swap files, unlinked files, vendor-extension files, TexFAT,
@@ -188,7 +192,9 @@ destinations. The driver revalidates moves and reserves exact destinations.
 Relocation takes the inode lock, waits for direct I/O, and holds the mapping's
 invalidate lock while revoking mmap PTEs, writing back and invalidating folios.
 Renames, allocation and FAT/directory updates are serialised by ``s_lock``;
-bitmap changes also use ``bitmap_lock``. Destination data and allocation are
+bitmap changes also use ``bitmap_lock``. Large NoFatChain FAT construction
+releases ``s_lock`` between durable batches, retaining the inode and mapping
+locks to keep the source allocation fixed. Destination data and allocation are
 flushed before switching the file reference. The reference is flushed before
 releasing source bitmap bits. FAT caches and inode hints are invalidated.
 Source blocks are not discarded by this operation.
