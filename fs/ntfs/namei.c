@@ -1575,7 +1575,7 @@ int ntfs_reclaim_deleted_attributes(struct ntfs_inode *ni, bool recovery)
 		attr = ctx->attr;
 		if (!attr->non_resident ||
 		    !ntfs_deleted_attribute_reclaimable(attr->type,
-			    attr->name_length) ||
+			    attr->name_length, recovery) ||
 		    le64_to_cpu(attr->data.non_resident.lowest_vcn))
 			continue;
 		attr_len = le32_to_cpu(attr->length);

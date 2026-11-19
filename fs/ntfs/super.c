@@ -2527,7 +2527,8 @@ static void ntfs_put_super(struct super_block *sb)
 
 	had_journal = !!vol->journal;
 	if (had_journal) {
-		err = ntfs_log_stop(vol, !NVolErrors(vol) && !NVolShutdown(vol));
+		err = ntfs_log_stop(vol, !NVolErrors(vol) && !NVolShutdown(vol) &&
+				   !NVolRecoveryNeeded(vol));
 		if (!NVolShutdown(vol) || err != -EROFS)
 			ntfs_unmount_io_error(vol, "stop the journal", err);
 	}

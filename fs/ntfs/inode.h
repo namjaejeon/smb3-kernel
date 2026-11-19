@@ -375,7 +375,7 @@ void ntfs_destroy_big_inode(struct inode *inode);
 void ntfs_free_big_inode(struct inode *inode);
 int ntfs_drop_big_inode(struct inode *inode);
 void ntfs_evict_big_inode(struct inode *vi);
-bool ntfs_deleted_attribute_reclaimable(__le32 type, u8 name_len);
+bool ntfs_deleted_attribute_reclaimable(__le32 type, u8 name_len, bool recovery);
 int ntfs_reclaim_deleted_attribute(struct inode *vi);
 int ntfs_reclaim_deleted_attributes(struct ntfs_inode *ni, bool recovery);
 int ntfs_recover_unlinked_inodes(struct ntfs_volume *vol);
