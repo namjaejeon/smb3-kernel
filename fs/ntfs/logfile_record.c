@@ -1460,9 +1460,9 @@ static int ntfs_log_raw_write_fua(struct ntfs_log *log, u64 file_off,
 		if (err)
 			break;
 
-		/* Only the final extent carries the durability flags. */
+		/* The final extent also makes any earlier extents durable. */
 		if (done + len == bytes)
-			op |= REQ_FUA | (preflush ? REQ_PREFLUSH : 0);
+			op |= REQ_FUA | ((preflush || done) ? REQ_PREFLUSH : 0);
 		err = bdev_rw_virt(log->vol->sb->s_bdev,
 				dev_off >> SECTOR_SHIFT, data + done, len, op);
 		if (err)
@@ -2484,11 +2484,20 @@ static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
 			page->data;
 
 		if (page->has_terminal) {
-			/* Other readers can act on these records before the fence. */
-			err = ntfs_log_sync_logfile_pages(log);
+			bool buffered = log->pending_bdev_range_valid;
+			bool preflush = buffered || list_is_first(&page->list, &pages);
+
+			/*
+			 * Other readers can act on these records before the batch
+			 * marker. The first preflush orders any data writes, then
+			 * consecutive FUA writes keep the log prefix durable.
+			 */
+			if (buffered)
+				err = ntfs_log_sync_logfile_pages(log);
 			if (!err)
 				err = ntfs_log_raw_write_fua(log, page->file_off, data,
-							   log->layout.page_size, true);
+							   log->layout.page_size,
+							   preflush);
 		} else {
 			err = ntfs_log_raw_write(log, page->file_off, data,
 						log->layout.page_size, false);
