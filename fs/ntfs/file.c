@@ -592,6 +592,26 @@ static void ntfs_protect_mmap_eof(struct inode *vi, loff_t old_size)
 	folio_put(folio);
 }
 
+static bool ntfs_truncate_has_delalloc(struct ntfs_inode *ni, loff_t size)
+{
+	const struct runlist_element *rl;
+	s64 last_vcn = ntfs_bytes_to_cluster(ni->vol, size - 1);
+	bool found = false;
+
+	down_read(&ni->runlist.lock);
+	if (ni->i_dealloc_clusters) {
+		for (rl = ni->runlist.rl; rl && rl->length && rl->vcn <= last_vcn;
+		     rl++) {
+			if (rl->lcn == LCN_DELALLOC) {
+				found = true;
+				break;
+			}
+		}
+	}
+	up_read(&ni->runlist.lock);
+	return found;
+}
+
 int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
@@ -599,6 +619,7 @@ int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 	bool stream = ntfs_inode_is_named_stream(ni);
 	int err;
 	loff_t old_size = vi->i_size;
+	loff_t kept_size = min(old_size, attr->ia_size);
 
 	if (stream && NVolShutdown(ni->vol))
 		return -EIO;
@@ -636,10 +657,15 @@ int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 	} else {
 		filemap_invalidate_lock(vi->i_mapping);
 	}
-	if (ni->vol->journal && S_ISREG(vi->i_mode) &&
-	    NInoNonResident(ni) && old_size && attr->ia_size) {
-		err = filemap_write_and_wait_range(vi->i_mapping, 0,
-				min(old_size, attr->ia_size) - 1);
+	/*
+	 * Materialize delayed allocations retained by the new EOF. Ordinary
+	 * overwrites of initialized clusters can follow normal writeback.
+	 */
+	if (!stream && ni->vol->journal && S_ISREG(vi->i_mode) &&
+	    NInoNonResident(ni) && kept_size &&
+	    (NInoPendingEmptyEof(ni) ||
+	     ntfs_truncate_has_delalloc(ni, kept_size))) {
+		err = filemap_write_and_wait_range(vi->i_mapping, 0, kept_size - 1);
 		if (err)
 			goto out_unlock_mapping;
 	}
