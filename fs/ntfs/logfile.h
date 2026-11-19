@@ -287,6 +287,7 @@ int ntfs_log_track_inode(struct ntfs_log_handle *handle, struct inode *vi,
 int ntfs_log_wait_inode(struct inode *vi);
 int ntfs_log_writeback_inode(struct inode *vi, bool sync);
 int ntfs_log_flush(struct ntfs_volume *vol);
+int ntfs_log_fsync(struct ntfs_volume *vol);
 void ntfs_log_account_metadata_home_flush(u64 nanoseconds);
 void ntfs_log_account_unmount_final_flush(u64 nanoseconds);
 void ntfs_log_account_lifecycle_fallback_flush(u64 nanoseconds);

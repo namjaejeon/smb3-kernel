@@ -694,7 +694,7 @@ static bool ntfs_log_lsn_in_writer_epoch(struct ntfs_log *log, u64 required_lsn)
 }
 
 static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
-		bool allow_delay);
+		bool allow_delay, bool *flushed);
 static void ntfs_log_aggregate_reset(struct ntfs_log *log);
 static void ntfs_log_promote_deferred(struct ntfs_log *log,
 		const unsigned long *batch_retired);
@@ -702,7 +702,7 @@ static void ntfs_log_defer_handle_frees(struct ntfs_log_handle *handle,
 		unsigned int slot);
 
 /* Capture the tail under append_lock. Never wait while holding that lock. */
-int ntfs_log_flush(struct ntfs_volume *vol)
+static int ntfs_log_flush_volume(struct ntfs_volume *vol, bool *flushed)
 {
 	struct ntfs_log *log;
 	u64 lsn;
@@ -718,10 +718,36 @@ int ntfs_log_flush(struct ntfs_volume *vol)
 		err = -EROFS;
 	mutex_unlock(&log->append_lock);
 	if (!err && lsn)
-		err = ntfs_log_flush_group(log, lsn, false);
+		err = ntfs_log_flush_group(log, lsn, false, flushed);
 out:
 	up_read(&vol->journal_lock);
 	return err;
+}
+
+int ntfs_log_flush(struct ntfs_volume *vol)
+{
+	return ntfs_log_flush_volume(vol, NULL);
+}
+
+/**
+ * ntfs_log_fsync - make the log and completed data I/O durable
+ * @vol: volume being synchronized
+ *
+ * A batch flushed by this call includes a device preflush. Another task
+ * may have started its preflush before our data I/O completed, so a batch
+ * flushed by another task cannot replace this caller's device flush.
+ *
+ * Return: 0 on success or a negative error.
+ */
+int ntfs_log_fsync(struct ntfs_volume *vol)
+{
+	bool flushed = false;
+	int err;
+
+	err = ntfs_log_flush_volume(vol, &flushed);
+	if (err || flushed)
+		return err;
+	return blkdev_issue_flush(vol->sb->s_bdev);
 }
 
 static void ntfs_log_flush_work(struct work_struct *work)
@@ -782,7 +808,7 @@ static int ntfs_log_drain_deferred_queue(struct ntfs_log *log,
 		err = -EROFS;
 	mutex_unlock(&log->append_lock);
 	if (!err && pending)
-		err = ntfs_log_flush_group(log, lsn, false);
+		err = ntfs_log_flush_group(log, lsn, false, NULL);
 	if (!err)
 		flush_work(&queue->work);
 	if (!err && READ_ONCE(log->aborted))
@@ -1139,7 +1165,7 @@ static int ntfs_log_wait_lsn_pinned(struct ntfs_log *log, u64 required_lsn)
 		goto out_success;
 	if (!ntfs_log_lsn_reached(log, required_lsn)) {
 		ntfs_log_recording_account(NTFS_LOG_RECORDING_LSN_WAIT, 1);
-		err = ntfs_log_flush_group(log, required_lsn, true);
+		err = ntfs_log_flush_group(log, required_lsn, true, NULL);
 		if (err && !ntfs_log_lsn_reached(log, required_lsn))
 			goto out;
 	}
@@ -2378,7 +2404,7 @@ static int ntfs_log_publish_restart(struct ntfs_log *log, u64 current_lsn,
 
 /* Called without append_lock so concurrent appenders can join this batch. */
 static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
-		bool allow_delay)
+			bool allow_delay, bool *flushed)
 {
 	LIST_HEAD(pages);
 	LIST_HEAD(ordered_io);
@@ -2579,6 +2605,8 @@ out_io:
 	WRITE_ONCE(log->durable_lsn, pending_lsn);
 	ntfs_log_promote_deferred(log, batch_retired);
 	wake_up_all(&log->durable_wait);
+	if (flushed)
+		*flushed = true;
 	goto out_append;
 
 out_abort:
@@ -3177,7 +3205,7 @@ static int __ntfs_log_checkpoint(struct ntfs_log *log, bool clean,
 			}
 			mutex_unlock(&log->append_lock);
 			if (commit_lsn) {
-				err = ntfs_log_flush_group(log, commit_lsn, false);
+				err = ntfs_log_flush_group(log, commit_lsn, false, NULL);
 				if (err)
 					goto out_transaction;
 			}
@@ -3304,7 +3332,7 @@ static int __ntfs_log_checkpoint(struct ntfs_log *log, bool clean,
 			atomic64_read(&log->inode_writeback_generation);
 	log->pending_clean = publish_clean;
 	mutex_unlock(&log->append_lock);
-	err = ntfs_log_flush_group(log, checkpoint_lsn, false);
+	err = ntfs_log_flush_group(log, checkpoint_lsn, false, NULL);
 	mutex_lock(&log->append_lock);
 	if (err)
 		goto out_abort;
@@ -3594,7 +3622,7 @@ static int ntfs_log_background_checkpoint(struct ntfs_log *log)
 	mutex_unlock(&log->append_lock);
 	mutex_unlock(&log->open_attr_lock);
 
-	err = ntfs_log_flush_group(log, checkpoint_lsn, false);
+	err = ntfs_log_flush_group(log, checkpoint_lsn, false, NULL);
 	if (err)
 		goto out_checkpoint;
 	NVolClearLogFileEmpty(log->vol);
@@ -4791,7 +4819,7 @@ static int __ntfs_log_write_operation(struct ntfs_log_handle *handle,
 	if (!packed)
 		mutex_unlock(&log->append_lock);
 	if (wait_durable) {
-		err = ntfs_log_flush_group(log, lsn, true);
+		err = ntfs_log_flush_group(log, lsn, true, NULL);
 		if (err)
 			goto out_entry;
 	}
@@ -5381,7 +5409,7 @@ retry:
 			u64 flush_lsn = log->last_client_lsn;
 
 			mutex_unlock(&log->append_lock);
-			err = ntfs_log_flush_group(log, flush_lsn, false);
+			err = ntfs_log_flush_group(log, flush_lsn, false, NULL);
 			if (!err)
 				goto retry;
 			goto out_free;

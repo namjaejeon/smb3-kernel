@@ -1211,9 +1211,7 @@ static int ntfs_dir_fsync(struct file *filp, loff_t start, loff_t end,
 	if (unlikely(err && !ret))
 		ret = err;
 	if (!ret)
-		ret = ntfs_log_flush(vol);
-	if (!ret)
-		ret = blkdev_issue_flush(vi->i_sb->s_bdev);
+		ret = ntfs_log_fsync(vol);
 	if (likely(!ret))
 		ntfs_debug("Done.");
 	else

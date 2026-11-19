@@ -423,13 +423,8 @@ int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 		vi = VFS_I(ni);
 	}
 
-	if (vol->journal || !datasync || !non_resident) {
+	if (!vol->journal && (!datasync || !non_resident))
 		ret = __ntfs_write_inode(vi, 1);
-		if (ret == -EAGAIN && vol->journal) {
-			err = ntfs_log_reclaim(vol);
-			ret = err ? err : __ntfs_write_inode(vi, 1);
-		}
-	}
 	/*
 	 * Never enter inode writeback under mrec_lock or lcnbmp_lock: an active
 	 * transaction can need either lock while a checkpoint blocks new readers.
@@ -516,13 +511,13 @@ int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 		kfree(attr);
 	}
 
-	/* Attribute writeback may have updated the base mapping pairs. */
 	if (vol->journal) {
-		err = __ntfs_write_inode(vi, 1);
+		/* Log inode changes after attribute writeback and defer home I/O. */
+		err = __ntfs_write_inode(vi, 0);
 		if (err == -EAGAIN) {
 			err = ntfs_log_reclaim(vol);
 			if (!err)
-				err = __ntfs_write_inode(vi, 1);
+				err = __ntfs_write_inode(vi, 0);
 		}
 	} else {
 		err = write_inode_now(vi, 1);
@@ -554,9 +549,7 @@ out:
 				"Failed to f%ssync inode 0x%llx.  Error %u.",
 				datasync ? "data" : "", ni->mft_no, -ret);
 	if (!ret)
-		ret = ntfs_log_flush(vol);
-	if (!ret)
-		ret = blkdev_issue_flush(vi->i_sb->s_bdev);
+		ret = ntfs_log_fsync(vol);
 	return ret;
 }
 
