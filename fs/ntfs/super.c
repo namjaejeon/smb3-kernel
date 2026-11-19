@@ -1251,14 +1251,15 @@ static bool load_and_init_mft_mirror(struct ntfs_volume *vol)
 /*
  * check_mft_mirror - compare contents of the mft mirror with the mft
  * @vol:	ntfs super block describing device whose mft mirror to check
+ * @mismatch:	whether the readable copies differ
  *
- * Return 'true' on success or 'false' on error.
+ * Return 'true' if the copies can be read and their geometry is valid.
  *
  * Note, this function also results in the mft mirror runlist being completely
  * mapped into memory.  The mft mirror write code requires this and will BUG()
  * should it find an unmapped runlist element.
  */
-static bool check_mft_mirror(struct ntfs_volume *vol)
+static bool check_mft_mirror(struct ntfs_volume *vol, bool *mismatch)
 {
 	struct super_block *sb = vol->sb;
 	struct ntfs_inode *mirr_ni;
@@ -1269,6 +1270,7 @@ static bool check_mft_mirror(struct ntfs_volume *vol)
 	int mrecs_per_page, i;
 
 	ntfs_debug("Entering.");
+	*mismatch = false;
 	/* Compare contents of $MFT and $MFTMirr. */
 	mrecs_per_page = PAGE_SIZE / vol->mft_record_size;
 	index = i = 0;
@@ -1341,12 +1343,8 @@ mft_unmap_out:
 				bytes = vol->mft_record_size;
 		}
 		/* Compare the two records. */
-		if (memcmp(kmft, kmirr, bytes)) {
-			ntfs_error(sb,
-				   "$MFT and $MFTMirr record %i do not match.  Run chkdsk.",
-				   i);
-			goto mm_unmap_out;
-		}
+		if (memcmp(kmft, kmirr, bytes))
+			*mismatch = true;
 		kmft += vol->mft_record_size;
 		kmirr += vol->mft_record_size;
 	} while (++i < vol->mftmirr_size);
@@ -1940,12 +1938,14 @@ static int load_system_files(struct ntfs_volume *vol)
 	bool resume_readonly_recovery = false;
 	bool replay_only = vol->journal_mode == NTFS_JOURNAL_REPLAY;
 	bool replay_only_failed = false;
+	bool mirror_mismatch = false;
 	int err, ret = -EINVAL;
 	u8 saved_on_errors;
 
 	ntfs_debug("Entering.");
 	/* Get mft mirror inode compare the contents of $MFT and $MFTMirr. */
-	if (!load_and_init_mft_mirror(vol) || !check_mft_mirror(vol)) {
+	if (!load_and_init_mft_mirror(vol) ||
+	    !check_mft_mirror(vol, &mirror_mismatch)) {
 		/* If a read-write mount, convert it to a read-only mount. */
 		if (!sb_rdonly(sb) && vol->on_errors == ON_ERRORS_REMOUNT_RO) {
 			static const char *es1 = "Failed to load $MFTMirr";
@@ -2133,6 +2133,12 @@ get_ctx_vol_failed:
 			} else {
 				err = ntfs_replay_logfile(vol, rp);
 			}
+			if (!err && mirror_mismatch && !sb_rdonly(sb)) {
+				err = ntfs_resync_mft_mirror(vol);
+				if (!err && (!check_mft_mirror(vol, &mirror_mismatch) ||
+					     mirror_mismatch))
+					err = -EIO;
+			}
 			if (err) {
 				/*
 				 * Never expose a volume whose recovery state is unknown for
@@ -2175,6 +2181,13 @@ get_ctx_vol_failed:
 	}
 
 	kvfree(rp);
+	if (mirror_mismatch) {
+		sb->s_flags |= SB_RDONLY;
+		ntfs_error(sb,
+			   "$MFT and $MFTMirr differ. Mounting read-only. Run chkdsk.");
+		NVolSetErrors(vol);
+		replay_only_failed = replay_only;
+	}
 	if (readonly_recovery) {
 		/* Keep read-only inode permissions while loading system files. */
 		resume_readonly_recovery = !replay_only && !sb_rdonly(sb);

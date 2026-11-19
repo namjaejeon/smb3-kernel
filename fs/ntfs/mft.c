@@ -1064,6 +1064,41 @@ out_unlock:
 	return err;
 }
 
+/* Restore the mirror from the primary MFT after journal replay. */
+int ntfs_resync_mft_mirror(struct ntfs_volume *vol)
+{
+	struct address_space *mapping = vol->mft_ino->i_mapping;
+	u64 bytes = (u64)vol->mftmirr_size * vol->mft_record_size;
+	u64 pos;
+	int err;
+
+	err = filemap_write_and_wait(mapping);
+	if (err)
+		return err;
+	if (mapping_tagged(mapping, PAGECACHE_TAG_DIRTY))
+		return -EIO;
+
+	for (pos = 0; pos < bytes; pos += PAGE_SIZE) {
+		struct ntfs_mft_io_unit unit = {
+			.len = min_t(u64, bytes - pos, PAGE_SIZE),
+		};
+		struct folio *folio;
+
+		folio = ntfs_read_metadata_folio(mapping, pos >> PAGE_SHIFT);
+		if (IS_ERR(folio))
+			return PTR_ERR(folio);
+		folio_lock(folio);
+		folio_wait_writeback(folio);
+		unit.folio_ofs = offset_in_folio(folio, pos);
+		err = ntfs_sync_mft_mirror_unit(vol, folio, pos, &unit);
+		folio_unlock(folio);
+		folio_put(folio);
+		if (err)
+			return err;
+	}
+	return blkdev_issue_flush(vol->sb->s_bdev);
+}
+
 int ntfs_prepare_mft_record_write(struct ntfs_inode *ni)
 {
 	struct ntfs_inode *mft_ni = NTFS_I(ni->vol->mft_ino);
