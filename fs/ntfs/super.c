@@ -2060,7 +2060,8 @@ get_ctx_vol_failed:
 
 	/* Make sure that no unsupported volume flags are set. */
 	must_mount_ro = vol->vol_flags & VOLUME_MUST_MOUNT_RO_MASK;
-	if (vol->journal_mode == NTFS_JOURNAL_RESET)
+	if (vol->journal_mode == NTFS_JOURNAL_ON ||
+	    vol->journal_mode == NTFS_JOURNAL_RESET)
 		must_mount_ro &= ~VOLUME_IS_DIRTY;
 	if (must_mount_ro) {
 		static const char *es1a = "Volume is dirty";
@@ -2082,9 +2083,7 @@ get_ctx_vol_failed:
 					(unsigned int)le16_to_cpu(vol->vol_flags));
 		}
 		/* If a read-write mount, convert it to a read-only mount. */
-		if (!sb_rdonly(sb) &&
-		    (vol->on_errors == ON_ERRORS_REMOUNT_RO ||
-		     vol->journal_mode != NTFS_JOURNAL_ON)) {
+		if (!sb_rdonly(sb)) {
 			sb->s_flags |= SB_RDONLY;
 			ntfs_error(sb, "%s.  Mounting read-only%s", es1, es2);
 		}
