@@ -321,6 +321,30 @@ struct inode *ntfs_attr_ilookup(struct inode *base_vi, __le32 type,
 	return ilookup5(base_vi->i_sb, na.mft_no, ntfs_test_inode, &na);
 }
 
+static int ntfs_test_owned_attr_inode(struct inode *vi, void *data)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+
+	if (!NInoAttr(ni) || ni->nr_extents != -1)
+		return 0;
+	/* An index bitmap inode can itself be attached to a fake index inode. */
+	do {
+		ni = ni->ext.base_ntfs_ino;
+	} while (ni && NInoAttr(ni) && ni->nr_extents == -1);
+	return ni == data;
+}
+
+void ntfs_unhash_inode_attributes(struct ntfs_inode *ni)
+{
+	struct inode *attr_vi;
+
+	while ((attr_vi = ilookup5(ni->vol->sb, ni->mft_no,
+				   ntfs_test_owned_attr_inode, ni))) {
+		remove_inode_hash(attr_vi);
+		iput(attr_vi);
+	}
+}
+
 /*
  * ntfs_index_iget - obtain a struct inode corresponding to an index
  * @base_vi:	vfs base inode containing the index related attributes
@@ -5222,6 +5246,14 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 
 	if (NVolShutdown(ni->vol))
 		return -EIO;
+
+	/*
+	 * discard_new_inode() leaves I_CREATING set after clearing I_NEW.
+	 * A failed create has already restored or freed its MFT record.
+	 */
+	if ((inode_state_read_once(vi) & (I_NEW | I_CREATING)) == I_CREATING &&
+	    inode_unhashed(vi))
+		return 0;
 
 	/*
 	 * Dirty attribute inodes are written via their real inodes so just

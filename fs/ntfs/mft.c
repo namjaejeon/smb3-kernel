@@ -323,6 +323,9 @@ static int ntfs_mft_alloc_home_abort(void *data)
 
 	if (!undo || !undo->vol)
 		return -EINVAL;
+	/* Home restoration may have reopened attributes of this failed create. */
+	if (undo->ni)
+		ntfs_unhash_inode_attributes(undo->ni);
 	memalloc_flags = memalloc_nofs_save();
 	if (undo->lock_bitmap)
 		down_write(&undo->vol->mftbmp_lock);

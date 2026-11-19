@@ -1259,6 +1259,11 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 	return ni;
 
 err_out:
+	/*
+	 * The MFT number can be reused as soon as the allocation is undone.
+	 * Do not leave attribute inodes from the failed create in the hash.
+	 */
+	ntfs_unhash_inode_attributes(ni);
 	if (log_handle) {
 		int abort_err;
 
@@ -1331,6 +1336,7 @@ err_out:
 	}
 	if (rollback_reparse)
 		ntfs_delete_reparse_index(ni);
+	ntfs_unhash_inode_attributes(ni);
 	/*
 	 * Free extent MFT records (should not exist any with current
 	 * ntfs_create implementation, but for any case if something will be
