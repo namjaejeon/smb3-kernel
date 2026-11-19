@@ -686,11 +686,6 @@ static bool ntfs_log_lsn_in_writer_epoch(struct ntfs_log *log, u64 required_lsn)
 
 	mutex_lock(&log->append_lock);
 	head_lsn = log->head_lsn;
-	/* Folding can rewind the packing cursor below a home metadata LSN. */
-	if (log->pending_alias_lsn &&
-	    (!head_lsn || ntfs_log_lsn_before_eq(&log->layout, head_lsn,
-			log->pending_alias_lsn)))
-		head_lsn = log->pending_alias_lsn;
 	in_epoch = log->oldest_lsn && head_lsn &&
 		ntfs_log_lsn_before_eq(&log->layout, log->oldest_lsn, required_lsn) &&
 		ntfs_log_lsn_before_eq(&log->layout, required_lsn, head_lsn);
@@ -701,7 +696,6 @@ static bool ntfs_log_lsn_in_writer_epoch(struct ntfs_log *log, u64 required_lsn)
 static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
 		bool allow_delay);
 static void ntfs_log_aggregate_reset(struct ntfs_log *log);
-static void ntfs_log_aggregate_compile_generation(struct ntfs_log *log);
 static void ntfs_log_promote_deferred(struct ntfs_log *log,
 		const unsigned long *batch_retired);
 static void ntfs_log_defer_handle_frees(struct ntfs_log_handle *handle,
@@ -1605,7 +1599,7 @@ static int ntfs_log_reserve_pages(struct ntfs_log *log, u32 nr_pages,
 
 /* append_lock must be held. No page-cache access or I/O on the append path. */
 static int ntfs_log_queue_page(struct ntfs_log *log, u64 file_off,
-		const void *data)
+		const void *data, bool has_terminal)
 {
 	struct ntfs_log_sealed_page *page;
 
@@ -1613,6 +1607,7 @@ static int ntfs_log_queue_page(struct ntfs_log *log, u64 file_off,
 	if (!page)
 		return -ENOMEM;
 	page->file_off = file_off;
+	page->has_terminal = has_terminal;
 	memcpy(page->data, data, log->layout.page_size);
 	list_add_tail(&page->list, &log->sealed_pages);
 	log->sealed_bytes += log->layout.page_size;
@@ -1649,7 +1644,7 @@ static int ntfs_log_write_record_pages(struct ntfs_log *log, u64 lsn,
 		if (err)
 			return err;
 		file_off &= ~((u64)log->layout.page_mask);
-		err = ntfs_log_queue_page(log, file_off, page);
+		err = ntfs_log_queue_page(log, file_off, page, false);
 		if (err)
 			return err;
 		err = ntfs_log_advance_lsn(&log->layout, page_lsn, 1,
@@ -1729,7 +1724,8 @@ static int ntfs_log_seal_pending_page(struct ntfs_log *log)
 	err = ntfs_log_resequence_mst(log, page, log->layout.page_size);
 	if (err)
 		return err;
-	err = ntfs_log_queue_page(log, log->pending_page_off, page);
+	err = ntfs_log_queue_page(log, log->pending_page_off, page,
+				 log->pending_page_has_terminal);
 	if (err)
 		return err;
 
@@ -1749,6 +1745,7 @@ static int ntfs_log_seal_pending_page(struct ntfs_log *log)
 	log->pending_page = NULL;
 	log->pending_page_off = 0;
 	log->pending_page_records = 0;
+	log->pending_page_has_terminal = false;
 	ntfs_log_recording_account(NTFS_LOG_RECORDING_PAGE, 1);
 	return 0;
 }
@@ -1759,8 +1756,8 @@ static u32 ntfs_log_spare_credits(const struct ntfs_log_handle *handle)
 
 	if (!handle)
 		return 0;
-	/* The paused parent must retain all possible CLRs and its final marker. */
-	required = (u64)handle->used_credits * 2 + 1;
+	/* Reserve the parent's possible CLRs, Commit and Forget. */
+	required = (u64)handle->used_credits * 2 + 2;
 	return required < handle->reserved_credits ?
 		handle->reserved_credits - required : 0;
 }
@@ -1772,7 +1769,7 @@ static void ntfs_log_independent_reservation(
 	u32 spare = ntfs_log_spare_credits(parent);
 
 	if (!full_reservation)
-		*reserved = min(*reserved, max(spare, 3U));
+		*reserved = min(*reserved, max(spare, 4U));
 	*borrowed = min(*reserved, spare);
 }
 
@@ -1855,18 +1852,18 @@ static int ntfs_log_grow_reservation(struct ntfs_log_handle *handle, u32 grow,
 }
 
 static int ntfs_log_record_reservation(u32 used, u32 pages, bool save_undo,
-		u32 record_type, const void *payload, u32 payload_len, u32 *needed)
+		u16 redo_op, u32 *needed)
 {
-	const struct ntfs_log_rec_hdr *record = payload;
-	bool terminal = record_type == le32_to_cpu(LFS_CLIENT_RECORD) &&
-		payload_len >= sizeof(*record) &&
-		(le16_to_cpu(record->redo_op) == CommitTransaction ||
-		 le16_to_cpu(record->redo_op) == ForgetTransaction);
+	u32 terminal_pages = 2;
+
+	if (redo_op == CommitTransaction)
+		terminal_pages = 1;
+	else if (redo_op == ForgetTransaction)
+		terminal_pages = 0;
 
 	if (check_add_overflow(used, pages, needed) ||
 	    (save_undo && check_mul_overflow(*needed, 2U, needed)) ||
-	    ((save_undo || !terminal) &&
-	     check_add_overflow(*needed, 1U, needed)))
+	    check_add_overflow(*needed, terminal_pages, needed))
 		return -EOVERFLOW;
 	return 0;
 }
@@ -1902,6 +1899,7 @@ static int ntfs_log_append_record(struct ntfs_log *log,
 	u64 sequence;
 	u64 next_lsn;
 	u64 lsn;
+	u16 redo_op = Noop;
 	int err;
 
 	if (!payload || !payload_len ||
@@ -1911,6 +1909,9 @@ static int ntfs_log_append_record(struct ntfs_log *log,
 	nr_pages32 = DIV_ROUND_UP(record_bytes, page_capacity);
 	if (!nr_pages32 || nr_pages32 > U16_MAX)
 		return -E2BIG;
+	if (record_type == le32_to_cpu(LFS_CLIENT_RECORD) &&
+	    payload_len >= sizeof(struct ntfs_log_rec_hdr))
+		redo_op = le16_to_cpu(((struct ntfs_log_rec_hdr *)payload)->redo_op);
 	charged_pages = nr_pages32;
 	if (handle && handle->packed) {
 		struct ntfs_log_packed_append *packed = handle->packed;
@@ -1948,14 +1949,11 @@ static int ntfs_log_append_record(struct ntfs_log *log,
 		}
 
 		/*
-		 * A forward record needs room for its CLR and one terminal
-		 * Commit or Forget.  The shared batch marker uses emergency ring
-		 * space instead of charging every transaction for another record.
-		 * The terminal record consumes that slot, not another future slot.
+		 * Keep room for CLRs and the terminal records. The batch marker
+		 * uses emergency ring space.
 		 */
 		reserve_err = ntfs_log_record_reservation(handle->used_credits,
-				charged_pages, save_undo, record_type, payload,
-				payload_len, &needed);
+				charged_pages, save_undo, redo_op, &needed);
 		if (reserve_err || needed > handle->reserved_credits) {
 			if (!reserve_err)
 				reserve_err = ntfs_log_grow_reservation(handle,
@@ -2065,6 +2063,8 @@ static int ntfs_log_append_record(struct ntfs_log *log,
 				byte_off & log->layout.page_mask);
 		if (err)
 			return err;
+		if (redo_op == CommitTransaction || redo_op == ForgetTransaction)
+			log->pending_page_has_terminal = true;
 		if (packed)
 			ntfs_log_recording_account(
 					NTFS_LOG_RECORDING_PACKED_RECORD, 1);
@@ -2418,10 +2418,7 @@ static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
 	pending_lsn = log->pending_lsn;
 	pending_records = log->pending_records;
 	if (!pending_lsn || !pending_records ||
-	    (!ntfs_log_lsn_before_eq(&log->layout, required_lsn, pending_lsn) &&
-	     (!log->pending_alias_lsn ||
-	      !ntfs_log_lsn_before_eq(&log->layout, required_lsn,
-			log->pending_alias_lsn)))) {
+	    !ntfs_log_lsn_before_eq(&log->layout, required_lsn, pending_lsn)) {
 		err = -EIO;
 		goto out_abort;
 	}
@@ -2434,8 +2431,6 @@ static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
 	ordered = log->pending_ordered_data;
 	marker_flags = publish ? NTFS_LOG_BATCH_COMMIT_RESTART_REQUIRED : 0;
 	marker_write_bytes = bdev_logical_block_size(log->vol->sb->s_bdev);
-	/* Compile committed overwrite chains before their pages become immutable. */
-	ntfs_log_aggregate_compile_generation(log);
 	/* No merge state may outlive the mutable pages being detached below. */
 	ntfs_log_aggregate_reset(log);
 	/* Put the marker alone at the beginning of a page and within one sector. */
@@ -2474,7 +2469,6 @@ static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
 	list_splice_init(&log->sealed_pages, &pages);
 	log->sealed_bytes = 0;
 	log->pending_lsn = 0;
-	log->pending_alias_lsn = 0;
 	log->pending_first_lsn = 0;
 	log->pending_records = 0;
 	log->flush_inflight = true;
@@ -2489,8 +2483,16 @@ static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
 		const void *data = page == marker_page ? incomplete_marker :
 			page->data;
 
-		err = ntfs_log_raw_write(log, page->file_off, data,
-				log->layout.page_size, false);
+		if (page->has_terminal) {
+			/* Other readers can act on these records before the fence. */
+			err = ntfs_log_sync_logfile_pages(log);
+			if (!err)
+				err = ntfs_log_raw_write_fua(log, page->file_off, data,
+							   log->layout.page_size, true);
+		} else {
+			err = ntfs_log_raw_write(log, page->file_off, data,
+						log->layout.page_size, false);
+		}
 		if (err)
 			goto out_io;
 	}
@@ -4094,21 +4096,15 @@ static void ntfs_log_aggregate_add(struct ntfs_log *log,
 	}
 	hash = ntfs_log_aggregate_unit_hash(&record->operation);
 	bucket = &log->aggregate_hash[hash];
-	record->previous = NULL;
 	hlist_for_each_entry(tail, bucket, hash_node) {
 		if (ntfs_log_same_aggregate_unit(&tail->operation,
 				&record->operation)) {
-			if (tail->mergeable && record->mergeable &&
-			    ntfs_log_same_overwrite_target(&tail->operation,
-				    &record->operation))
-				record->previous = tail;
 			hlist_del_init(&tail->hash_node);
 			break;
 		}
 	}
 	record->lsn = lsn;
 	record->transaction_id = handle->transaction_id;
-	record->anchor = record;
 	hlist_add_head(&record->hash_node, bucket);
 	list_add_tail(&record->batch_list, &log->aggregate_records);
 	list_add_tail(&record->handle_list, &handle->aggregate_records);
@@ -4212,20 +4208,6 @@ static int ntfs_log_aggregate_prepare_page(struct ntfs_log *log,
 		return -EIO;
 	}
 	return 0;
-}
-
-static int ntfs_log_aggregate_protect_page(struct ntfs_log *log, void *page,
-		bool protect)
-{
-	int err;
-
-	if (!protect)
-		return 0;
-	err = pre_write_mst_fixup((struct ntfs_record *)page,
-			log->layout.page_size);
-	if (err)
-		return err;
-	return ntfs_log_resequence_mst(log, page, log->layout.page_size);
 }
 
 static bool ntfs_log_mft_record_has_boundary(const struct mft_record *mrec,
@@ -4400,401 +4382,16 @@ out:
 	return false;
 }
 
-/* Validate both records before editing the unprotected pending page. */
-static u32 ntfs_log_aggregate_merge_records(struct ntfs_log *log,
-		struct ntfs_log_aggregate_record *anchor,
-		struct ntfs_log_aggregate_record *current_record, bool elide)
+/* Keep each transaction's before and after images independent. */
+static void ntfs_log_aggregate_commit_handle(struct ntfs_log_handle *handle)
 {
-	struct ntfs_record_page_hdr *current_page;
-	struct ntfs_log_record_location anchor_location;
-	struct ntfs_log_record_location current_location;
-	struct ntfs_lfs_record_hdr *current_lfs;
-	struct ntfs_log_rec_hdr *anchor_lrh;
-	struct ntfs_log_rec_hdr *current_lrh;
-	void *anchor_copy = NULL;
-	void *current_copy = NULL;
-	bool same_page;
-	bool in_place;
-	u64 current_byte_off;
-	u64 head_byte_off;
-	u64 sequence;
-	u64 previous_lsn;
-	u64 previous_byte_off;
-	u32 old_record_end;
-	u32 new_record_end;
-	u32 old_client_len;
-	u32 compact_len;
-	u16 current_redo_off;
-	u16 anchor_redo_off;
-	int err;
-
-	/*
-	 * Reclaim is possible only while this operation is the physical tail of
-	 * the deprotected packing page.  Mutating an interior or sealed record
-	 * would keep the same I/O volume and merely add CPU overhead.
-	 */
-	if (current_record->lsn != log->last_client_lsn ||
-	    ntfs_lsn_to_byte_off(&log->layout, current_record->lsn,
-		    &current_byte_off) ||
-	    ntfs_lsn_to_byte_off(&log->layout, log->head_lsn, &head_byte_off))
-		return false;
-	err = ntfs_log_find_mutable_record(log, anchor->lsn, &anchor_location);
-	if (err)
-		return false;
-	err = ntfs_log_find_mutable_record(log, current_record->lsn,
-			&current_location);
-	if (err)
-		return false;
-	if (current_location.protected ||
-	    current_location.page != log->pending_page ||
-	    (head_byte_off & ~((u64)log->layout.page_mask)) !=
-		    log->pending_page_off)
-		return false;
-	same_page = anchor_location.page == current_location.page;
-	in_place = same_page && !anchor_location.protected;
-	if (in_place) {
-		/* append_lock excludes flushing. Every failure is checked below. */
-		anchor_copy = anchor_location.page;
-	} else {
-		err = ntfs_log_aggregate_prepare_page(log, &anchor_location,
-				&anchor_copy);
-		if (err)
-			goto out;
-	}
-	if (same_page) {
-		current_copy = anchor_copy;
-	} else {
-		err = ntfs_log_aggregate_prepare_page(log, &current_location,
-				&current_copy);
-		if (err)
-			goto out;
-	}
-	anchor_lrh = ntfs_log_aggregate_record_header(log, anchor_copy,
-			anchor_location.record_off, anchor);
-	current_lrh = ntfs_log_aggregate_record_header(log, current_copy,
-			current_location.record_off, current_record);
-	if (!anchor_lrh || !current_lrh) {
-		err = -EINVAL;
-		goto out;
-	}
-	current_lfs = (void *)((u8 *)current_copy +
-			current_location.record_off);
-	current_page = current_copy;
-	old_client_len = le32_to_cpu(current_lfs->client_data_len);
-	if (check_add_overflow(current_location.record_off,
-			(u32)log->layout.record_header_len, &old_record_end) ||
-	    check_add_overflow(old_record_end, old_client_len,
-			&old_record_end)) {
-		err = -EOVERFLOW;
-		goto out;
-	}
-	old_record_end = ALIGN(old_record_end, 8);
-	compact_len = struct_size(current_lrh, page_lcns, 1);
-	new_record_end = elide ? current_location.record_off :
-		ALIGN(current_location.record_off +
-			log->layout.record_header_len + compact_len, 8);
-	if (old_record_end != le16_to_cpu(
-			current_page->record_hdr.next_record_off) ||
-	    (head_byte_off & log->layout.page_mask) != old_record_end ||
-	    new_record_end >= old_record_end) {
-		err = -EAGAIN;
-		goto out;
-	}
-	previous_lsn = le64_to_cpu(current_lfs->client_prev_lsn);
-	if (elide && (log->pending_page_records < 2 || log->pending_records < 2 ||
-	    !previous_lsn ||
-	    ntfs_lsn_to_byte_off(&log->layout, previous_lsn, &previous_byte_off) ||
-	    (previous_byte_off & ~((u64)log->layout.page_mask)) !=
-			log->pending_page_off ||
-	    (previous_byte_off & log->layout.page_mask) < log->layout.data_off ||
-	    (previous_byte_off & log->layout.page_mask) >=
-			current_location.record_off)) {
-		err = -EAGAIN;
-		goto out;
-	}
-	anchor_redo_off = le16_to_cpu(anchor_lrh->redo_off);
-	current_redo_off = le16_to_cpu(current_lrh->redo_off);
-	if (anchor_redo_off > U16_MAX - anchor->operation.redo_len ||
-	    current_redo_off > U16_MAX - current_record->operation.redo_len) {
-		err = -EOVERFLOW;
-		goto out;
-	}
-	/*
-	 * Record/header/bounds validation is complete. On the in-place path
-	 * protection is a no-op and no remaining operation can fail.
-	 */
-	memcpy((u8 *)anchor_lrh + anchor_redo_off,
-			(u8 *)current_lrh + current_redo_off,
-			current_record->operation.redo_len);
-	current_lrh->redo_op = cpu_to_le16(Noop);
-	current_lrh->undo_op = cpu_to_le16(Noop);
-	current_lrh->redo_off = cpu_to_le16(compact_len);
-	current_lrh->redo_len = 0;
-	current_lrh->undo_off = cpu_to_le16(compact_len);
-	current_lrh->undo_len = 0;
-	current_lrh->target_attr = 0;
-	current_lrh->lcns_follow = 0;
-	current_lrh->record_off = 0;
-	current_lrh->attr_off = 0;
-	current_lrh->cluster_off = 0;
-	current_lrh->target_vcn = 0;
-	current_lrh->page_lcns[0] = 0;
-	current_lfs->client_data_len = cpu_to_le32(compact_len);
-	current_page->record_hdr.next_record_off =
-			cpu_to_le16(new_record_end);
-	if (elide) {
-		current_page->rhdr.lsn = cpu_to_le64(previous_lsn);
-		current_page->record_hdr.last_end_lsn = cpu_to_le64(previous_lsn);
-	}
-	memset((u8 *)current_copy + new_record_end, 0,
-			old_record_end - new_record_end);
-	err = ntfs_log_aggregate_protect_page(log, anchor_copy,
-			anchor_location.protected);
-	if (err)
-		goto out;
-	if (!same_page) {
-		err = ntfs_log_aggregate_protect_page(log, current_copy,
-				current_location.protected);
-		if (err)
-			goto out;
-	}
-	if (!in_place) {
-		memcpy(anchor_location.page, anchor_copy, log->layout.page_size);
-		if (!same_page)
-			memcpy(current_location.page, current_copy,
-					log->layout.page_size);
-	}
-	sequence = current_record->lsn >> log->layout.file_data_bits;
-	log->head_lsn = ntfs_byte_off_to_lsn(&log->layout,
-			(current_byte_off & ~((u64)log->layout.page_mask)) +
-			new_record_end, sequence);
-	if (elide) {
-		/*
-		 * Keep home metadata's former tail LSN pinned to the next marker.
-		 * Reusing the byte offset is safe: that marker is placed on a later
-		 * page and cannot become durable before the updated anchor. Only
-		 * the physical client chain is shortened. The batch codec still
-		 * receives its exact physical last LSN and record count.
-		 * Reverse-order commits must not lower an earlier waiter's alias.
-		 */
-		if (!log->pending_alias_lsn ||
-		    ntfs_log_lsn_before_eq(&log->layout, log->pending_alias_lsn,
-			    current_record->lsn))
-			log->pending_alias_lsn = current_record->lsn;
-		log->last_client_lsn = previous_lsn;
-		log->pending_lsn = previous_lsn;
-		log->pending_page_records--;
-		log->pending_records--;
-	}
-out:
-	if (!same_page)
-		kvfree(current_copy);
-	if (!in_place)
-		kvfree(anchor_copy);
-	return err ? 0 : old_record_end - new_record_end;
-}
-
-/*
- * Compile an interior overwrite into its generation's first record without
- * changing any LSN or record boundary.  The successor becomes a Noop of the
- * same size, so records from other transactions retain their exact ordering.
- * Both transactions must already be represented in the batch commit bitmap.
- */
-static bool ntfs_log_aggregate_compile_record(struct ntfs_log *log,
-		struct ntfs_log_aggregate_record *anchor,
-		struct ntfs_log_aggregate_record *current_record)
-{
-	struct ntfs_log_record_location anchor_location;
-	struct ntfs_log_record_location current_location;
-	struct ntfs_log_rec_hdr *anchor_lrh;
-	struct ntfs_log_rec_hdr *current_lrh;
-	void *anchor_copy = NULL;
-	void *current_copy = NULL;
-	bool same_page;
-	u16 anchor_redo_off;
-	u16 current_redo_off;
-	u16 compact_len;
-	int err;
-
-	err = ntfs_log_find_mutable_record(log, anchor->lsn,
-			&anchor_location);
-	if (err)
-		return false;
-	err = ntfs_log_find_mutable_record(log, current_record->lsn,
-			&current_location);
-	if (err)
-		return false;
-	same_page = anchor_location.page == current_location.page;
-	err = ntfs_log_aggregate_prepare_page(log, &anchor_location,
-			&anchor_copy);
-	if (err)
-		goto out;
-	if (same_page) {
-		current_copy = anchor_copy;
-	} else {
-		err = ntfs_log_aggregate_prepare_page(log, &current_location,
-				&current_copy);
-		if (err)
-			goto out;
-	}
-	anchor_lrh = ntfs_log_aggregate_record_header(log, anchor_copy,
-			anchor_location.record_off, anchor);
-	current_lrh = ntfs_log_aggregate_record_header(log, current_copy,
-			current_location.record_off, current_record);
-	if (!anchor_lrh || !current_lrh) {
-		err = -EINVAL;
-		goto out;
-	}
-	anchor_redo_off = le16_to_cpu(anchor_lrh->redo_off);
-	current_redo_off = le16_to_cpu(current_lrh->redo_off);
-	memcpy((u8 *)anchor_lrh + anchor_redo_off,
-			(u8 *)current_lrh + current_redo_off,
-			current_record->operation.redo_len);
-
-	compact_len = struct_size(current_lrh, page_lcns, 1);
-	current_lrh->redo_op = cpu_to_le16(Noop);
-	current_lrh->undo_op = cpu_to_le16(Noop);
-	current_lrh->redo_off = cpu_to_le16(compact_len);
-	current_lrh->redo_len = 0;
-	current_lrh->undo_off = cpu_to_le16(compact_len);
-	current_lrh->undo_len = 0;
-	current_lrh->target_attr = 0;
-	current_lrh->lcns_follow = 0;
-	current_lrh->record_off = 0;
-	current_lrh->attr_off = 0;
-	current_lrh->cluster_off = 0;
-	current_lrh->reserved = 0;
-	current_lrh->target_vcn = 0;
-	current_lrh->page_lcns[0] = 0;
-
-	err = ntfs_log_aggregate_protect_page(log, anchor_copy,
-			anchor_location.protected);
-	if (err)
-		goto out;
-	if (!same_page) {
-		err = ntfs_log_aggregate_protect_page(log, current_copy,
-				current_location.protected);
-		if (err)
-			goto out;
-	}
-	memcpy(anchor_location.page, anchor_copy, log->layout.page_size);
-	if (!same_page)
-		memcpy(current_location.page, current_copy,
-				log->layout.page_size);
-out:
-	if (!same_page)
-		kvfree(current_copy);
-	kvfree(anchor_copy);
-	return !err;
-}
-
-/* append_lock is held and every committed bit is still generation-local. */
-static void ntfs_log_aggregate_compile_generation(struct ntfs_log *log)
-{
-	struct ntfs_log_aggregate_record *record;
-	struct ntfs_log_aggregate_record *anchor;
-	u64 started = ntfs_log_task_cpu_time();
-
-	list_for_each_entry(record, &log->aggregate_records, batch_list) {
-		if (!record->committed || !record->mergeable ||
-		    record->anchor != record || !record->previous ||
-		    !record->previous->committed)
-			continue;
-		anchor = record->previous->anchor;
-		if (!anchor || !anchor->committed ||
-		    !ntfs_log_same_overwrite_target(&anchor->operation,
-			    &record->operation))
-			continue;
-		ntfs_log_recording_account(
-				NTFS_LOG_RECORDING_GENERATION_COMPILE_ATTEMPT, 1);
-		if (!ntfs_log_aggregate_compile_record(log, anchor, record))
-			continue;
-		record->anchor = anchor;
-		ntfs_log_recording_account(NTFS_LOG_RECORDING_GENERATION_COMPILE,
-				1);
-		ntfs_log_recording_account(
-				NTFS_LOG_RECORDING_GENERATION_COMPILE_BYTE,
-				record->operation.redo_len);
-	}
-	ntfs_log_recording_account(NTFS_LOG_RECORDING_GENERATION_COMPILE_CPU_NS,
-			ntfs_log_task_cpu_time() - started);
-}
-
-/* The handle is becoming visible to its generation. The append_lock prevents a flush. */
-static void ntfs_log_aggregate_commit_handle(struct ntfs_log *log,
-		struct ntfs_log_handle *handle)
-{
-	struct ntfs_log_aggregate_record *record;
-	struct ntfs_log_aggregate_record *next;
-	struct ntfs_log_aggregate_record *anchor;
-	u64 started = ntfs_log_task_cpu_time();
-	u32 reclaimed;
-	bool elide;
+	struct ntfs_log_aggregate_record *record, *next;
 
 	list_for_each_entry_safe(record, next, &handle->aggregate_records,
-			handle_list) {
+				handle_list) {
 		record->committed = true;
-		anchor = record->previous ? record->previous->anchor : NULL;
-		reclaimed = 0;
-		/*
-		 * A buffered size transaction with exactly one physical operation
-		 * can disappear completely into an already committed anchor. No
-		 * remaining log record, undo chain or batch bitmap then names its
-		 * short-lived ID. Active and multi-operation handles keep their IDs.
-		 */
-		elide = log->async_commit && !handle->force_durable_commit &&
-			!handle->independent && !handle->writeback &&
-			record->operation.redo_op == SetNewAttributeSizes &&
-			handle->first_lsn == record->lsn &&
-			handle->prev_lsn == record->lsn &&
-			list_is_singular(&handle->aggregate_records) &&
-			log->pending_page_records > 1;
-		if (record->mergeable &&
-		    !hlist_unhashed(&record->hash_node) && record->previous &&
-		    record->previous->committed && anchor &&
-		    ntfs_log_same_overwrite_target(&anchor->operation,
-			    &record->operation))
-			reclaimed = ntfs_log_aggregate_merge_records(log, anchor,
-					record, elide);
-		if (reclaimed) {
-			record->anchor = anchor;
-			ntfs_log_recording_account(
-					NTFS_LOG_RECORDING_AGGREGATE_MERGE, 1);
-			ntfs_log_recording_account(
-					NTFS_LOG_RECORDING_AGGREGATE_BYTE,
-					record->operation.redo_len);
-			ntfs_log_recording_account(
-					NTFS_LOG_RECORDING_AGGREGATE_RECLAIM_BYTE,
-					reclaimed);
-			if (elide) {
-				struct ntfs_log_aggregate_record *previous =
-					record->previous;
-				u32 hash = ntfs_log_aggregate_unit_hash(&record->operation);
-
-				/* Reuse the committed write-set entry, not another shadow. */
-				hlist_del_init(&record->hash_node);
-				hlist_add_head(&previous->hash_node,
-						&log->aggregate_hash[hash]);
-				list_del(&record->batch_list);
-				list_del(&record->handle_list);
-				log->aggregate_bytes -= record->allocation_size;
-				handle->record_elided = true;
-				ntfs_log_recording_account(
-						NTFS_LOG_RECORDING_ELIDED_RECORD, 1);
-				kfree(record);
-				continue;
-			}
-		} else if (record->previous) {
-			ntfs_log_recording_account(
-					NTFS_LOG_RECORDING_AGGREGATE_FALLBACK, 1);
-		} else {
-			ntfs_log_recording_account(
-					NTFS_LOG_RECORDING_AGGREGATE_UNIQUE, 1);
-		}
 		list_del_init(&record->handle_list);
 	}
-	ntfs_log_recording_account(NTFS_LOG_RECORDING_AGGREGATE_LOOKUP_CPU_NS,
-			ntfs_log_task_cpu_time() - started);
 }
 
 /* append_lock must be held. Active handles lose only optional merge state. */
@@ -5098,14 +4695,6 @@ static int __ntfs_log_write_operation(struct ntfs_log_handle *handle,
 		err = -EROFS;
 		goto out_unlock;
 	}
-	/*
-	 * Finalize mutable aggregation while the operation record is still the
-	 * batch tail.  The CommitTransaction append below is in the same critical
-	 * section, so neither a flush nor another transaction can observe the
-	 * compacted form without its commit record.
-	 */
-	if (operation->redo_op == CommitTransaction)
-		ntfs_log_aggregate_commit_handle(log, handle);
 	started = ntfs_log_task_cpu_time();
 	if (!packed && save_undo && undo_entry &&
 	    ntfs_log_aggregate_fold_mft_create(log, handle, operation,
@@ -5173,19 +4762,22 @@ static int __ntfs_log_write_operation(struct ntfs_log_handle *handle,
 	aggregate_record = NULL;
 	/* A checkpoint may run before this caller returns from its flush. */
 	if (operation->redo_op == CommitTransaction) {
-		int index = ntfs_log_transaction_id_index(handle->transaction_id);
-
 		handle->commit_recorded = true;
-		if (WARN_ON_ONCE(index < 0)) {
-			err = -EINVAL;
-			ntfs_log_abort_writer(log, err);
-			goto out_unlock;
-		}
-		set_bit(index, log->retired_transaction_ids);
-		if (handle->queue_deferred_free)
-			ntfs_log_defer_handle_frees(handle, index);
+		ntfs_log_aggregate_commit_handle(handle);
 	} else if (operation->redo_op == ForgetTransaction) {
 		handle->forget_recorded = true;
+		if (handle->commit_recorded) {
+			int index = ntfs_log_transaction_id_index(handle->transaction_id);
+
+			if (WARN_ON_ONCE(index < 0)) {
+				err = -EINVAL;
+				ntfs_log_abort_writer(log, err);
+				goto out_unlock;
+			}
+			set_bit(index, log->retired_transaction_ids);
+			if (handle->queue_deferred_free)
+				ntfs_log_defer_handle_frees(handle, index);
+		}
 	}
 	if (!packed)
 		mutex_unlock(&log->append_lock);
@@ -5367,48 +4959,6 @@ static int ntfs_log_write_marker(struct ntfs_log_handle *handle, u16 marker,
 			handle->undo_next_lsn, false, wait_durable, NULL);
 }
 
-/*
- * Join an asynchronously committed handle to the current shared generation.
- * The v2 batch marker carries the transaction-slot bitmap, so a pending batch
- * needs no individual CommitTransaction record.  The slot remains retired
- * until that marker is durable and recovery therefore cannot confuse a
- * reused slot with an older generation.
- */
-static int ntfs_log_commit_generation(struct ntfs_log_handle *handle)
-{
-	struct ntfs_log *log = handle->log;
-	int index;
-	int err = 0;
-
-	mutex_lock(&log->append_lock);
-	if (!log->running || log->aborted) {
-		err = -EROFS;
-		goto out;
-	}
-	index = ntfs_log_transaction_id_index(handle->transaction_id);
-	if (WARN_ON_ONCE(index < 0)) {
-		err = -EINVAL;
-		ntfs_log_abort_writer(log, err);
-		goto out;
-	}
-	if (!log->pending_lsn) {
-		/* Give the next flush a new LSN for this commit. */
-		err = -EAGAIN;
-		goto out;
-	}
-	ntfs_log_aggregate_commit_handle(log, handle);
-	handle->commit_recorded = true;
-	if (handle->record_elided)
-		ntfs_log_recording_account(NTFS_LOG_RECORDING_ELIDED_TRANSACTION, 1);
-	else
-		set_bit(index, log->retired_transaction_ids);
-	ntfs_log_recording_account(NTFS_LOG_RECORDING_GENERATION_COMMIT, 1);
-	ntfs_log_recording_account(NTFS_LOG_RECORDING_COMMIT_RECORD_ELIDED, 1);
-out:
-	mutex_unlock(&log->append_lock);
-	return err;
-}
-
 static int ntfs_log_transaction_id_index(u32 id)
 {
 	return ntfs_log_transaction_slot_index(id);
@@ -5477,15 +5027,15 @@ static int ntfs_log_transaction_reservation(const struct ntfs_log *log,
 		return -EINVAL;
 	data_pages = div_u64(log->layout.log_size - log->layout.first_page,
 			     log->layout.page_size);
-	if (data_pages <= NTFS_LOG_EMERGENCY_PAGES + 2)
+	if (data_pages <= NTFS_LOG_EMERGENCY_PAGES + 3)
 		return -E2BIG;
 	/*
 	 * Forward records and their CLRs share at most half of the data ring.
 	 * Keep the other half available for the current tail, checkpoints, and
 	 * transactions that were admitted concurrently.
 	 */
-	max_credits = (data_pages - NTFS_LOG_EMERGENCY_PAGES - 2) / 4;
-	max_credits = min_t(u64, max_credits, (U32_MAX - 1) / 2);
+	max_credits = (data_pages - NTFS_LOG_EMERGENCY_PAGES - 3) / 4;
+	max_credits = min_t(u64, max_credits, (U32_MAX - 2) / 2);
 	if (full_reservation && (!max_credits || requested > max_credits))
 		return -E2BIG;
 	/*
@@ -5503,7 +5053,7 @@ static int ntfs_log_transaction_reservation(const struct ntfs_log *log,
 				NTFS_LOG_INITIAL_TRANSACTION_CREDITS);
 		initial_credits = min_t(u64, initial_credits, max_credits);
 	}
-	*reserved_credits = initial_credits * 2 + 1;
+	*reserved_credits = initial_credits * 2 + 2;
 	return 0;
 }
 
@@ -7153,8 +6703,6 @@ static bool ntfs_log_aggregate_coalesce_sizes(
 		const struct ntfs_log_operation_desc *operation, u64 current_lsn,
 		u64 *lsn_out)
 {
-	struct ntfs_log_aggregate_record *anchor = tail->anchor;
-	struct ntfs_log_aggregate_record *record;
 	struct ntfs_log_handle *active;
 	struct ntfs_lfs_record_hdr *lfs;
 	struct ntfs_log_rec_hdr *lrh;
@@ -7163,34 +6711,22 @@ static bool ntfs_log_aggregate_coalesce_sizes(
 	u64 result_lsn;
 	u32 client_len;
 	u32 header_len;
-	unsigned int depth = 0;
 	u16 redo_off;
 	u16 undo_off;
 	u16 undo_len;
 
-	if (!tail->committed || !tail->mergeable || !anchor ||
-	    !anchor->committed || !anchor->mergeable ||
-	    !ntfs_log_same_overwrite_target(&tail->operation, operation) ||
-	    !ntfs_log_same_overwrite_target(&anchor->operation, operation))
+	if (!tail->committed || !tail->mergeable ||
+	    !ntfs_log_same_overwrite_target(&tail->operation, operation))
 		return false;
-	/* Bound the optional scan. Committed predecessors may still be active. */
-	for (record = tail; record; record = record->previous) {
-		if (!record->committed || ++depth > 32)
+	list_for_each_entry(active, &log->active_handles, active_list)
+		if (active->transaction_id == tail->transaction_id)
 			return false;
-		list_for_each_entry(active, &log->active_handles, active_list)
-			if (active->transaction_id == record->transaction_id)
-				return false;
-		if (record == anchor)
-			break;
-	}
-	if (record != anchor)
-		return false;
 	if (!log->pending_page ||
-	    ntfs_lsn_to_byte_off(&log->layout, anchor->lsn, &byte_off) ||
+	    ntfs_lsn_to_byte_off(&log->layout, tail->lsn, &byte_off) ||
 	    (byte_off & ~((u64)log->layout.page_mask)) != log->pending_page_off)
 		return false;
 	lrh = ntfs_log_aggregate_record_header(log, log->pending_page,
-			byte_off & log->layout.page_mask, anchor);
+			byte_off & log->layout.page_mask, tail);
 	if (!lrh)
 		return false;
 	lfs = (void *)((u8 *)log->pending_page +
@@ -7211,15 +6747,11 @@ static bool ntfs_log_aggregate_coalesce_sizes(
 		return false;
 
 	head_lsn = log->head_lsn;
-	if (log->pending_alias_lsn &&
-	    (!head_lsn || ntfs_log_lsn_before_eq(&log->layout, head_lsn,
-			log->pending_alias_lsn)))
-		head_lsn = log->pending_alias_lsn;
-	result_lsn = anchor->lsn;
+	result_lsn = tail->lsn;
 	if (current_lsn && log->oldest_lsn && head_lsn &&
 	    ntfs_log_lsn_before_eq(&log->layout, log->oldest_lsn, current_lsn) &&
 	    ntfs_log_lsn_before_eq(&log->layout, current_lsn, head_lsn) &&
-	    ntfs_log_lsn_before_eq(&log->layout, anchor->lsn, current_lsn))
+	    ntfs_log_lsn_before_eq(&log->layout, tail->lsn, current_lsn))
 		result_lsn = current_lsn;
 	memcpy((u8 *)lrh + redo_off, operation->redo_data, operation->redo_len);
 	*lsn_out = result_lsn;
@@ -7236,7 +6768,6 @@ static bool ntfs_log_aggregate_coalesce_mapping_sizes(struct ntfs_log *log,
 		const struct ntfs_log_operation_desc *mapping,
 		u64 current_lsn, u64 *lsn_out)
 {
-	struct ntfs_log_aggregate_record *size_anchor = tail->anchor;
 	struct ntfs_log_aggregate_record *map_anchor;
 	struct ntfs_lfs_record_hdr *lfs;
 	struct ntfs_log_rec_hdr *lrh;
@@ -7249,14 +6780,12 @@ static bool ntfs_log_aggregate_coalesce_mapping_sizes(struct ntfs_log *log,
 
 	if (!mapping->undo_data || !mapping->redo_data ||
 	    mapping->undo_len != mapping->redo_len ||
-	    !size_anchor || !size_anchor->batch_list.prev ||
-	    size_anchor->batch_list.prev == &log->aggregate_records)
+	    tail->batch_list.prev == &log->aggregate_records)
 		return false;
-	map_anchor = list_entry(size_anchor->batch_list.prev,
+	map_anchor = list_entry(tail->batch_list.prev,
 			struct ntfs_log_aggregate_record, batch_list);
 	if (!map_anchor->committed || !map_anchor->mergeable ||
-	    map_anchor->anchor != map_anchor ||
-	    map_anchor->transaction_id != size_anchor->transaction_id ||
+	    map_anchor->transaction_id != tail->transaction_id ||
 	    !ntfs_log_same_overwrite_target(&map_anchor->operation, mapping) ||
 	    !log->pending_page ||
 	    ntfs_lsn_to_byte_off(&log->layout, map_anchor->lsn, &byte_off) ||
@@ -7879,20 +7408,10 @@ static int __ntfs_log_commit(struct ntfs_log_handle *handle)
 	wait_durable = handle->force_durable_commit ||
 		!handle->log->async_commit ||
 		(handle->log->vol->sb->s_flags & (SB_SYNCHRONOUS | SB_DIRSYNC));
-	if (wait_durable) {
-		err = ntfs_log_write_marker(handle, CommitTransaction, true);
-	} else if (handle->has_deferred_free) {
-		/*
-		 * A new commit record keeps this slot in a future marker even
-		 * if its operation records were flushed earlier.
-		 */
-		handle->queue_deferred_free = true;
-		err = ntfs_log_write_marker(handle, CommitTransaction, false);
-	} else {
-		err = ntfs_log_commit_generation(handle);
-		if (err == -EAGAIN)
-			err = ntfs_log_write_marker(handle, CommitTransaction, false);
-	}
+	handle->queue_deferred_free = !wait_durable && handle->has_deferred_free;
+	err = ntfs_log_write_marker(handle, CommitTransaction, false);
+	if (!err)
+		err = ntfs_log_write_marker(handle, ForgetTransaction, wait_durable);
 	if (err) {
 		ntfs_error(handle->log->vol->sb,
 			"Journal commit failed (transaction %u, first LSN 0x%llx, last LSN 0x%llx, error %d).",
@@ -7913,12 +7432,6 @@ static int __ntfs_log_commit(struct ntfs_log_handle *handle)
 		ntfs_log_abort_writer(handle->log, err);
 		return ntfs_log_finish_transaction(handle, err);
 	}
-	/*
-	 * The durable batch marker retires every committed transaction at once.
-	 * Keep its slot reserved until that marker is stable instead of appending
-	 * one ForgetTransaction per metadata operation.
-	 */
-	ntfs_log_recording_account(NTFS_LOG_RECORDING_FORGET_ELIDED, 1);
 	if (!wait_durable) {
 		mutex_lock(&handle->log->append_lock);
 		if (!handle->log->stopping) {

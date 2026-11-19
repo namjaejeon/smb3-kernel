@@ -255,10 +255,8 @@ loaded, for example ``modprobe ntfs journal_async_commit=N``.
 
 ``journal_async_commit``
   Batch journal flushes across buffered transactions when enabled (default
-  ``Y``). Ordinary asynchronous transactions share a private generation
-  marker rather than emitting individual commit and forget records.
-  Transactions with deferred frees, or with no remaining pending batch, still
-  emit a commit record.
+  ``Y``). Each transaction records its commit and forget operations. A
+  private batch marker lets the driver find the durable end of the log.
   Setting this to ``N`` waits for each commit to reach stable storage.
   Explicit durability operations and synchronous mounts still wait when
   batching is enabled.

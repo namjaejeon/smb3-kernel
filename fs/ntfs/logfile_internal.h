@@ -645,8 +645,6 @@ struct ntfs_log_aggregate_record {
 	struct list_head batch_list;
 	struct list_head handle_list;
 	struct hlist_node hash_node;
-	struct ntfs_log_aggregate_record *previous;
-	struct ntfs_log_aggregate_record *anchor;
 	struct ntfs_log_operation_desc operation;
 	void *redo_image;
 	size_t allocation_size;
@@ -696,8 +694,6 @@ struct ntfs_log_handle {
 	bool force_durable_commit;
 	bool has_deferred_free;
 	bool queue_deferred_free;
-	/* No on-disk record names this single-operation handle after folding. */
-	bool record_elided;
 	/* Checkpoint-visible state, changed with the corresponding append. */
 	bool commit_recorded;
 	bool forget_recorded;
@@ -710,6 +706,7 @@ struct ntfs_log_handle {
 /* Immutable, MST-protected page owned by append or by one flush batch. */
 struct ntfs_log_sealed_page {
 	struct list_head list;
+	bool has_terminal;
 	u64 file_off;
 	u8 data[];
 };
@@ -748,8 +745,6 @@ struct ntfs_log {
 	u64 head_lsn;
 	u64 durable_lsn;
 	u64 pending_lsn;
-	/* Furthest folded tail LSN, even when handles commit in reverse order. */
-	u64 pending_alias_lsn;
 	u64 pending_first_lsn;
 	u64 oldest_lsn;
 	u64 checkpoint_lsn;
@@ -785,6 +780,7 @@ struct ntfs_log {
 	void *pending_page;
 	u64 pending_page_off;
 	u32 pending_page_records;
+	bool pending_page_has_terminal;
 	u64 pending_bdev_start;
 	u64 pending_bdev_end;
 	bool pending_bdev_range_valid;
