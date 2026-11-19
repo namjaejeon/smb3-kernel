@@ -1696,6 +1696,11 @@ static int ntfs_attrlist_nonresident_update_transacted(
 				false);
 		if (written != write_end - changed_start) {
 			err = written < 0 ? written : -EIO;
+			/* ENOSPC here is an I/O error on allocated clusters. */
+			if (err == -ENOSPC)
+				ntfs_error(vol->sb,
+					   "Failed to write existing attribute-list data on inode %llu (error %d).",
+					   (unsigned long long)base_ni->mft_no, err);
 			goto out;
 		}
 	}
@@ -1863,10 +1868,11 @@ int ntfs_inode_add_attrlist_transacted(struct ntfs_log_handle *handle,
 		err = ntfs_attr_make_base_record_space_initial_transacted(handle,
 				ni, required_free, move_limit, list, list_size);
 		if (err) {
-			ntfs_error(ni->vol->sb,
-				   "Failed to make room for initial attribute list on inode %llu (need %u bytes, move limit %d, error %d).",
-				   (unsigned long long)ni->mft_no, required_free,
-				   move_limit, err);
+			if (err != -ENOSPC)
+				ntfs_error(ni->vol->sb,
+					   "Failed to make room for initial attribute list on inode %llu (need %u bytes, move limit %d, error %d).",
+					   (unsigned long long)ni->mft_no, required_free,
+					   move_limit, err);
 			goto out;
 		}
 	}

@@ -6082,6 +6082,8 @@ int ntfs_log_open_attribute(struct ntfs_log_handle *handle, u64 mref,
 
 	slot = log->next_open_attr_slot;
 	if (slot > U16_MAX - sizeof(struct ntfs_open_attr_entry_disk)) {
+		if (log->vol && log->vol->sb)
+			ntfs_error(log->vol->sb, "Journal open attribute table exhausted.");
 		err = -ENOSPC;
 		goto out_unlock;
 	}

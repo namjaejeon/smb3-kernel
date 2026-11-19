@@ -527,7 +527,7 @@ static struct runlist_element *ntfs_cluster_alloc_core(
 
 	if (free_clusters < min_count) {
 		err = -ENOSPC;
-		ntfs_error(vol->sb,
+		ntfs_debug(
 			"Cluster allocation reports no space (free clusters %lld, dirty clusters %lld, requested %lld, minimum %lld, total clusters %lld, zone %s).",
 			(long long)atomic64_read(&vol->free_clusters),
 			(long long)atomic64_read(&vol->dirty_clusters),
@@ -1076,7 +1076,7 @@ switch_to_data1_zone:		search_zone = 2;
 			exhausted = true;
 			err = -ENOSPC;
 			if (min_count == count)
-				ntfs_error(vol->sb,
+				ntfs_debug(
 					"Cluster allocation exhausted all zones (free clusters %lld, dirty clusters %lld, requested %lld, total clusters %lld, zone %s).",
 					(long long)atomic64_read(
 							&vol->free_clusters),
@@ -1142,7 +1142,7 @@ out:
 				zone == MFT_ZONE ? "MFT" : "DATA");
 		err = 0;
 	} else if (err == -ENOSPC && exhausted && min_count < count) {
-		ntfs_error(vol->sb,
+		ntfs_debug(
 			"Cluster allocation exhausted all zones below its minimum (free clusters %lld, dirty clusters %lld, requested %lld, allocated %lld, minimum %lld, total clusters %lld, zone %s).",
 			(long long)atomic64_read(&vol->free_clusters),
 			(long long)atomic64_read(&vol->dirty_clusters),

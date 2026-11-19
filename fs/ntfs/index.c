@@ -2284,7 +2284,8 @@ static int ntfs_ibm_add(struct ntfs_index_context *icx)
 	ret = ntfs_attr_add(icx->idx_ni, AT_BITMAP, icx->name, icx->name_len,
 			    bmp, sizeof(bmp));
 	if (ret) {
-		ntfs_error(icx->idx_ni->vol->sb, "Failed to add AT_BITMAP");
+		if (ret != -ENOSPC)
+			ntfs_error(icx->idx_ni->vol->sb, "Failed to add AT_BITMAP");
 		return ret;
 	}
 
@@ -3301,7 +3302,9 @@ static int ntfs_ibm_modify(struct ntfs_index_context *icx, s64 vcn, int set)
 		if (bmp_ni->data_size < bpos + 1) {
 			ret = ntfs_attr_truncate(bmp_ni, (bmp_ni->data_size + 8) & ~7);
 			if (ret) {
-				ntfs_error(icx->idx_ni->vol->sb, "Failed to truncate AT_BITMAP");
+				if (ret != -ENOSPC)
+					ntfs_error(icx->idx_ni->vol->sb,
+						   "Failed to truncate AT_BITMAP");
 				goto err;
 			}
 			i_size_write(bmp_vi, (loff_t)bmp_ni->data_size);
@@ -3527,7 +3530,9 @@ static int ntfs_ia_add(struct ntfs_index_context *icx)
 		ret = ntfs_attr_add(icx->idx_ni, AT_INDEX_ALLOCATION, icx->name,
 					icx->name_len, NULL, 0);
 		if (ret) {
-			ntfs_error(icx->idx_ni->vol->sb, "Failed to add AT_INDEX_ALLOCATION");
+			if (ret != -ENOSPC)
+				ntfs_error(icx->idx_ni->vol->sb,
+					   "Failed to add AT_INDEX_ALLOCATION");
 			return ret;
 		}
 	}
@@ -3743,7 +3748,7 @@ static int ntfs_ir_make_space(struct ntfs_index_context *icx, int data_size)
 		ret = ntfs_ir_reparent(icx);
 		if (!ret)
 			ret = -EAGAIN;
-		else
+		else if (ret != -ENOSPC)
 			ntfs_error(icx->idx_ni->vol->sb, "Failed to modify INDEX_ROOT");
 	}
 
@@ -4492,9 +4497,10 @@ static int ntfs_index_root_insert_median_transacted(
 		 */
 		err = ntfs_index_root_move_transacted(handle, icx);
 		if (err) {
-			ntfs_error(icx->idx_ni->vol->sb,
-				"Transacted index root move failed for inode %llu before parent insertion (error %d).",
-				(unsigned long long)icx->idx_ni->mft_no, err);
+			if (err != -ENOSPC)
+				ntfs_error(icx->idx_ni->vol->sb,
+					"Transacted index root move failed for inode %llu before parent insertion (error %d).",
+					(unsigned long long)icx->idx_ni->mft_no, err);
 			goto out;
 		}
 		attr = icx->actx ? icx->actx->attr : NULL;
@@ -4600,7 +4606,7 @@ static int ntfs_index_parent_insert_transacted(
 	if (parent_vcn == VCN_INDEX_ROOT_PARENT) {
 		err = ntfs_index_root_insert_median_transacted(handle, icx,
 				promoted, right_vcn, icx->parent_pos[depth]);
-		if (err)
+		if (err && err != -ENOSPC)
 			ntfs_error(icx->idx_ni->vol->sb,
 				"Transacted index root parent insertion failed for inode %llu (depth %d, right VCN %lld, error %d).",
 				(unsigned long long)icx->idx_ni->mft_no, depth,
@@ -4760,10 +4766,11 @@ static int ntfs_index_parent_insert_transacted(
 
 	err = ntfs_index_split_allocate_vcn_transacted(handle, icx, &new_vcn);
 	if (err) {
-		ntfs_error(icx->idx_ni->vol->sb,
-			"Transacted index parent split VCN allocation failed for inode %llu (depth %d, parent VCN %lld, error %d).",
-			(unsigned long long)icx->idx_ni->mft_no, depth, parent_vcn,
-			err);
+		if (err != -ENOSPC)
+			ntfs_error(icx->idx_ni->vol->sb,
+				"Transacted index parent split VCN allocation failed for inode %llu (depth %d, parent VCN %lld, error %d).",
+				(unsigned long long)icx->idx_ni->mft_no, depth, parent_vcn,
+				err);
 		goto out;
 	}
 	right->index_block_vcn = cpu_to_le64(new_vcn);
@@ -4777,10 +4784,11 @@ static int ntfs_index_parent_insert_transacted(
 	err = ntfs_index_parent_insert_transacted(handle, icx, depth - 1,
 			promoted_up, new_vcn);
 	if (err) {
-		ntfs_error(icx->idx_ni->vol->sb,
-			"Transacted index parent recursive insertion failed for inode %llu (depth %d, parent VCN %lld, new VCN %lld, error %d).",
-			(unsigned long long)icx->idx_ni->mft_no, depth, parent_vcn,
-			new_vcn, err);
+		if (err != -ENOSPC)
+			ntfs_error(icx->idx_ni->vol->sb,
+				"Transacted index parent recursive insertion failed for inode %llu (depth %d, parent VCN %lld, new VCN %lld, error %d).",
+				(unsigned long long)icx->idx_ni->mft_no, depth, parent_vcn,
+				new_vcn, err);
 		goto out;
 	}
 	err = ntfs_index_block_update_transacted(handle, icx, parent_old, left);
@@ -5039,9 +5047,10 @@ static int ntfs_index_leaf_split_transacted(
 
 	err = ntfs_index_split_allocate_vcn_transacted(handle, icx, &new_vcn);
 	if (err) {
-		ntfs_error(icx->idx_ni->vol->sb,
-			"Transacted index leaf split VCN allocation failed for inode %llu (error %d).",
-			(unsigned long long)icx->idx_ni->mft_no, err);
+		if (err != -ENOSPC)
+			ntfs_error(icx->idx_ni->vol->sb,
+				"Transacted index leaf split VCN allocation failed for inode %llu (error %d).",
+				(unsigned long long)icx->idx_ni->mft_no, err);
 		goto out;
 	}
 	right->index_block_vcn = cpu_to_le64(new_vcn);
@@ -5055,9 +5064,10 @@ static int ntfs_index_leaf_split_transacted(
 	err = ntfs_index_parent_insert_transacted(handle, icx,
 			icx->pindex - 1, promoted, new_vcn);
 	if (err) {
-		ntfs_error(icx->idx_ni->vol->sb,
-			"Transacted index leaf split parent insertion failed for inode %llu (VCN %lld, error %d).",
-			(unsigned long long)icx->idx_ni->mft_no, new_vcn, err);
+		if (err != -ENOSPC)
+			ntfs_error(icx->idx_ni->vol->sb,
+				"Transacted index leaf split parent insertion failed for inode %llu (VCN %lld, error %d).",
+				(unsigned long long)icx->idx_ni->mft_no, new_vcn, err);
 		goto out;
 	}
 	err = ntfs_index_block_update_transacted(handle, icx, icx->ib, left);
@@ -5109,7 +5119,7 @@ static int ntfs_index_allocation_add_transacted(
 		return -EOVERFLOW;
 	if (new_index_len > allocated_size) {
 		err = ntfs_index_leaf_split_transacted(handle, icx, ie);
-		if (err)
+		if (err && err != -ENOSPC)
 			ntfs_error(icx->idx_ni->vol->sb,
 				"Transacted index allocation leaf split failed for inode %llu (index length %u, allocated %u, entry %u, error %d).",
 				(unsigned long long)icx->idx_ni->mft_no, index_len,
@@ -5647,17 +5657,19 @@ static int ntfs_index_root_reparent_transacted(
 	err = ntfs_attr_add_transacted(handle, icx->idx_ni,
 			AT_INDEX_ALLOCATION, icx->name, icx->name_len, NULL, 0);
 	if (err) {
-		ntfs_error(icx->idx_ni->vol->sb,
-			   "Initial index reparent failed at index allocation attribute for inode %llu (error %d).",
-			   (unsigned long long)icx->idx_ni->mft_no, err);
+		if (err != -ENOSPC)
+			ntfs_error(icx->idx_ni->vol->sb,
+				   "Initial index reparent failed at index allocation attribute for inode %llu (error %d).",
+				   (unsigned long long)icx->idx_ni->mft_no, err);
 		goto out;
 	}
 	err = ntfs_attr_add_transacted(handle, icx->idx_ni, AT_BITMAP,
 			icx->name, icx->name_len, bitmap, sizeof(bitmap));
 	if (err) {
-		ntfs_error(icx->idx_ni->vol->sb,
-			   "Initial index reparent failed at index bitmap attribute for inode %llu (error %d).",
-			   (unsigned long long)icx->idx_ni->mft_no, err);
+		if (err != -ENOSPC)
+			ntfs_error(icx->idx_ni->vol->sb,
+				   "Initial index reparent failed at index bitmap attribute for inode %llu (error %d).",
+				   (unsigned long long)icx->idx_ni->mft_no, err);
 		goto out;
 	}
 
@@ -5680,9 +5692,10 @@ static int ntfs_index_root_reparent_transacted(
 	err = ntfs_index_allocation_extend_transacted(handle, icx,
 			icx->block_size);
 	if (err) {
-		ntfs_error(icx->idx_ni->vol->sb,
-			   "Initial index allocation growth failed for inode %llu (error %d).",
-			   (unsigned long long)icx->idx_ni->mft_no, err);
+		if (err != -ENOSPC)
+			ntfs_error(icx->idx_ni->vol->sb,
+				   "Initial index allocation growth failed for inode %llu (error %d).",
+				   (unsigned long long)icx->idx_ni->mft_no, err);
 		goto out;
 	}
 	VFS_I(icx->ia_ni)->i_blocks = icx->ia_ni->allocated_size >> 9;
@@ -5770,7 +5783,7 @@ static int ntfs_index_root_add_transacted(struct ntfs_log_handle *handle,
 		(entry_len + 120 > free_space && free_space >= 120)) {
 		err = ntfs_index_root_reparent_transacted(handle, icx, ie,
 				mrec, attr, record_off);
-		if (err)
+		if (err && err != -ENOSPC)
 			ntfs_error(icx->idx_ni->vol->sb,
 				"Transacted filename index root reparent failed for inode %llu (entry %u, free %u, error %d).",
 				(unsigned long long)icx->idx_ni->mft_no, entry_len,
@@ -5868,7 +5881,7 @@ static int __ntfs_index_add_filename(struct ntfs_log_handle *handle,
 			err = ntfs_index_allocation_add_transacted(handle, icx, ie);
 	} else
 		err = ntfs_ie_add(icx, ie);
-	if (err && handle)
+	if (err && err != -ENOSPC && handle)
 		ntfs_error(ni->vol->sb,
 			"Transacted filename index insertion failed for inode %llu (in_root %d, error %d).",
 			(unsigned long long)ni->mft_no, icx->is_in_root, err);

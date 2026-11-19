@@ -918,7 +918,7 @@ int ntfs_reparse_wsl_not_symlink_log_credits(struct ntfs_inode *ni)
  */
 static int update_reparse_data(struct ntfs_log_handle *handle,
 		struct ntfs_inode *ni, struct ntfs_index_context *xr,
-		char *value, size_t size)
+		char *value, size_t size, bool new_attr)
 {
 	struct inode *rp_inode;
 	int err = 0;
@@ -945,9 +945,10 @@ static int update_reparse_data(struct ntfs_log_handle *handle,
 	if (handle) {
 		err = resize_reparse_data_transacted(handle, rp_ni, size);
 		if (err) {
-			ntfs_error(ni->vol->sb,
-				   "Failed to resize reparse data to %zu bytes (error %d).",
-				   size, err);
+			if (err != -ENOSPC)
+				ntfs_error(ni->vol->sb,
+					   "Failed to resize reparse data to %zu bytes (error %d).",
+					   size, err);
 			goto put_rp_inode;
 		}
 		err = ntfs_attr_pwrite_transacted(handle, rp_ni, 0, value,
@@ -958,9 +959,10 @@ static int update_reparse_data(struct ntfs_log_handle *handle,
 	}
 	if (written != size) {
 		err = written < 0 ? written : -EIO;
-		ntfs_error(ni->vol->sb,
-			   "Failed to write reparse data (%zu bytes, error %d).",
-			   size, err);
+		if (err != -ENOSPC || handle || !new_attr)
+			ntfs_error(ni->vol->sb,
+				   "Failed to write reparse data (%zu bytes, error %d).",
+				   size, err);
 		goto put_rp_inode;
 	}
 
@@ -1208,7 +1210,7 @@ static int ntfs_set_ntfs_reparse_data(struct ntfs_inode *ni, char *value, size_t
 
 	/* update value and index */
 	mutex_lock_nested(&xrni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
-	err = update_reparse_data(handle, ni, xr, value, size);
+	err = update_reparse_data(handle, ni, xr, value, size, !present);
 	if (handle) {
 		if (err) {
 			int abort_err = ntfs_log_abort(handle);
@@ -1280,7 +1282,7 @@ static int ntfs_set_ntfs_reparse_data_transacted(
 	xrni = xr->idx_ni;
 	mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
 	mutex_lock_nested(&xrni->mrec_lock, NTFS_EXTEND_MUTEX_PARENT);
-	err = update_reparse_data(handle, ni, xr, value, size);
+	err = update_reparse_data(handle, ni, xr, value, size, false);
 	ntfs_index_ctx_put(xr);
 	mutex_unlock(&xrni->mrec_lock);
 	mutex_unlock(&ni->mrec_lock);

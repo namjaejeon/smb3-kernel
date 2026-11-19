@@ -648,7 +648,7 @@ static int ntfs_sd_add_everyone(struct ntfs_log_handle *log_handle,
 	else
 		ret = ntfs_attr_add(ni, AT_SECURITY_DESCRIPTOR, AT_UNNAMED, 0,
 				(u8 *)sd, sd_len);
-	if (ret)
+	if (ret && ret != -ENOSPC)
 		ntfs_error(ni->vol->sb, "Failed to add SECURITY_DESCRIPTOR\n");
 
 	kfree(sd);
@@ -858,7 +858,7 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 	else
 		err = ntfs_mft_record_alloc(vol, mode, &ni, NULL, &ni_mrec, -1);
 	if (err) {
-		if (log_handle)
+		if (log_handle && err != -ENOSPC)
 			ntfs_error(sb,
 				"Create transacted MFT allocation failed (credits %u, error %d).",
 				journal_credits, err);
@@ -949,14 +949,16 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 		err = ntfs_attr_add(ni, AT_STANDARD_INFORMATION, AT_UNNAMED, 0,
 				(u8 *)si, si_len);
 	if (err) {
-		ntfs_error(sb, "Failed to add STANDARD_INFORMATION attribute.\n");
+		if (err != -ENOSPC)
+			ntfs_error(sb, "Failed to add STANDARD_INFORMATION attribute.\n");
 		goto err_out;
 	}
 
 	err = ntfs_sd_add_everyone(log_handle, ni);
 	if (err) {
-		ntfs_error(sb,
-			"Create failed to add SECURITY_DESCRIPTOR (error %d).", err);
+		if (err != -ENOSPC)
+			ntfs_error(sb,
+				"Create failed to add SECURITY_DESCRIPTOR (error %d).", err);
 		goto err_out;
 	}
 	if (!log_handle)
@@ -1001,9 +1003,10 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 					(u8 *)ir, ir_len);
 		if (err) {
 			kfree(ir);
-			ntfs_error(vi->i_sb,
-				"Create failed to add INDEX_ROOT attribute (error %d).",
-				err);
+			if (err != -ENOSPC)
+				ntfs_error(vi->i_sb,
+					"Create failed to add INDEX_ROOT attribute (error %d).",
+					err);
 			goto err_out;
 		}
 		kfree(ir);
@@ -1022,8 +1025,9 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 		else
 			err = ntfs_attr_add(ni, AT_DATA, AT_UNNAMED, 0, NULL, 0);
 		if (err) {
-			ntfs_error(dir_ni->vol->sb,
-				"Create failed to add DATA attribute (error %d).", err);
+			if (err != -ENOSPC)
+				ntfs_error(dir_ni->vol->sb,
+					"Create failed to add DATA attribute (error %d).", err);
 			goto err_out;
 		}
 		created_data = true;
@@ -1043,9 +1047,10 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 		err = ntfs_attr_add_transacted(log_handle, ni, AT_REPARSE_POINT,
 				AT_UNNAMED, 0, (u8 *)&rp, sizeof(rp));
 		if (err) {
-			ntfs_error(sb,
-				"Create failed to add REPARSE_POINT attribute (error %d).",
-				err);
+			if (err != -ENOSPC)
+				ntfs_error(sb,
+					"Create failed to add REPARSE_POINT attribute (error %d).",
+					err);
 			goto err_out;
 		}
 	}
@@ -1053,9 +1058,10 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 		err = ntfs_ea_add_wsl_transacted(log_handle, vi, dev, &ea_size,
 				NTFS_EA_UID | NTFS_EA_GID | NTFS_EA_MODE);
 		if (err) {
-			ntfs_error(sb,
-				"Create failed to add initial WSL EA attributes (error %d).",
-				err);
+			if (err != -ENOSPC)
+				ntfs_error(sb,
+					"Create failed to add initial WSL EA attributes (error %d).",
+					err);
 			goto err_out;
 		}
 		created_ea = true;
@@ -1124,7 +1130,8 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 		}
 	}
 	if (err) {
-		ntfs_error(sb, "Create reparse setup failed (error %d).", err);
+		if (err != -ENOSPC)
+			ntfs_error(sb, "Create reparse setup failed (error %d).", err);
 		goto err_out;
 	}
 
@@ -1132,9 +1139,10 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 		err = ntfs_ea_set_wsl_inode(vi, dev, &ea_size,
 				NTFS_EA_UID | NTFS_EA_GID | NTFS_EA_MODE);
 		if (err) {
-			ntfs_error(sb,
-				"Create failed to set initial WSL EA attributes (error %d).",
-				err);
+			if (err != -ENOSPC)
+				ntfs_error(sb,
+					"Create failed to set initial WSL EA attributes (error %d).",
+					err);
 			goto err_out;
 		}
 	}
@@ -1185,8 +1193,9 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 		err = ntfs_attr_add(ni, AT_FILE_NAME, AT_UNNAMED, 0,
 				(u8 *)fn, fn_len);
 	if (err) {
-		ntfs_error(sb,
-			"Create failed to add FILE_NAME attribute (error %d).", err);
+		if (err != -ENOSPC)
+			ntfs_error(sb,
+				"Create failed to add FILE_NAME attribute (error %d).", err);
 		goto err_out;
 	}
 
@@ -1203,8 +1212,12 @@ static struct ntfs_inode *__ntfs_create(const struct mnt_idmap *idmap, struct in
 	else
 		err = ntfs_index_add_filename(dir_ni, fn, child_mft_ref);
 	if (err) {
-		ntfs_error(sb,
-			"Create failed to add FILE_NAME index entry (error %d).", err);
+		/* A failed insertion did not publish the new inode. */
+		if (!log_handle)
+			ntfs_mft_set_link_count(NULL, ni, ni_mrec, 0);
+		if (err != -ENOSPC)
+			ntfs_error(sb,
+				"Create failed to add FILE_NAME index entry (error %d).", err);
 		goto err_out;
 	}
 	if (log_handle) {
@@ -1442,9 +1455,10 @@ out_free_stream_names:
 	kmem_cache_free(ntfs_name_cache, uname);
 	if (IS_ERR(ni)) {
 		err = PTR_ERR(ni);
-		ntfs_error(dir->i_sb,
-			"Create failed for inode name length %u (error %d).",
-			dentry->d_name.len, err);
+		if (err != -ENOSPC)
+			ntfs_error(dir->i_sb,
+				"Create failed for inode name length %u (error %d).",
+				dentry->d_name.len, err);
 		return err;
 	}
 
@@ -2397,7 +2411,8 @@ static int __ntfs_link(struct ntfs_log_handle *log_handle,
 		err = ntfs_attr_add_transacted(log_handle, ni, AT_FILE_NAME,
 				AT_UNNAMED, 0, (u8 *)fn, fn_len);
 		if (err) {
-			ntfs_error(sb, "Failed to add FILE_NAME attribute.\n");
+			if (err != -ENOSPC)
+				ntfs_error(sb, "Failed to add FILE_NAME attribute.\n");
 			goto err_out;
 		}
 		err = ntfs_mft_set_link_count(log_handle, ni, ni_mrec,
@@ -2411,7 +2426,8 @@ static int __ntfs_link(struct ntfs_log_handle *log_handle,
 				MK_MREF(ni->mft_no,
 					le16_to_cpu(ni_mrec->sequence_number)));
 		if (err) {
-			ntfs_error(sb, "Failed to add filename to the index");
+			if (err != -ENOSPC)
+				ntfs_error(sb, "Failed to add filename to the index");
 			goto err_out;
 		}
 		if (finish_transaction) {
@@ -2427,13 +2443,15 @@ static int __ntfs_link(struct ntfs_log_handle *log_handle,
 	err = ntfs_index_add_filename(dir_ni, fn, MK_MREF(ni->mft_no,
 					le16_to_cpu(ni_mrec->sequence_number)));
 	if (err) {
-		ntfs_error(sb, "Failed to add filename to the index");
+		if (err != -ENOSPC)
+			ntfs_error(sb, "Failed to add filename to the index");
 		goto err_out;
 	}
 	/* Add FILE_NAME attribute to inode. */
 	err = ntfs_attr_add(ni, AT_FILE_NAME, AT_UNNAMED, 0, (u8 *)fn, fn_len);
 	if (err) {
-		ntfs_error(sb, "Failed to add FILE_NAME attribute.\n");
+		if (err != -ENOSPC)
+			ntfs_error(sb, "Failed to add FILE_NAME attribute.\n");
 		/* Try to remove just added attribute from index. */
 		if (ntfs_index_remove(dir_ni, fn, fn_len))
 			goto rollback_failed;
@@ -3057,7 +3075,8 @@ static int ntfs_link(struct dentry *old_dentry, struct inode *dir,
 		mutex_unlock(&dir_ni->mrec_lock);
 		mutex_unlock(&ni->mrec_lock);
 		iput(vi);
-		pr_err("failed to create link, err = %d\n", err);
+		if (err != -ENOSPC)
+			pr_err("failed to create link, err = %d\n", err);
 		goto out;
 	}
 

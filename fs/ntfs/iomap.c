@@ -695,8 +695,10 @@ static int ntfs_write_da_iomap_begin_non_resident(struct inode *inode,
 				ntfs_iomap_flags & NTFS_IOMAP_FLAGS_NODELALLOC);
 	up_write(&ni->runlist.lock);
 	if (err) {
-		ntfs_report_iomap_error(inode,
-			"cluster mapping", offset, length, err, ntfs_iomap_flags);
+		if (err != -ENOSPC ||
+		    (ntfs_iomap_flags & NTFS_IOMAP_FLAGS_WRITEBACK))
+			ntfs_report_iomap_error(inode, "cluster mapping", offset,
+					length, err, ntfs_iomap_flags);
 		/* Abort restores DELALLOC, so retain its dirty-cluster charge. */
 		if (!log_handle)
 			mutex_unlock(&mrec_ni->mrec_lock);
@@ -786,8 +788,6 @@ static int ntfs_write_da_iomap_begin_non_resident(struct inode *inode,
 	return err;
 
 out_abort:
-	ntfs_report_iomap_error(inode, "transaction abort", offset, length,
-			err, ntfs_iomap_flags);
 	if (!log_handle)
 		return err;
 	abort_err = ntfs_log_abort(log_handle);
@@ -1009,8 +1009,9 @@ static int __ntfs_write_iomap_begin(struct inode *inode, loff_t offset,
 			mutex_unlock(&mrec_ni->mrec_lock);
 		}
 		if (ret) {
-			ntfs_report_write_enospc(inode,
-				"truncate/attribute expansion", offset, length, ret);
+			if (ret != -ENOSPC)
+				ntfs_report_write_enospc(inode,
+					"truncate/attribute expansion", offset, length, ret);
 			return ret;
 		}
 	}

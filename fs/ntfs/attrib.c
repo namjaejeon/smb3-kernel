@@ -3195,10 +3195,11 @@ static int ntfs_resident_attr_add_listed_transacted(
 		err = ntfs_mft_record_alloc_transacted(handle, base_ni->vol,
 				&target_ni, base_ni, &mrec);
 		if (err) {
-			ntfs_error(base_ni->vol->sb,
-				   "Failed to allocate extent while adding attribute 0x%x to inode %llu (error %d).",
-				   le32_to_cpu(type),
-				   (unsigned long long)base_ni->mft_no, err);
+			if (err != -ENOSPC)
+				ntfs_error(base_ni->vol->sb,
+					   "Failed to allocate extent while adding attribute 0x%x to inode %llu (error %d).",
+					   le32_to_cpu(type),
+					   (unsigned long long)base_ni->mft_no, err);
 			return err;
 		}
 	}
@@ -3246,7 +3247,7 @@ static int ntfs_resident_attr_add_listed_transacted(
 	err = ntfs_attrlist_entry_add_transacted(handle, target_ni,
 			attr_copy);
 	kfree(attr_copy);
-	if (err)
+	if (err && err != -ENOSPC)
 		ntfs_error(base_ni->vol->sb,
 			   "Failed to add attribute-list entry for attribute 0x%x on inode %llu (error %d).",
 			   le32_to_cpu(type),
@@ -3306,10 +3307,11 @@ static int ntfs_non_resident_attr_add_listed_transacted(
 		err = ntfs_mft_record_alloc_transacted(handle, base_ni->vol,
 				&target_ni, base_ni, &mrec);
 		if (err) {
-			ntfs_error(base_ni->vol->sb,
-				   "Failed to allocate extent while adding non-resident attribute 0x%x to inode %llu (error %d).",
-				   le32_to_cpu(type),
-				   (unsigned long long)base_ni->mft_no, err);
+			if (err != -ENOSPC)
+				ntfs_error(base_ni->vol->sb,
+					   "Failed to allocate extent while adding non-resident attribute 0x%x to inode %llu (error %d).",
+					   le32_to_cpu(type),
+					   (unsigned long long)base_ni->mft_no, err);
 			return err;
 		}
 	}
@@ -3517,10 +3519,11 @@ retry:
 			if (!NInoAttrList(ni)) {
 				err = ntfs_inode_add_attrlist_transacted(log_handle, ni);
 				if (err) {
-					ntfs_error(sb,
-						   "Failed to create attribute list while adding non-resident attribute 0x%x to inode %llu (error %d).",
-						   le32_to_cpu(type),
-						   (unsigned long long)ni->mft_no, err);
+					if (err != -ENOSPC)
+						ntfs_error(sb,
+							   "Failed to create attribute list while adding non-resident attribute 0x%x to inode %llu (error %d).",
+							   le32_to_cpu(type),
+							   (unsigned long long)ni->mft_no, err);
 					goto err_out;
 				}
 			}
@@ -3530,16 +3533,17 @@ retry:
 		if (!NInoAttrList(ni)) {
 			err = ntfs_inode_add_attrlist_transacted(log_handle, ni);
 			if (err) {
-				ntfs_error(sb,
-					   "Failed to create attribute list while adding attribute 0x%x to inode %llu (error %d).",
-					   le32_to_cpu(type),
-					   (unsigned long long)ni->mft_no, err);
+				if (err != -ENOSPC)
+					ntfs_error(sb,
+						   "Failed to create attribute list while adding attribute 0x%x to inode %llu (error %d).",
+						   le32_to_cpu(type),
+						   (unsigned long long)ni->mft_no, err);
 				goto err_out;
 			}
 		}
 		err = ntfs_resident_attr_add_listed_transacted(log_handle, ni,
 				type, name, name_len, val, size, attr_rec_size);
-		if (err)
+		if (err && err != -ENOSPC)
 			ntfs_error(sb,
 				   "Failed to add listed resident attribute 0x%x to inode %llu (error %d).",
 				   le32_to_cpu(type),
@@ -5373,10 +5377,11 @@ int ntfs_attr_make_base_record_space_transacted(
 					base_ni->vol, &target_ni, base_ni,
 					&target_mrec);
 			if (err) {
-				ntfs_error(base_ni->vol->sb,
-					   "Attribute-list extent allocation failed on inode %llu (attribute 0x%x, length %u, error %d).",
-					   (unsigned long long)base_ni->mft_no,
-					   le32_to_cpu(attr->type), attr_len, err);
+				if (err != -ENOSPC)
+					ntfs_error(base_ni->vol->sb,
+						   "Attribute-list extent allocation failed on inode %llu (attribute 0x%x, length %u, error %d).",
+						   (unsigned long long)base_ni->mft_no,
+						   le32_to_cpu(attr->type), attr_len, err);
 				break;
 			}
 			err = ntfs_attr_record_move_to_new_extent_transacted(handle,
@@ -5480,10 +5485,11 @@ int ntfs_attr_make_base_record_space_initial_transacted(
 					base_ni->vol, &target_ni, base_ni,
 					&target_mrec);
 			if (err) {
-				ntfs_error(base_ni->vol->sb,
-					   "Initial attribute-list extent allocation failed on inode %llu (attribute 0x%x, length %u, error %d).",
-					   (unsigned long long)base_ni->mft_no,
-					   le32_to_cpu(attr->type), attr_len, err);
+				if (err != -ENOSPC)
+					ntfs_error(base_ni->vol->sb,
+						   "Initial attribute-list extent allocation failed on inode %llu (attribute 0x%x, length %u, error %d).",
+						   (unsigned long long)base_ni->mft_no,
+						   le32_to_cpu(attr->type), attr_len, err);
 				break;
 			}
 			err = ntfs_attr_record_move_to_new_extent_transacted(handle,
@@ -6054,7 +6060,7 @@ static int ntfs_attr_publish_mapping_extents_transacted(
 			return 0;
 	}
 out:
-	if (err)
+	if (err && err != -ENOSPC)
 		ntfs_error(ni->vol->sb,
 			   "Failed to publish mapping extent for inode %llu attr 0x%x at %s (error %d).",
 			   (unsigned long long)base_ni->mft_no,
@@ -6316,7 +6322,7 @@ static int ntfs_attr_update_mapping_pairs_extent_transacted(
 			next_vcn, next_rl, -1, attr_flags);
 	goto out;
 out:
-	if (err)
+	if (err && err != -ENOSPC)
 		ntfs_error(ni->vol->sb,
 			   "Failed to update mapping extent for inode %llu attr 0x%x at %s (error %d).",
 			   (unsigned long long)base_ni->mft_no,
@@ -8526,8 +8532,14 @@ int ntfs_attr_make_nonresident_transacted(struct ntfs_log_handle *handle,
 		goto out_unlock;
 	err = ntfs_attr_write_allocated_value(ni->vol, allocated_rl, value,
 			value_size);
-	if (err)
+	if (err) {
+		/* ENOSPC here is an I/O error, not a cluster allocation failure. */
+		if (err == -ENOSPC)
+			ntfs_error(ni->vol->sb,
+				   "Failed to write allocated attribute data on inode %llu (error %d).",
+				   (unsigned long long)base_ni->mft_no, err);
 		goto out_unlock;
+	}
 	err = ntfs_log_ordered_data(handle);
 	if (err)
 		goto out_unlock;
@@ -10973,11 +10985,12 @@ int ntfs_attr_map_cluster_transacted(struct ntfs_log_handle *handle,
 				ni);
 	}
 	if (err) {
-		ntfs_error(vol->sb,
-			   "Failed to journal mapping pairs during %s for inode %llu attr 0x%x (vcn %lld, clusters %lld, attribute list %d, error %d).",
-			   mapping_stage, (unsigned long long)ni->mft_no,
-			   le32_to_cpu(ni->type), vcn, clu_count,
-			   !!NInoAttrList(ni), err);
+		if (err != -ENOSPC || skip_holes)
+			ntfs_error(vol->sb,
+				   "Failed to journal mapping pairs during %s for inode %llu attr 0x%x (vcn %lld, clusters %lld, attribute list %d, error %d).",
+				   mapping_stage, (unsigned long long)ni->mft_no,
+				   le32_to_cpu(ni->type), vcn, clu_count,
+				   !!NInoAttrList(ni), err);
 		return err;
 	}
 	NInoClearRunlistDirty(ni);

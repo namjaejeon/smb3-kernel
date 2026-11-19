@@ -4130,9 +4130,10 @@ have_alloc_rec:
 			}
 
 			if (unlikely(err)) {
-				ntfs_error(vol->sb,
-					   "Failed to extend mft data allocation (error %d).",
-					   err);
+				if (err != -ENOSPC)
+					ntfs_error(vol->sb,
+						   "Failed to extend mft data allocation (error %d).",
+						   err);
 				goto undo_mftbmp_alloc_nolock;
 			}
 			read_lock_irqsave(&mft_ni->size_lock, flags);
@@ -4893,7 +4894,7 @@ int ntfs_mft_record_alloc_transacted(struct ntfs_log_handle *handle,
 		return -EINVAL;
 	err = __ntfs_mft_record_alloc(handle, vol, 0, ni, base_ni, ni_mrec,
 			-1);
-	if (err)
+	if (err && err != -ENOSPC)
 		ntfs_error(vol->sb,
 			   "Transacted extent MFT record allocation failed for inode %llu (error %d).",
 			   (unsigned long long)base_ni->mft_no, err);
