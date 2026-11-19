@@ -3240,8 +3240,12 @@ static int __ntfs_log_checkpoint(struct ntfs_log *log, bool clean,
 		err = -EIO;
 		goto out_transaction;
 	}
-	if (!err && collect_home && NVolErrors(vol))
-		err = -EIO;
+	if (!err && collect_home) {
+		/* Inode BIO errors are recorded separately from blockdev errors. */
+		err = errseq_check(&vol->sb->s_wb_err, log->home_wb_err);
+		if (!err && NVolErrors(vol))
+			err = -EIO;
+	}
 	if (err) {
 		ntfs_log_abort_writer(log, err);
 		goto out_transaction;
@@ -8255,6 +8259,7 @@ int ntfs_log_start(struct ntfs_volume *vol,
 	log->commit_interval = clamp_t(unsigned int,
 			journal_commit_interval, 1, 3600) * HZ;
 	init_waitqueue_head(&log->durable_wait);
+	log->home_wb_err = errseq_sample(&vol->sb->s_wb_err);
 	atomic64_set(&log->home_generation, 0);
 	atomic64_set(&log->inode_writeback_generation, 0);
 	atomic64_set(&log->home_writeback_generation, 0);

@@ -7,6 +7,7 @@
 #define _LINUX_NTFS_LOGFILE_INTERNAL_H
 
 #include <linux/bitmap.h>
+#include <linux/errseq.h>
 #include <linux/kernel.h>
 #include <linux/jump_label.h>
 #include <linux/list.h>
@@ -735,6 +736,7 @@ struct ntfs_log {
 	atomic64_t home_generation;
 	u64 checkpointed_home_generation;
 	bool checkpointed_generation_valid;
+	errseq_t home_wb_err;
 	/* Inode or metadata-page writeback deferred during a checkpoint pass. */
 	atomic64_t inode_writeback_generation;
 	/* Deferred writeback of an existing journaled home image. */
