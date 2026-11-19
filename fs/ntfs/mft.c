@@ -1185,6 +1185,45 @@ static int ntfs_prepare_mft_record_io_units(struct ntfs_inode *ni,
 	return 2;
 }
 
+static int ntfs_mft_copy_protected_record(const struct ntfs_inode *ni,
+					  const struct mft_record *m,
+					  void *folio_data)
+{
+	struct ntfs_record *dest = folio_data + ni->folio_ofs;
+	u32 size = ni->vol->mft_record_size;
+
+	memcpy(dest, m, size);
+	return pre_write_mst_fixup(dest, size);
+}
+
+/**
+ * ntfs_stage_mft_record - copy a mapped record to the $MFT page cache
+ * @ni: inode whose MFT record is locked by the caller
+ * @m: mapped MFT record
+ *
+ * Writeback checks the staged record's LSN before submitting it. In-flight
+ * writes use private snapshots. Keep the inode dirty so failed retirement
+ * can still write the record synchronously.
+ *
+ * Return: 0 on success or a negative error.
+ */
+int ntfs_stage_mft_record(struct ntfs_inode *ni, const struct mft_record *m)
+{
+	struct folio *folio = ni->folio;
+	void *addr;
+	int err;
+
+	lockdep_assert_held(&ni->mrec_lock);
+	folio_lock(folio);
+	addr = kmap_local_folio(folio, 0);
+	err = ntfs_mft_copy_protected_record(ni, m, addr);
+	kunmap_local(addr);
+	if (!err)
+		folio_mark_dirty(folio);
+	folio_unlock(folio);
+	return err;
+}
+
 /*
  * write_mft_record_nolock - write out a mapped (extent) mft record
  * @ni:		ntfs inode describing the mapped (extent) mft record
@@ -1216,7 +1255,6 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 	unsigned int nr_units;
 	int err = 0;
 	u8 *kaddr;
-	struct mft_record *fixup_m;
 	bool dirty;
 
 	ntfs_debug("Entering for inode 0x%llx.", ni->mft_no);
@@ -1245,11 +1283,7 @@ int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int syn
 	nr_units = err;
 
 	kaddr = kmap_local_folio(folio, 0);
-	fixup_m = (struct mft_record *)(kaddr + ni->folio_ofs);
-	memcpy(fixup_m, m, vol->mft_record_size);
-
-	/* Apply the mst protection fixups. */
-	err = pre_write_mst_fixup((struct ntfs_record *)fixup_m, vol->mft_record_size);
+	err = ntfs_mft_copy_protected_record(ni, m, kaddr);
 	if (err) {
 		ntfs_error(vol->sb, "Failed to apply mst fixups!");
 		goto unmap_err_out;

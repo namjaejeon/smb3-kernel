@@ -908,7 +908,7 @@ static int ntfs_retire_deleted_attribute(struct ntfs_inode *ni)
 static int __ntfs_truncate_vfs(struct inode *vi, loff_t new_size,
 		loff_t i_size, bool holes, bool initialize_delalloc,
 		bool update_timestamps);
-static int ntfs_preserve_deleted_inode(struct ntfs_inode *ni);
+static int ntfs_preserve_deleted_inode(struct ntfs_inode *ni, bool sync);
 
 int ntfs_reclaim_deleted_attribute(struct inode *vi)
 {
@@ -970,7 +970,8 @@ int ntfs_drop_big_inode(struct inode *inode)
 
 		atomic_inc(&inode->i_count);
 		spin_unlock(&inode->i_lock);
-		err = ntfs_preserve_deleted_inode(ni);
+		/* Keep the MFT image available to writeback through eviction. */
+		err = ntfs_preserve_deleted_inode(ni, false);
 		if (err) {
 			NVolSetRecoveryNeeded(ni->vol);
 			NVolSetErrors(ni->vol);
@@ -3088,40 +3089,42 @@ void ntfs_clear_extent_inode(struct ntfs_inode *ni)
 	ntfs_destroy_extent_inode(ni);
 }
 
-static int ntfs_preserve_deleted_record(struct ntfs_inode *ni)
+static int ntfs_preserve_deleted_record(struct ntfs_inode *ni, bool sync)
 {
 	struct mft_record *m;
 	int err;
 
 	if (!NInoDirty(ni))
 		return 0;
-	err = ntfs_prepare_mft_record_write(ni);
-	if (err)
-		return err;
+	if (sync) {
+		err = ntfs_prepare_mft_record_write(ni);
+		if (err)
+			return err;
+	}
 	m = map_mft_record(ni);
 	if (IS_ERR(m))
 		return PTR_ERR(m);
-	err = write_mft_record(ni, m, 1);
+	err = sync ? write_mft_record(ni, m, 1) : ntfs_stage_mft_record(ni, m);
 	unmap_mft_record(ni);
 	return err;
 }
 
 /*
- * Failed retirement leaves the records allocated.  Keep their dirty
- * images before releasing the private buffers used by extent inodes.
+ * Stage the dirty MFT images before eviction can hide the private copies
+ * from checkpoint writeback. A retained orphan requests synchronous I/O.
  */
-static int ntfs_preserve_deleted_inode(struct ntfs_inode *ni)
+static int ntfs_preserve_deleted_inode(struct ntfs_inode *ni, bool sync)
 {
 	int err, ret, i;
 
 	mutex_lock(&ni->mrec_lock);
-	err = ntfs_preserve_deleted_record(ni);
+	err = ntfs_preserve_deleted_record(ni, sync);
 	mutex_lock(&ni->extent_lock);
 	for (i = 0; i < ni->nr_extents; i++) {
 		struct ntfs_inode *ext_ni = ni->ext.extent_ntfs_inos[i];
 
 		mutex_lock(&ext_ni->mrec_lock);
-		ret = ntfs_preserve_deleted_record(ext_ni);
+		ret = ntfs_preserve_deleted_record(ext_ni, sync);
 		mutex_unlock(&ext_ni->mrec_lock);
 		if (!err)
 			err = ret;
@@ -3139,7 +3142,7 @@ static void ntfs_preserve_failed_retirement(struct ntfs_inode *ni)
 	NVolSetErrors(ni->vol);
 	if (NVolShutdown(ni->vol))
 		return;
-	err = ntfs_preserve_deleted_inode(ni);
+	err = ntfs_preserve_deleted_inode(ni, true);
 	if (err) {
 		NVolSetShutdown(ni->vol);
 		ni->vol->sb->s_flags |= SB_RDONLY;
@@ -3285,7 +3288,7 @@ retire_close:
 			/* Mount recovery can shrink the attributes in bounded steps. */
 			NVolSetRecoveryNeeded(ni->vol);
 			retire_stage = "orphan preservation";
-			err = ntfs_preserve_deleted_inode(ni);
+			err = ntfs_preserve_deleted_inode(ni, true);
 		}
 		if (first_mismatch >= 0) {
 			NVolSetErrors(ni->vol);

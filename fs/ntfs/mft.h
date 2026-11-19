@@ -54,6 +54,7 @@ int ntfs_mft_bioset_init(void);
 void ntfs_mft_bioset_exit(void);
 int ntfs_resync_mft_mirror(struct ntfs_volume *vol);
 int ntfs_prepare_mft_record_write(struct ntfs_inode *ni);
+int ntfs_stage_mft_record(struct ntfs_inode *ni, const struct mft_record *m);
 int write_mft_record_nolock(struct ntfs_inode *ni, struct mft_record *m, int sync);
 int ntfs_mft_wait_page_log(struct ntfs_volume *vol, const u8 *data,
 		pgoff_t index, u32 start, u32 len, bool sync);
