@@ -10807,6 +10807,8 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 			}
 		}
 	} else {
+		if (was_delalloc)
+			ni->i_dealloc_clusters -= clu_count;
 		VFS_I(ni)->i_blocks += clu_count << (vol->cluster_size_bits - 9);
 		NInoSetRunlistDirty(ni);
 		mark_mft_record_dirty(base_ni);
@@ -10815,8 +10817,6 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 	*lcn_start = lcn;
 	*lcn_count = clu_count;
 	*balloc = true;
-	if (!err && was_delalloc)
-		ni->i_dealloc_clusters -= clu_count;
 	goto out;
 free_alloc:
 	if (was_delalloc)
