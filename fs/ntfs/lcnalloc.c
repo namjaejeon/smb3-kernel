@@ -23,6 +23,7 @@
 
 struct ntfs_cluster_alloc_undo {
 	struct ntfs_volume *vol;
+	s64 delayed_clusters;
 	struct runlist_element rl[];
 };
 
@@ -54,12 +55,20 @@ static int ntfs_cluster_free_from_rl_nolock_core(struct ntfs_volume *vol,
 
 static int ntfs_cluster_alloc_home_restore(void *data)
 {
-	if (!data)
+	struct ntfs_cluster_alloc_undo *undo = data;
+
+	if (!undo || !undo->vol)
 		return -EINVAL;
 	/*
-	 * Keep allocated bits reserved until the transaction's compensation
-	 * records are durable. The abort callback releases them afterward.
+	 * Restore the DELALLOC charge before the runlist is restored. The
+	 * allocated bits remain unavailable until the CLR is durable.
 	 */
+	if (undo->delayed_clusters) {
+		down_write(&undo->vol->lcnbmp_lock);
+		ntfs_hold_dirty_clusters(undo->vol, undo->delayed_clusters);
+		undo->delayed_clusters = 0;
+		up_write(&undo->vol->lcnbmp_lock);
+	}
 	return 0;
 }
 
@@ -109,26 +118,40 @@ static void ntfs_cluster_alloc_home_release(void *data)
 
 static int ntfs_cluster_register_alloc_undo(struct ntfs_log_handle *handle,
 		struct ntfs_volume *vol, const struct runlist_element *rl,
-		int nr_runs)
+		int nr_runs, s64 delayed_clusters)
 {
 	struct ntfs_cluster_alloc_undo *undo;
 	size_t bytes;
 	int err;
 
-	if (!handle || !vol || !rl || nr_runs <= 0)
+	if (!handle || !vol || !rl || nr_runs <= 0 || delayed_clusters < 0)
 		return -EINVAL;
+	lockdep_assert_held_write(&vol->lcnbmp_lock);
 	bytes = struct_size(undo, rl, nr_runs + 1);
 	undo = kmalloc(bytes, GFP_NOFS);
 	if (!undo)
 		return -ENOMEM;
 	undo->vol = vol;
+	undo->delayed_clusters = delayed_clusters;
 	memcpy(undo->rl, rl, (nr_runs + 1) * sizeof(*rl));
+	if (delayed_clusters &&
+	    !ntfs_consume_dirty_clusters(vol, delayed_clusters)) {
+		ntfs_error(vol->sb,
+			   "Insufficient delayed allocation charge for %lld allocated clusters.",
+			   (long long)delayed_clusters);
+		NVolSetErrors(vol);
+		ntfs_cluster_alloc_home_release(undo);
+		return -EIO;
+	}
 	err = ntfs_log_register_home_undo_with_abort(handle,
 			ntfs_cluster_alloc_home_restore,
 			ntfs_cluster_alloc_home_abort,
 			ntfs_cluster_alloc_home_release, undo);
-	if (err)
+	if (err) {
+		if (delayed_clusters)
+			ntfs_hold_dirty_clusters(vol, delayed_clusters);
 		ntfs_cluster_alloc_home_release(undo);
+	}
 	return err;
 }
 
@@ -488,7 +511,7 @@ static struct runlist_element *ntfs_cluster_alloc_core(
 		s64 available = atomic64_read(&vol->free_clusters);
 
 		if (!is_dealloc)
-			available -= atomic64_read(&vol->dirty_clusters);
+			available = ntfs_available_clusters(vol);
 		err = ntfs_log_reclaim_deferred(vol,
 				NTFS_LOG_DEFERRED_CLUSTERS, available, min_count,
 				is_contig);
@@ -499,7 +522,7 @@ static struct runlist_element *ntfs_cluster_alloc_core(
 	/* Take the lcnbmp lock for writing. */
 	down_write(&vol->lcnbmp_lock);
 	free_clusters = atomic64_read(&vol->free_clusters);
-	if (is_dealloc == false)
+	if (!is_dealloc)
 		free_clusters -= atomic64_read(&vol->dirty_clusters);
 
 	if (free_clusters < min_count) {
@@ -1134,7 +1157,8 @@ out:
 		}
 		if (log_handle) {
 			err = ntfs_cluster_register_alloc_undo(log_handle, vol, rl,
-					rlpos);
+					rlpos, is_dealloc ?
+					allocation_count - clusters : 0);
 			if (err)
 				goto rollback_alloc;
 		}
@@ -1162,7 +1186,8 @@ rollback_alloc:
 			 * this handle's CLR can be replayed.
 			 */
 			err2 = ntfs_cluster_register_alloc_undo(log_handle, vol,
-					rl, rlpos);
+					rl, rlpos, is_dealloc ?
+					allocation_count - clusters : 0);
 			if (err2) {
 				ntfs_error(vol->sb,
 					"Failed to register partial cluster-allocation rollback (error %i). Leaving clusters reserved; unmount and run chkdsk.",
@@ -1187,9 +1212,6 @@ rollback_alloc:
 	} else if (err == -ENOSPC)
 		ntfs_debug("No space left at all, err = -ENOSPC, first free lcn = 0x%llx.",
 				vol->data1_zone_pos);
-	if (!log_handle)
-		atomic64_set(&vol->dirty_clusters, 0);
-
 out_restore:
 	up_write(&vol->lcnbmp_lock);
 out_memalloc:
@@ -1305,6 +1327,13 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 	return ntfs_cluster_alloc_core(NULL, vol, start_vcn, count, count,
 			start_lcn, zone, is_extension, is_contig, is_dealloc,
 			0);
+}
+
+struct runlist_element *ntfs_cluster_alloc_data_partial(struct ntfs_volume *vol,
+		s64 start_vcn, s64 count, s64 start_lcn, bool is_dealloc)
+{
+	return ntfs_cluster_alloc_core(NULL, vol, start_vcn, count, 1,
+			start_lcn, DATA_ZONE, false, true, is_dealloc, 0);
 }
 
 struct runlist_element *ntfs_cluster_alloc_transacted(

@@ -15,6 +15,7 @@
 struct ntfs_ordered_io;
 
 bool ntfs_iomap_can_share_delalloc(struct ntfs_inode *ni);
+void ntfs_maybe_writeback_delalloc(struct ntfs_volume *vol);
 DECLARE_IOMAP_ITER_NEXT(ntfs_append_iomap_next);
 DECLARE_IOMAP_ITER_NEXT(ntfs_ordered_append_iomap_next);
 DECLARE_IOMAP_ITER_NEXT(ntfs_write_iomap_next);

@@ -2823,6 +2823,7 @@ s64 get_nr_free_clusters(struct ntfs_volume *vol)
  * @nr_clusters is the number of clusters requested for allocation.
  *
  * Reserve up to @nr_clusters for delayed allocation and return the charge.
+ * Return zero when the caller must allocate immediately instead.
  */
 s64 ntfs_reserve_dirty_clusters(struct ntfs_volume *vol, s64 nr_clusters)
 {
@@ -2837,8 +2838,7 @@ s64 ntfs_reserve_dirty_clusters(struct ntfs_volume *vol, s64 nr_clusters)
 	if (!NVolFreeClusterKnown(vol))
 		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
 	if (READ_ONCE(vol->journal)) {
-		free_clusters = atomic64_read(&vol->free_clusters) -
-				atomic64_read(&vol->dirty_clusters);
+		free_clusters = ntfs_available_clusters(vol);
 		err = ntfs_log_reclaim_deferred(vol, NTFS_LOG_DEFERRED_CLUSTERS,
 				free_clusters, nr_clusters, false);
 		if (err)
@@ -2848,19 +2848,13 @@ s64 ntfs_reserve_dirty_clusters(struct ntfs_volume *vol, s64 nr_clusters)
 	down_read(&vol->lcnbmp_lock);
 	do {
 		dirty_clusters = atomic64_read(&vol->dirty_clusters);
-		free_clusters = atomic64_read(&vol->free_clusters) -
-			dirty_clusters;
-		if (free_clusters <= 0) {
+		free_clusters = atomic64_read(&vol->free_clusters);
+		reserved = ntfs_delalloc_limit(vol, free_clusters) - dirty_clusters;
+		if (reserved <= 0) {
 			up_read(&vol->lcnbmp_lock);
-			ntfs_error(vol->sb,
-				"Delayed allocation reservation reports no space (free clusters %lld, dirty clusters %lld, requested %lld, total clusters %lld).",
-				(long long)atomic64_read(&vol->free_clusters),
-				(long long)dirty_clusters,
-				(long long)nr_clusters,
-				(long long)vol->nr_clusters);
-			return -ENOSPC;
+			return 0;
 		}
-		reserved = min(nr_clusters, free_clusters);
+		reserved = min(nr_clusters, reserved);
 	} while (atomic64_cmpxchg(&vol->dirty_clusters, dirty_clusters,
 			dirty_clusters + reserved) != dirty_clusters);
 	up_read(&vol->lcnbmp_lock);
@@ -3001,8 +2995,8 @@ static int ntfs_statfs(struct dentry *dentry, struct kstatfs *sfs)
 	if (size < 0LL)
 		size = 0LL;
 
-	/* Free blocks avail to non-superuser, same as above on NTFS. */
-	sfs->f_bavail = sfs->f_bfree = size;
+	sfs->f_bfree = size;
+	sfs->f_bavail = size;
 
 	/* Number of inodes in filesystem (at this point in time). */
 	read_lock_irqsave(&mft_ni->size_lock, flags);

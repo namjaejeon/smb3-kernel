@@ -98,7 +98,8 @@ int ntfs_attr_size_bounds_check(const struct ntfs_volume *vol,
 int ntfs_attr_can_be_resident(const struct ntfs_volume *vol,
 		const __le32 type);
 int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
-		s64 *lcn_count, s64 max_clu_count, bool *balloc, bool update_mp, bool skip_holes);
+		s64 *lcn_count, s64 max_clu_count, bool *balloc, bool update_mp,
+		bool skip_holes, bool low_space);
 int ntfs_attr_record_resize(struct mft_record *m, struct attr_record *a, u32 new_size);
 int ntfs_resident_attr_value_resize(struct mft_record *m, struct attr_record *a,
 		const u32 new_size);

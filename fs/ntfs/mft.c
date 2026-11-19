@@ -2006,12 +2006,11 @@ static int ntfs_mft_bitmap_extend_allocation_nolock(struct ntfs_volume *vol)
 	tb = 1 << (lcn & 7ull);
 	/*
 	 * A page skipped by the initial scan has no free bits recorded.
-	 * Honor that and the space reserved for delayed allocation.
+	 * Honor that and space reserved for delayed allocation.
 	 */
 	if (*b != 0xff && !(*b & tb) &&
 	    vol->lcn_empty_bits_per_page[ll >> PAGE_SHIFT] &&
-	    atomic64_read(&vol->free_clusters) >
-			atomic64_read(&vol->dirty_clusters)) {
+	    ntfs_available_clusters(vol) > 0) {
 		/* Next cluster is free, allocate it. */
 		*b |= tb;
 		folio_mark_dirty(folio);

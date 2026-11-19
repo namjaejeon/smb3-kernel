@@ -10620,7 +10620,7 @@ int ntfs_attr_truncate(struct ntfs_inode *ni, const s64 newsize)
 
 int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 		s64 *lcn_count, s64 max_clu_count, bool *balloc, bool update_mp,
-		bool skip_holes)
+		bool skip_holes, bool low_space)
 {
 	struct ntfs_inode *base_ni = ntfs_base_inode(ni);
 	struct ntfs_volume *vol = ni->vol;
@@ -10629,6 +10629,7 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 	struct runlist_element *old_rl = NULL;
 	s64 vcn = vcn_start, lcn, clu_count;
 	s64 lcn_seek_from = -1;
+	bool was_delalloc;
 	int err = 0;
 	size_t new_rl_count, old_rl_count;
 
@@ -10659,6 +10660,7 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 	}
 
 	lcn = ntfs_rl_vcn_to_lcn(rl, vcn);
+	was_delalloc = lcn == LCN_DELALLOC;
 	clu_count = min(max_clu_count, rl->length - (vcn - rl->vcn));
 	if (lcn >= LCN_HOLE) {
 		if (lcn > LCN_DELALLOC ||
@@ -10666,6 +10668,10 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 			*lcn_start = lcn;
 			*lcn_count = clu_count;
 			*balloc = false;
+			goto out;
+		}
+		if (was_delalloc && clu_count > ni->i_dealloc_clusters) {
+			err = -EIO;
 			goto out;
 		}
 	} else {
@@ -10710,8 +10716,12 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 		}
 	}
 
-	rlc = ntfs_cluster_alloc(vol, vcn, clu_count, lcn_seek_from, DATA_ZONE,
-			false, true, true);
+	if (low_space)
+		rlc = ntfs_cluster_alloc_data_partial(vol, vcn, clu_count,
+				lcn_seek_from, was_delalloc);
+	else
+		rlc = ntfs_cluster_alloc(vol, vcn, clu_count, lcn_seek_from,
+				DATA_ZONE, false, true, was_delalloc);
 	if (IS_ERR(rlc)) {
 		err = PTR_ERR(rlc);
 		goto out;
@@ -10720,28 +10730,27 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 	WARN_ON(rlc->vcn != vcn);
 	lcn = rlc->lcn;
 	clu_count = rlc->length;
+	if (low_space) {
+		/* Do not publish a new mapping until its media is zeroed. */
+		err = ntfs_dio_zero_range(VFS_I(ni),
+				ntfs_cluster_to_bytes(vol, lcn),
+				ntfs_cluster_to_bytes(vol, clu_count));
+		if (err)
+			goto free_alloc;
+	}
 	old_rl_count = ni->runlist.count;
 	old_rl = kmemdup(ni->runlist.rl,
 			 old_rl_count * sizeof(*old_rl), GFP_NOFS);
 	if (!old_rl) {
 		err = -ENOMEM;
-		if (ntfs_cluster_free_from_rl(vol, rlc)) {
-			ntfs_error(vol->sb,
-				   "Failed to free cluster allocation after runlist backup failure.");
-			NVolSetErrors(vol);
-		}
-		kvfree(rlc);
-		goto out;
+		goto free_alloc;
 	}
 
 	rl = ntfs_runlists_merge(&ni->runlist, rlc, 0, &new_rl_count);
 	if (IS_ERR(rl)) {
 		ntfs_error(vol->sb, "Failed to merge runlists");
 		err = PTR_ERR(rl);
-		if (ntfs_cluster_free_from_rl(vol, rlc))
-			ntfs_error(vol->sb, "Failed to free hot clusters.");
-		kvfree(rlc);
-		goto out;
+		goto free_alloc;
 	}
 	ni->runlist.rl = rl;
 	ni->runlist.count = new_rl_count;
@@ -10760,6 +10769,8 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 		if (err) {
 			int err2;
 
+			if (was_delalloc)
+				ntfs_hold_dirty_clusters(vol, clu_count);
 			err2 = ntfs_cluster_free(ni, vcn, clu_count, ctx);
 			if (err2 < 0 || err2 != clu_count) {
 				ntfs_error(vol->sb,
@@ -10792,6 +10803,17 @@ int ntfs_attr_map_cluster(struct ntfs_inode *ni, s64 vcn_start, s64 *lcn_start,
 	*lcn_start = lcn;
 	*lcn_count = clu_count;
 	*balloc = true;
+	if (!err && was_delalloc)
+		ni->i_dealloc_clusters -= clu_count;
+	goto out;
+free_alloc:
+	if (was_delalloc)
+		ntfs_hold_dirty_clusters(vol, clu_count);
+	if (ntfs_cluster_free_from_rl(vol, rlc)) {
+		ntfs_error(vol->sb, "Failed to free cluster allocation.");
+		NVolSetErrors(vol);
+	}
+	kvfree(rlc);
 out:
 	kvfree(old_rl);
 	ntfs_attr_put_search_ctx(ctx);
@@ -12455,8 +12477,6 @@ static int ntfs_attr_fallocate_journaled(struct ntfs_inode *ni, loff_t start,
 		mutex_unlock(&mrec_ni->mrec_lock);
 		if (err)
 			return err;
-		if (was_delalloc && balloc)
-			ntfs_release_dirty_clusters(vol, alloc_count);
 		vcn += alloc_count;
 		cond_resched();
 	}
@@ -12585,7 +12605,8 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
 						NTFS_INODE_MUTEX_NORMAL);
 				down_write(&ni->runlist.lock);
 				err = ntfs_attr_map_cluster(ni, vcn, &lcn, &alloc_cnt,
-							    try_alloc_cnt, &balloc, false, false);
+							    try_alloc_cnt, &balloc, false, false,
+							    false);
 				up_write(&ni->runlist.lock);
 				mutex_unlock(&base_ni->mrec_lock);
 				if (err)
@@ -12618,7 +12639,7 @@ int ntfs_attr_fallocate(struct ntfs_inode *ni, loff_t start, loff_t byte_len, bo
 		mutex_lock_nested(&base_ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
 		down_write(&ni->runlist.lock);
 		err = ntfs_attr_map_cluster(ni, vcn, &lcn, &alloc_cnt,
-					    try_alloc_cnt, &balloc, false, false);
+					    try_alloc_cnt, &balloc, false, false, false);
 		up_write(&ni->runlist.lock);
 		mutex_unlock(&base_ni->mrec_lock);
 		if (err || fatal_signal_pending(current))

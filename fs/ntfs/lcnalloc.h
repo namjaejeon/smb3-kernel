@@ -41,6 +41,8 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 		const bool is_extension,
 		const bool is_contig,
 		const bool is_dealloc);
+struct runlist_element *ntfs_cluster_alloc_data_partial(struct ntfs_volume *vol,
+		s64 start_vcn, s64 count, s64 start_lcn, bool is_dealloc);
 /*
  * A caller-owned transaction must be aborted after an allocation error.
  * Partially allocated bits remain reserved until its abort is durable.
@@ -55,8 +57,8 @@ struct runlist_element *ntfs_cluster_alloc_transacted(
  * @min_count clusters are available.  A nonzero @max_runs bounds fragmentation
  * and must be at least @min_count. Zero leaves it unlimited.  An error still
  * requires aborting @handle because a partial allocation may have been logged.
- * A DELALLOC caller owns the dirty-cluster charge until it commits or restores
- * its runlist.
+ * A DELALLOC allocation consumes its dirty-cluster charge when the bitmap
+ * allocation is registered for undo; abort restores the charge.
  */
 struct runlist_element *ntfs_cluster_alloc_transacted_partial(
 		struct ntfs_log_handle *handle, struct ntfs_volume *vol,

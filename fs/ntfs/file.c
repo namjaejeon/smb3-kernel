@@ -1132,8 +1132,7 @@ static ssize_t ntfs_buffered_append(struct kiocb *iocb, struct iov_iter *from,
 			if (prealloc_size == SZ_1M &&
 			    grow_clusters > required_clusters &&
 			    NVolFreeClusterKnown(ni->vol)) {
-				s64 available = atomic64_read(&ni->vol->free_clusters) -
-						atomic64_read(&ni->vol->dirty_clusters);
+				s64 available = ntfs_available_clusters(ni->vol);
 
 				/* A stale count only affects this optional tail. */
 				if (available < 0 || (u64)available < grow_clusters)
@@ -1340,9 +1339,9 @@ static ssize_t ntfs_buffered_gap_append(struct kiocb *iocb,
 }
 
 /*
- * Extend an eligible buffered append, including a small gap, with holes
- * rather than allocating its new clusters.  A physical partial-EOF cluster
- * must still be zeroed before its initialized size is published.
+ * Extend an eligible buffered append, including a small gap, with holes.
+ * Iomap reserves or allocates the new clusters as space permits. A physical
+ * partial-EOF cluster must still be zeroed before initialized size is published.
  */
 static bool ntfs_begin_delalloc_append(struct ntfs_inode *ni,
 		unsigned int ki_flags, loff_t pos, loff_t end,
@@ -1473,6 +1472,9 @@ retry:
 
 	if (NInoCompressed(ni) && iocb->ki_flags & IOCB_DIRECT)
 		return -EOPNOTSUPP;
+
+	if (!(iocb->ki_flags & IOCB_NOWAIT))
+		ntfs_maybe_writeback_delalloc(vol);
 
 	if (iocb->ki_flags & IOCB_NOWAIT) {
 		if (!inode_trylock(vi))
@@ -1733,6 +1735,7 @@ static vm_fault_t ntfs_filemap_page_mkwrite(struct vm_fault *vmf)
 		cond_resched();
 		return VM_FAULT_NOPAGE;
 	}
+	ntfs_maybe_writeback_delalloc(ni->vol);
 	/* Observe the size after a completed or aborted gap append. */
 	smp_rmb();
 
@@ -2088,9 +2091,7 @@ static int ntfs_allocate_range(struct ntfs_inode *ni, int mode, loff_t offset,
 		need_space = end_vcn - need_space;
 	else
 		need_space = end_vcn - start_vcn;
-	if (need_space > 0 &&
-	    need_space > (atomic64_read(&vol->free_clusters) -
-			  atomic64_read(&vol->dirty_clusters))) {
+	if (need_space > 0 && need_space > ntfs_available_clusters(vol)) {
 		err = -ENOSPC;
 		goto out;
 	}

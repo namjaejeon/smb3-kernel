@@ -16,6 +16,7 @@
 #include <linux/uidgid.h>
 #include <linux/workqueue.h>
 #include <linux/errseq.h>
+#include <linux/math64.h>
 
 #include "layout.h"
 
@@ -307,6 +308,27 @@ DEFINE_NVOL_BIT_OPS(Replaying)
 DEFINE_NVOL_BIT_OPS(RecoveryNeeded)
 DEFINE_NVOL_BIT_OPS(NoRecovery)
 
+static inline s64 ntfs_available_clusters(struct ntfs_volume *vol)
+{
+	return atomic64_read(&vol->free_clusters) -
+		atomic64_read(&vol->dirty_clusters);
+}
+
+/*
+ * Stop creating DELALLOC reservations when 5% of the volume remains
+ * unreserved, or when dirty reservations exceed two thirds of free space.
+ * The remaining space is still available for immediate allocations.
+ */
+static inline s64 ntfs_delalloc_limit(struct ntfs_volume *vol, s64 free)
+{
+	s64 watermark = max_t(s64, div_u64(vol->nr_clusters, 20), 1);
+	s64 relative_limit;
+
+	free = max_t(s64, free, 0);
+	relative_limit = free - DIV_ROUND_UP_ULL((u64)free, 3);
+	return max_t(s64, min(free - watermark, relative_limit), 0);
+}
+
 static inline void ntfs_inc_free_clusters(struct ntfs_volume *vol, s64 nr)
 {
 	if (!NVolFreeClusterKnown(vol))
@@ -348,12 +370,26 @@ static __always_inline void ntfs_hold_dirty_clusters(struct ntfs_volume *vol, s6
 	atomic64_add(nr_clusters, &vol->dirty_clusters);
 }
 
+static inline bool ntfs_consume_dirty_clusters(struct ntfs_volume *vol, s64 nr_clusters)
+{
+	s64 dirty = atomic64_read(&vol->dirty_clusters);
+
+	do {
+		if (dirty < nr_clusters)
+			return false;
+	} while (!atomic64_try_cmpxchg(&vol->dirty_clusters, &dirty,
+				      dirty - nr_clusters));
+	return true;
+}
+
 static __always_inline void ntfs_release_dirty_clusters(struct ntfs_volume *vol, s64 nr_clusters)
 {
-	if (atomic64_read(&vol->dirty_clusters) < nr_clusters)
-		atomic64_set(&vol->dirty_clusters, 0);
-	else
-		atomic64_sub(nr_clusters, &vol->dirty_clusters);
+	s64 dirty = atomic64_read(&vol->dirty_clusters);
+	s64 remaining;
+
+	do {
+		remaining = max_t(s64, dirty - nr_clusters, 0);
+	} while (!atomic64_try_cmpxchg(&vol->dirty_clusters, &dirty, remaining));
 }
 
 s64 ntfs_reserve_dirty_clusters(struct ntfs_volume *vol, s64 nr_clusters);
