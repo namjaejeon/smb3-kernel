@@ -6759,6 +6759,7 @@ static bool ntfs_restart_record_is_durable(struct inode *log_vi,
  * ntfs_check_logfile - check the journal for consistency
  * @log_vi:	struct inode of loaded journal LogFile to check
  * @rp:		[OUT] on success this is a copy of the current restart page
+ * @restart_pos:	[OUT] offset of the selected restart page, or NULL
  *
  * Check the LogFile journal for consistency and return 'true' if it is
  * consistent and 'false' if not.  On success, the current restart page is
@@ -6772,10 +6773,12 @@ static bool ntfs_restart_record_is_durable(struct inode *log_vi,
  * if the LogFile was created on a system with a different page size to ours
  * yet and mst deprotection would fail if our page size is smaller.
  */
-bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
+bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp,
+		u64 *restart_pos)
 {
 	s64 size, pos;
 	s64 rstr1_lsn, rstr2_lsn;
+	u64 selected_pos = 0;
 	struct ntfs_volume *vol = NTFS_SB(log_vi->i_sb);
 	struct address_space *mapping = log_vi->i_mapping;
 	struct folio *folio = NULL;
@@ -6877,6 +6880,8 @@ bool ntfs_check_logfile(struct inode *log_vi, struct restart_page_header **rp)
 				!rstr1_ph ? &rstr1_ph : &rstr2_ph,
 				!rstr1_ph ? &rstr1_lsn : &rstr2_lsn);
 		if (!err) {
+			if (!rstr2_ph)
+				selected_pos = pos;
 			/*
 			 * If we have now found the first (modified by chkdsk)
 			 * restart page, continue looking for the second one.
@@ -6942,15 +6947,16 @@ is_empty:
 		if (!ntfs_restart_record_is_durable(log_vi, newer) &&
 		    ntfs_restart_record_is_durable(log_vi, older)) {
 			ntfs_debug("More recent restart page is not durable; falling back to the older one.");
-			rstr1_ph = older;
-			kvfree(newer);
-		} else {
-			rstr1_ph = newer;
-			kvfree(older);
+			swap(newer, older);
 		}
-		rstr2_ph = NULL;
+		if (newer == rstr2_ph)
+			selected_pos = pos;
+		rstr1_ph = newer;
+		kvfree(older);
 	}
 	/* All consistency checks passed. */
+	if (restart_pos)
+		*restart_pos = selected_pos;
 	if (rp)
 		*rp = rstr1_ph;
 	else

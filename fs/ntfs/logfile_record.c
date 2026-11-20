@@ -1417,11 +1417,11 @@ static int ntfs_log_raw_write(struct ntfs_log *log, u64 file_off,
  * A private direct-mapped copy is used because bdev_rw_virt() cannot consume a
  * vmalloc address and the block-device page cache must not retain stale data.
  */
-static int ntfs_log_raw_write_fua(struct ntfs_log *log, u64 file_off,
-		const void *buffer, u32 bytes, bool preflush)
+static int ntfs_log_raw_write_fua(struct ntfs_volume *vol, u64 log_size,
+		u64 file_off, const void *buffer, u32 bytes, bool preflush)
 {
-	struct ntfs_inode *log_ni = NTFS_I(log->vol->logfile_ino);
-	struct address_space *mapping = ntfs_log_bdev_mapping(log->vol->sb);
+	struct ntfs_inode *log_ni = NTFS_I(vol->logfile_ino);
+	struct address_space *mapping = ntfs_log_bdev_mapping(vol->sb);
 	u8 *data;
 	u64 end_off;
 	u32 done = 0;
@@ -1430,20 +1430,20 @@ static int ntfs_log_raw_write_fua(struct ntfs_log *log, u64 file_off,
 	if (!bytes || !buffer || !IS_ALIGNED(bytes, SECTOR_SIZE) ||
 	    !IS_ALIGNED(file_off, SECTOR_SIZE) ||
 	    check_add_overflow(file_off, (u64)bytes, &end_off) ||
-	    end_off > log->layout.log_size)
+	    end_off > log_size)
 		return -EINVAL;
 	data = kmemdup(buffer, bytes, GFP_NOFS);
 	if (!data)
 		return -ENOMEM;
 
-	truncate_inode_pages_range(log->vol->logfile_ino->i_mapping,
+	truncate_inode_pages_range(vol->logfile_ino->i_mapping,
 			file_off, end_off - 1);
 	down_write(&log_ni->runlist.lock);
 	while (done < bytes) {
 		struct runlist_element *rl;
 		u64 pos = file_off + done;
-		u64 cluster_off = pos & log->vol->cluster_size_mask;
-		s64 vcn = pos >> log->vol->cluster_size_bits;
+		u64 cluster_off = pos & vol->cluster_size_mask;
+		s64 vcn = pos >> vol->cluster_size_bits;
 		s64 run_clusters;
 		u64 run_bytes;
 		loff_t dev_off;
@@ -1461,13 +1461,13 @@ static int ntfs_log_raw_write_fua(struct ntfs_log *log, u64 file_off,
 			break;
 		}
 		run_clusters = rl->length - (vcn - rl->vcn);
-		run_bytes = (u64)run_clusters << log->vol->cluster_size_bits;
+		run_bytes = (u64)run_clusters << vol->cluster_size_bits;
 		if (run_bytes <= cluster_off) {
 			err = -EIO;
 			break;
 		}
 		len = min_t(u64, bytes - done, run_bytes - cluster_off);
-		dev_off = NTFS_CLU_TO_B(log->vol,
+		dev_off = NTFS_CLU_TO_B(vol,
 				rl->lcn + vcn - rl->vcn) + cluster_off;
 		if (!IS_ALIGNED(dev_off, SECTOR_SIZE) ||
 		    !IS_ALIGNED(len, SECTOR_SIZE)) {
@@ -1489,7 +1489,7 @@ static int ntfs_log_raw_write_fua(struct ntfs_log *log, u64 file_off,
 		/* The final extent also makes any earlier extents durable. */
 		if (done + len == bytes)
 			op |= REQ_FUA | ((preflush || done) ? REQ_PREFLUSH : 0);
-		err = bdev_rw_virt(log->vol->sb->s_bdev,
+		err = bdev_rw_virt(vol->sb->s_bdev,
 				dev_off >> SECTOR_SHIFT, data + done, len, op);
 		if (err)
 			break;
@@ -1498,7 +1498,7 @@ static int ntfs_log_raw_write_fua(struct ntfs_log *log, u64 file_off,
 		done += len;
 	}
 	up_write(&log_ni->runlist.lock);
-	truncate_inode_pages_range(log->vol->logfile_ino->i_mapping,
+	truncate_inode_pages_range(vol->logfile_ino->i_mapping,
 			file_off, end_off - 1);
 	kfree(data);
 	return err;
@@ -2320,7 +2320,7 @@ static int ntfs_log_write_restart_copy(struct ntfs_log *log, u16 slot,
 
 	started = ktime_get_ns();
 	if (flush)
-		err = ntfs_log_raw_write_fua(log,
+		err = ntfs_log_raw_write_fua(log->vol, log->layout.log_size,
 				(u64)slot * log->layout.system_page_size,
 				page, log->layout.system_page_size, preflush);
 	else
@@ -2521,9 +2521,9 @@ static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
 			if (buffered)
 				err = ntfs_log_sync_logfile_pages(log);
 			if (!err)
-				err = ntfs_log_raw_write_fua(log, page->file_off, data,
-							   log->layout.page_size,
-							   preflush);
+				err = ntfs_log_raw_write_fua(log->vol, log->layout.log_size,
+					page->file_off, data, log->layout.page_size,
+					preflush);
 		} else {
 			err = ntfs_log_raw_write(log, page->file_off, data,
 						log->layout.page_size, false);
@@ -2564,8 +2564,9 @@ static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
 					NTFS_LOG_RECORDING_COMBINED_CHECKPOINT_FLUSH,
 					1);
 	} else {
-		err = ntfs_log_raw_write_fua(log, marker_page->file_off,
-				marker_page->data, marker_write_bytes, true);
+		err = ntfs_log_raw_write_fua(log->vol, log->layout.log_size,
+				marker_page->file_off, marker_page->data,
+				marker_write_bytes, true);
 		phase_started = ktime_get_ns() - phase_started;
 		ntfs_log_recording_account(
 				NTFS_LOG_RECORDING_RECORD_CACHE_FLUSH_NS,
@@ -8061,14 +8062,63 @@ int ntfs_log_stop(struct ntfs_volume *vol, bool clean)
 	return __ntfs_log_stop(vol, clean, clean);
 }
 
+/* Close the recovered log client while preserving the on-disk format. */
+static int ntfs_log_close_replayed_client(struct ntfs_volume *vol,
+		struct restart_page_header *rp, u64 restart_pos)
+{
+	struct restart_area *ra;
+	struct log_client_record *clients, *client;
+	u32 page_size = le32_to_cpu(rp->system_page_size);
+	u16 client_idx, free_idx;
+	u64 log_size;
+	int err;
+
+	ra = (void *)((u8 *)rp + le16_to_cpu(rp->restart_area_offset));
+	log_size = le64_to_cpu(ra->file_size);
+	clients = (void *)((u8 *)ra + le16_to_cpu(ra->client_array_offset));
+	client_idx = le16_to_cpu(ra->client_in_use_list);
+	if (client_idx >= le16_to_cpu(ra->log_clients))
+		return -EINVAL;
+	client = &clients[client_idx];
+	if (client->next_client != LOGFILE_NO_CLIENT)
+		return -EOPNOTSUPP;
+	free_idx = le16_to_cpu(ra->client_free_list);
+	if (free_idx != LOGFILE_NO_CLIENT_CPU)
+		clients[free_idx].prev_client = ra->client_in_use_list;
+	client->next_client = ra->client_free_list;
+	client->client_restart_lsn = 0;
+	client->oldest_lsn = 0;
+	ra->client_free_list = ra->client_in_use_list;
+	ra->client_in_use_list = LOGFILE_NO_CLIENT;
+	ra->flags |= RESTART_VOLUME_IS_CLEAN;
+	ra->current_lsn = cpu_to_le64(max(le64_to_cpu(ra->current_lsn),
+					 vol->journal_recovery_lsn));
+	ra->last_lsn_data_length = 0;
+	err = pre_write_mst_fixup((struct ntfs_record *)rp, page_size);
+	if (err)
+		return err;
+
+	/* Keep the selected restart page until the other copy is durable. */
+	err = ntfs_log_raw_write_fua(vol, log_size, page_size - restart_pos,
+				     rp, page_size, true);
+	if (err)
+		return err;
+	return ntfs_log_raw_write_fua(vol, log_size, restart_pos, rp, page_size,
+				     false);
+}
+
 int ntfs_log_finish_replay(struct ntfs_volume *vol,
-			   const struct restart_page_header *rp)
+			   struct restart_page_header *rp, u64 restart_pos)
 {
 	int err;
+
+	/* The caller persisted the dirty flag. Orphan cleanup has not run. */
+	if (le16_to_cpu(rp->major_ver) != NTFS_LOG_V1_MAJOR ||
+	    le16_to_cpu(rp->minor_ver) != NTFS_LOG_V1_MINOR)
+		return ntfs_log_close_replayed_client(vol, rp, restart_pos);
 
 	err = ntfs_log_start(vol, rp);
 	if (err)
 		return err;
-	/* The caller persisted the dirty flag. Orphan cleanup has not run. */
 	return __ntfs_log_stop(vol, true, false);
 }

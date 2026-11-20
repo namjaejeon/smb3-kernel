@@ -255,7 +255,7 @@ struct ntfs_new_attribute_sizes {
 } __packed;
 
 bool ntfs_check_logfile(struct inode *log_vi,
-		struct restart_page_header **rp);
+		struct restart_page_header **rp, u64 *restart_pos);
 bool ntfs_is_logfile_clean(const struct restart_page_header *rp);
 int ntfs_replay_logfile(struct ntfs_volume *vol,
 		const struct restart_page_header *rp);
@@ -278,7 +278,7 @@ int ntfs_log_reclaim_locked(struct ntfs_volume *vol);
 int ntfs_log_wait_ready(struct ntfs_volume *vol);
 int ntfs_log_stop(struct ntfs_volume *vol, bool clean);
 int ntfs_log_finish_replay(struct ntfs_volume *vol,
-			   const struct restart_page_header *rp);
+			   struct restart_page_header *rp, u64 restart_pos);
 int ntfs_log_wait_lsn(struct ntfs_volume *vol, u64 required_lsn);
 int ntfs_log_writeback_lsn(struct ntfs_volume *vol, u64 required_lsn,
 		bool sync);

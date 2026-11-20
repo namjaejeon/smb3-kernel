@@ -1393,11 +1393,12 @@ mft_unmap_out:
  * load_and_check_logfile - load and check the logfile inode for a volume
  * @vol: ntfs volume to load the logfile for
  * @rp: on success, set to the restart page header
+ * @restart_pos: on success with a restart page, set to its file offset
  *
  * Return 0 on success or errno on error.
  */
 static int load_and_check_logfile(struct ntfs_volume *vol,
-				  struct restart_page_header **rp)
+				 struct restart_page_header **rp, u64 *restart_pos)
 {
 	struct inode *tmp_ino;
 	int err = 0;
@@ -1410,7 +1411,7 @@ static int load_and_check_logfile(struct ntfs_volume *vol,
 		/* Caller will display error message. */
 		return -ENOENT;
 	}
-	if (!ntfs_check_logfile(tmp_ino, rp))
+	if (!ntfs_check_logfile(tmp_ino, rp, restart_pos))
 		err = -EINVAL;
 	NInoSetSparseDisabled(NTFS_I(tmp_ino));
 	vol->logfile_ino = tmp_ino;
@@ -1423,7 +1424,7 @@ static int ntfs_start_logfile_writer(struct ntfs_volume *vol)
 	struct restart_page_header *rp = NULL;
 	int err;
 
-	if (!ntfs_check_logfile(vol->logfile_ino, &rp))
+	if (!ntfs_check_logfile(vol->logfile_ino, &rp, NULL))
 		return -EINVAL;
 	err = ntfs_log_start(vol, rp);
 	kvfree(rp);
@@ -1937,6 +1938,7 @@ static int load_system_files(struct ntfs_volume *vol)
 	struct volume_information *vi;
 	struct ntfs_attr_search_ctx *ctx;
 	struct restart_page_header *rp;
+	u64 restart_pos = 0;
 	__le16 must_mount_ro;
 	bool requested_readonly = sb_rdonly(sb);
 	bool readonly_recovery = false;
@@ -2102,7 +2104,7 @@ get_ctx_vol_failed:
 	 * was shutdown cleanly.
 	 */
 	rp = NULL;
-	err = load_and_check_logfile(vol, &rp);
+	err = load_and_check_logfile(vol, &rp, &restart_pos);
 	if (err) {
 		/* A writer cannot safely run without a validated recovery log. */
 		if (!sb_rdonly(sb)) {
@@ -2161,12 +2163,21 @@ get_ctx_vol_failed:
 				NVolSetErrors(vol);
 				replay_only_failed = replay_only;
 			} else if (replay_only) {
-				if (sb_rdonly(sb) || NVolErrors(vol) || NVolShutdown(vol))
+				struct address_space *mft_mapping = vol->mft_ino->i_mapping;
+
+				if (sb_rdonly(sb) || NVolErrors(vol) || NVolShutdown(vol)) {
 					err = -EIO;
-				else
-					err = filemap_write_and_wait(vol->mft_ino->i_mapping);
+				} else {
+					sync_inodes_sb(sb);
+					err = filemap_write_and_wait(mft_mapping);
+				}
 				if (!err)
 					err = sync_blockdev(sb->s_bdev);
+				if (!err)
+					err = errseq_check(&sb->s_wb_err, vol->wb_err);
+				if (!err && (NVolErrors(vol) || NVolShutdown(vol) ||
+					     mapping_tagged(mft_mapping, PAGECACHE_TAG_DIRTY)))
+					err = -EIO;
 				if (!err)
 					err = blkdev_issue_flush(sb->s_bdev);
 				if (!err)
@@ -2174,7 +2185,7 @@ get_ctx_vol_failed:
 				if (!err)
 					err = ntfs_persist_volume_flags(vol, false);
 				if (!err)
-					err = ntfs_log_finish_replay(vol, rp);
+					err = ntfs_log_finish_replay(vol, rp, restart_pos);
 				if (err) {
 					ntfs_error(sb, "Failed to finish journal replay (%d).",
 						   -err);
