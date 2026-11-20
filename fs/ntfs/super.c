@@ -484,12 +484,13 @@ static int ntfs_reconfigure(struct fs_context *fc)
 		}
 	} else if (!sb_rdonly(sb) && (fc->sb_flags & SB_RDONLY)) {
 		bool forced = fc->sb_flags & SB_FORCE;
+		bool had_journal = !!vol->journal;
 
 		err = 0;
-		if (forced && vol->journal) {
+		if (forced && had_journal) {
 			/* In-flight writers can still need the journal. */
 			NVolSetRecoveryNeeded(vol);
-		} else if (vol->journal) {
+		} else if (had_journal) {
 			err = ntfs_log_stop(vol, !NVolErrors(vol) &&
 					!NVolShutdown(vol) &&
 					!NVolRecoveryNeeded(vol));
@@ -508,8 +509,12 @@ static int ntfs_reconfigure(struct fs_context *fc)
 			if (!err)
 				err = dirty_err;
 		}
-		if (err && !forced)
+		if (err && !forced) {
+			/* Journal stop detaches the writer even when it fails. */
+			if (had_journal)
+				sb->s_flags |= SB_RDONLY;
 			return err;
+		}
 	}
 
 	ntfs_debug("Done.");
