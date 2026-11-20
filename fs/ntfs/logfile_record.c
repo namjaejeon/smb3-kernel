@@ -3449,6 +3449,9 @@ static int ntfs_log_checkpoint_reason(struct ntfs_volume *vol, bool clean,
 		ntfs_log_recording_account(NTFS_LOG_RECORDING_CHECKPOINT_SKIP, 1);
 		ntfs_log_recording_account(reason, 1);
 		mutex_unlock(&log->checkpoint_lock);
+		/* Completed data writes can still be in the device cache. */
+		if (reason == NTFS_LOG_RECORDING_EXPLICIT_CHECKPOINT)
+			return blkdev_issue_flush(vol->sb->s_bdev);
 		return 0;
 	}
 	for (kind = 0; kind < NTFS_LOG_DEFERRED_KINDS; kind++) {
