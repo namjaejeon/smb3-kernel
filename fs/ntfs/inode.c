@@ -4456,7 +4456,8 @@ static int __ntfs_truncate_vfs(struct inode *vi, loff_t new_size,
 		!NVolDisableSparse(ni->vol) && !NInoSparseDisabled(ni) &&
 		ni->vol->major_ver >= 3;
 	deleted_attr = ntfs_deleted_reclaim_inode(ni);
-	if (ni->vol->journal && S_ISREG(vi->i_mode) && vi->i_nlink &&
+	if (ni->vol->journal && S_ISREG(vi->i_mode) &&
+	    (vi->i_nlink || deleted_attr) &&
 	    new_size > ni->data_size && !NInoNonResident(ni) &&
 	    !NInoEncrypted(ni) && !NInoCompressed(ni) && !NInoSparse(ni)) {
 		err = ntfs_truncate_resident_grow(ni, new_size, holes);
@@ -4480,7 +4481,7 @@ static int __ntfs_truncate_vfs(struct inode *vi, loff_t new_size,
 		}
 	}
 	if (ni->vol->journal && chunked_physical_grow &&
-	    S_ISREG(vi->i_mode) && vi->i_nlink) {
+	    S_ISREG(vi->i_mode) && (vi->i_nlink || deleted_attr)) {
 		err = ntfs_truncate_physical_grow_chunks(ni, new_size);
 		if (err)
 			return err;
