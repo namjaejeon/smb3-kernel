@@ -4024,10 +4024,6 @@ static int ntfs_truncate_physical_grow_chunks(struct ntfs_inode *ni,
 	struct ntfs_inode *mrec_ni = NInoAttr(ni) ?
 			ni->ext.base_ntfs_ino : ni;
 	struct ntfs_log_handle *handle;
-	u64 old_clusters;
-	u64 target_clusters;
-	u64 chunk_clusters;
-	s64 allocation_size;
 	int abort_err;
 	int credits;
 	int err;
@@ -4038,47 +4034,11 @@ static int ntfs_truncate_physical_grow_chunks(struct ntfs_inode *ni,
 	    ni->allocated_size < 0 ||
 	    !IS_ALIGNED(ni->allocated_size, ni->vol->cluster_size))
 		return -EINVAL;
-	target_clusters = DIV_ROUND_UP_ULL((u64)new_size,
-			ni->vol->cluster_size);
-	for (;;) {
-		if (signal_pending(current))
-			return -EINTR;
-		old_clusters = ni->allocated_size >> ni->vol->cluster_size_bits;
-		if (old_clusters >= target_clusters)
-			break;
-		chunk_clusters = min_t(u64, target_clusters - old_clusters,
-				NTFS_ATTR_GROW_MAX_CLUSTERS);
-		for (;;) {
-			credits = ntfs_attr_physical_grow_log_credits(ni->vol,
-					chunk_clusters);
-			if (credits >= 0 && credits <= (U16_MAX - 2) / 2)
-				break;
-			if (chunk_clusters == 1)
-				return credits < 0 ? credits : -E2BIG;
-			chunk_clusters >>= 1;
-		}
-		if (old_clusters > (S64_MAX >> ni->vol->cluster_size_bits) -
-				chunk_clusters)
-			return -EFBIG;
-		allocation_size = (old_clusters + chunk_clusters) <<
-				ni->vol->cluster_size_bits;
-		handle = ntfs_log_begin(ni->vol, credits);
-		if (IS_ERR(handle))
-			return PTR_ERR(handle);
-		mutex_lock(&mrec_ni->mrec_lock);
-		err = ntfs_attr_physical_prealloc_transacted(handle, ni,
-				allocation_size, chunk_clusters);
-		if (err) {
-			abort_err = ntfs_log_abort(handle);
-			mutex_unlock(&mrec_ni->mrec_lock);
-			return abort_err ? abort_err : err;
-		}
-		err = ntfs_log_commit(handle);
-		mutex_unlock(&mrec_ni->mrec_lock);
-		if (err)
-			return err;
-		cond_resched();
-	}
+	err = ntfs_attr_preallocate_chunks(ni, new_size);
+	if (err)
+		return err;
+	if (signal_pending(current))
+		return -EINTR;
 
 	credits = ntfs_attr_logical_grow_log_credits(ni->vol, false);
 	if (credits < 0)

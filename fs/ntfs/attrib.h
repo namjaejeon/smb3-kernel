@@ -278,6 +278,7 @@ int ntfs_attr_physical_grow_transacted(struct ntfs_log_handle *handle,
 		struct ntfs_inode *ni, s64 new_size, u64 max_clusters);
 int ntfs_attr_physical_prealloc_transacted(struct ntfs_log_handle *handle,
 		struct ntfs_inode *ni, s64 allocation_size, u64 max_clusters);
+int ntfs_attr_preallocate_chunks(struct ntfs_inode *ni, s64 new_size);
 int ntfs_attr_append_prealloc_transacted(struct ntfs_log_handle *handle,
 		struct ntfs_inode *ni, s64 allocation_size, u64 max_clusters);
 int ntfs_attr_empty_make_nonresident_log_credits(struct ntfs_volume *vol,

@@ -17,6 +17,7 @@
  */
 
 #include <linux/sched/signal.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
@@ -7998,20 +7999,31 @@ out:
 	return err;
 }
 
-int ntfs_attr_physical_grow_log_credits(struct ntfs_volume *vol,
-		u64 clusters)
+#define NTFS_ATTR_PREALLOC_MAX_CLUSTERS	SZ_32K
+#define NTFS_ATTR_PREALLOC_MAX_RUNS	8
+
+static int ntfs_attr_alloc_bitmap_updates(u64 clusters, unsigned int max_runs)
 {
-	int allocation_credits;
+	u64 updates;
+
+	/* Allow a record per run plus more records for bitmap page crossings. */
+	updates = max_runs + DIV_ROUND_UP_ULL(clusters, (u64)PAGE_SIZE * 8);
+	updates = min(updates, clusters);
+	if (updates >= INT_MAX)
+		return -E2BIG;
+	return updates;
+}
+
+static int ntfs_attr_allocation_log_credits(struct ntfs_volume *vol,
+		int allocation_credits, u64 max_runs)
+{
 	int mapping_credits;
 	int credits;
 
-	if (!vol || !clusters || clusters > S64_MAX)
-		return -EINVAL;
-	allocation_credits = ntfs_cluster_alloc_log_credits(clusters);
 	if (allocation_credits < 0)
 		return allocation_credits;
 	mapping_credits = ntfs_attr_update_mapping_pairs_log_credits(vol,
-			vol->mft_record_size, vol->mft_record_size, clusters, 0);
+			vol->mft_record_size, vol->mft_record_size, max_runs, 0);
 	if (mapping_credits < 0)
 		return mapping_credits;
 	if (check_add_overflow(allocation_credits, mapping_credits, &credits))
@@ -8019,9 +8031,18 @@ int ntfs_attr_physical_grow_log_credits(struct ntfs_volume *vol,
 	return credits;
 }
 
+int ntfs_attr_physical_grow_log_credits(struct ntfs_volume *vol, u64 clusters)
+{
+	if (!vol || !clusters || clusters > S64_MAX)
+		return -EINVAL;
+	return ntfs_attr_allocation_log_credits(vol,
+			ntfs_cluster_alloc_log_credits(clusters), clusters);
+}
+
 static int __ntfs_attr_physical_grow_transacted(
 		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
-		s64 new_size, u64 max_clusters, bool publish_eof, bool zero_fresh)
+		s64 new_size, u64 max_clusters, bool publish_eof, bool zero_fresh,
+		unsigned int max_runs, unsigned int max_bitmap_updates)
 {
 	struct runlist_element *allocated_rl = NULL;
 	struct runlist_element *new_rl;
@@ -8090,13 +8111,21 @@ static int __ntfs_attr_physical_grow_transacted(
 	err = ntfs_attr_allocation_register_home_undo(handle, ni);
 	if (err)
 		goto out;
-	allocated_rl = ntfs_cluster_alloc_transacted(handle, ni->vol,
-			old_clusters, grow_clusters, -1, DATA_ZONE, true, false,
-			false);
+	allocated_rl = ntfs_cluster_alloc_transacted_partial(handle, ni->vol,
+			old_clusters, grow_clusters, max_runs ? 1 : grow_clusters,
+			-1, DATA_ZONE, true, false, false, max_runs, max_bitmap_updates);
 	if (IS_ERR(allocated_rl)) {
 		err = PTR_ERR(allocated_rl);
 		allocated_rl = NULL;
 		goto out;
+	}
+	if (max_runs) {
+		const struct runlist_element *end = allocated_rl;
+
+		/* Preallocation can publish just the prefix the allocator found. */
+		while (end->length)
+			end++;
+		target_clusters = end->vcn;
 	}
 	if (initialize_tail) {
 		struct runlist_element *rl;
@@ -8148,14 +8177,14 @@ int ntfs_attr_physical_grow_transacted(struct ntfs_log_handle *handle,
 		struct ntfs_inode *ni, s64 new_size, u64 max_clusters)
 {
 	return __ntfs_attr_physical_grow_transacted(handle, ni, new_size,
-			max_clusters, true, true);
+			max_clusters, true, true, 0, 0);
 }
 
 int ntfs_attr_physical_prealloc_transacted(struct ntfs_log_handle *handle,
 		struct ntfs_inode *ni, s64 allocation_size, u64 max_clusters)
 {
 	return __ntfs_attr_physical_grow_transacted(handle, ni,
-			allocation_size, max_clusters, false, false);
+			allocation_size, max_clusters, false, false, 0, 0);
 }
 
 /* Allocate and initialize a bounded append tail without publishing any EOF. */
@@ -8163,7 +8192,97 @@ int ntfs_attr_append_prealloc_transacted(struct ntfs_log_handle *handle,
 		struct ntfs_inode *ni, s64 allocation_size, u64 max_clusters)
 {
 	return __ntfs_attr_physical_grow_transacted(handle, ni,
-			allocation_size, max_clusters, false, true);
+			allocation_size, max_clusters, false, true, 0, 0);
+}
+
+/* Grow the allocation of a dense attribute without changing EOF. */
+int ntfs_attr_preallocate_chunks(struct ntfs_inode *ni, s64 new_size)
+{
+	struct ntfs_inode *mrec_ni = NInoAttr(ni) ? ni->ext.base_ntfs_ino : ni;
+	struct ntfs_volume *vol = ni->vol;
+	u64 cluster_limit = NTFS_ATTR_PREALLOC_MAX_CLUSTERS;
+	u64 target_clusters;
+	int mapping_credits;
+	int update_limit;
+
+	if (!mrec_ni || new_size < 0)
+		return -EINVAL;
+	if (new_size > S64_MAX - vol->cluster_size_mask)
+		return -EFBIG;
+	target_clusters = DIV_ROUND_UP_ULL((u64)new_size, vol->cluster_size);
+	update_limit = ntfs_log_transaction_credits_limit(vol);
+	if (update_limit < 0)
+		return update_limit;
+	mapping_credits = ntfs_attr_update_mapping_pairs_log_credits(vol,
+			vol->mft_record_size, vol->mft_record_size, 0, 0);
+	if (mapping_credits < 0)
+		return mapping_credits;
+	/* Leave room for a tail mapping update and the bitmap open record. */
+	update_limit = max(1, update_limit - mapping_credits - 1);
+
+	for (;;) {
+		struct ntfs_log_handle *handle;
+		s64 allocated_size = READ_ONCE(ni->allocated_size);
+		s64 chunk_end;
+		u64 old_clusters;
+		u64 chunk_clusters;
+		unsigned int max_runs;
+		int bitmap_updates;
+		int abort_err;
+		int credits;
+		int err = 0;
+
+		if (allocated_size >= new_size)
+			return 0;
+		if (signal_pending(current))
+			return -EINTR;
+		if (allocated_size < 0 || !IS_ALIGNED(allocated_size, vol->cluster_size))
+			return -EIO;
+		old_clusters = ntfs_bytes_to_cluster(vol, allocated_size);
+		chunk_clusters = min(target_clusters - old_clusters, cluster_limit);
+		chunk_end = ntfs_cluster_to_bytes(vol, old_clusters + chunk_clusters);
+		bitmap_updates = min(update_limit, ntfs_attr_alloc_bitmap_updates(
+				chunk_clusters, NTFS_ATTR_PREALLOC_MAX_RUNS));
+		max_runs = min(bitmap_updates, NTFS_ATTR_PREALLOC_MAX_RUNS);
+		credits = ntfs_attr_allocation_log_credits(vol, bitmap_updates + 1,
+				max_runs);
+		if (credits < 0)
+			return credits;
+		/* Reserve before mrec_lock: log admission may need a checkpoint. */
+		handle = ntfs_log_begin(vol, credits);
+		if (IS_ERR(handle))
+			return PTR_ERR(handle);
+		mutex_lock(&mrec_ni->mrec_lock);
+		if (NInoSparse(ni))
+			err = -EAGAIN;
+		else if (allocated_size == ni->allocated_size)
+			err = __ntfs_attr_physical_grow_transacted(handle, ni,
+					chunk_end, chunk_clusters, false, false,
+					max_runs, bitmap_updates);
+		if (!err) {
+			err = ntfs_log_commit(handle);
+			mutex_unlock(&mrec_ni->mrec_lock);
+			if (err)
+				return err;
+			cond_resched();
+			continue;
+		}
+		abort_err = ntfs_log_abort(handle);
+		mutex_unlock(&mrec_ni->mrec_lock);
+		if (abort_err)
+			return abort_err;
+		if (err != -ENOSPC && err != -E2BIG)
+			return err;
+		if (err == -ENOSPC && ntfs_available_clusters(vol) <= 0)
+			return err;
+		/* Extent or attribute-list growth may need more of the ring. */
+		if (bitmap_updates > 1)
+			update_limit = bitmap_updates / 2;
+		else if (chunk_clusters > 1)
+			cluster_limit = 1;
+		else
+			return err;
+	}
 }
 
 int ntfs_attr_empty_make_nonresident_log_credits(struct ntfs_volume *vol,
@@ -10834,23 +10953,14 @@ out:
 
 int ntfs_attr_map_cluster_log_credits(struct ntfs_volume *vol, u64 clusters)
 {
-	int allocation_credits;
-	int mapping_credits;
-	int credits;
+	int bitmap_updates;
 
 	if (!vol || !clusters || clusters > S64_MAX)
 		return -EINVAL;
-	allocation_credits = ntfs_cluster_alloc_log_credits(clusters);
-	if (allocation_credits < 0)
-		return allocation_credits;
-	/* The transacted mapper requests one contiguous run and refuses splits. */
-	mapping_credits = ntfs_attr_update_mapping_pairs_log_credits(vol,
-			vol->mft_record_size, vol->mft_record_size, 1, 0);
-	if (mapping_credits < 0)
-		return mapping_credits;
-	if (check_add_overflow(allocation_credits, mapping_credits, &credits))
-		return -EOVERFLOW;
-	return credits;
+	bitmap_updates = ntfs_attr_alloc_bitmap_updates(clusters, 1);
+	if (bitmap_updates < 0)
+		return bitmap_updates;
+	return ntfs_attr_allocation_log_credits(vol, bitmap_updates + 1, 1);
 }
 
 /* Caller holds mrec_lock and runlist.lock. Inode DELALLOC is consumed here. */
@@ -10870,6 +10980,7 @@ int ntfs_attr_map_cluster_transacted(struct ntfs_log_handle *handle,
 	s64 vcn = vcn_start;
 	size_t new_rl_count;
 	const char *mapping_stage = "extent mapping update";
+	int bitmap_updates;
 	int err;
 
 	if (!handle || !ni || !lcn_start || !lcn_count || !balloc ||
@@ -10926,12 +11037,15 @@ int ntfs_attr_map_cluster_transacted(struct ntfs_log_handle *handle,
 		}
 	}
 
+	bitmap_updates = ntfs_attr_alloc_bitmap_updates(clu_count, 1);
+	if (bitmap_updates < 0)
+		return bitmap_updates;
 	err = ntfs_attr_allocation_register_home_undo(handle, ni);
 	if (err)
 		return err;
 	allocated = ntfs_cluster_alloc_transacted_partial(handle, vol, vcn,
 			clu_count, 1, lcn_seek_from, DATA_ZONE, false, true,
-			*was_delalloc, 0);
+			*was_delalloc, 0, bitmap_updates);
 	if (IS_ERR(allocated))
 		return PTR_ERR(allocated);
 	if (allocated->vcn != vcn || allocated->lcn < 0 ||
@@ -12362,8 +12476,6 @@ static int ntfs_attr_fallocate_journaled(struct ntfs_inode *ni, loff_t start,
 	}
 	while (keep_size && end > ni->allocated_size) {
 		u64 old_clusters;
-		u64 target_clusters;
-		u64 grow_clusters;
 		s64 allocation_size;
 		bool was_sparse;
 		bool sparse;
@@ -12376,8 +12488,6 @@ static int ntfs_attr_fallocate_journaled(struct ntfs_inode *ni, loff_t start,
 		was_sparse = NInoSparse(ni);
 		sparse = was_sparse;
 		old_clusters = ni->allocated_size >> vol->cluster_size_bits;
-		target_clusters = DIV_ROUND_UP_ULL((u64)end,
-				vol->cluster_size);
 		if (!sparse && old_clusters <
 				ntfs_bytes_to_cluster(vol, start) &&
 		    vol->major_ver >= 3 && !NVolDisableSparse(vol) &&
@@ -12385,30 +12495,22 @@ static int ntfs_attr_fallocate_journaled(struct ntfs_inode *ni, loff_t start,
 			/* Keep only the requested extent allocated. */
 			sparse = true;
 		}
-		if (sparse) {
-			/* Extend with holes. Allocate the requested range below. */
-			grow_clusters = target_clusters - old_clusters;
-			credits = ntfs_attr_sparse_grow_log_credits(vol);
-			if (credits < 0)
-				return credits;
-		} else {
-			grow_clusters = min_t(u64, target_clusters - old_clusters,
-					NTFS_ATTR_GROW_MAX_CLUSTERS);
-			for (;;) {
-				credits = ntfs_attr_physical_grow_log_credits(vol,
-						grow_clusters);
-				if (credits >= 0 && credits <= (U16_MAX - 2) / 2)
-					break;
-				if (grow_clusters == 1)
-					return credits < 0 ? credits : -E2BIG;
-				grow_clusters >>= 1;
-			}
+		if (!sparse) {
+			err = ntfs_attr_preallocate_chunks(ni, end);
+			if (err == -EAGAIN && NInoSparse(ni))
+				continue;
+			if (err)
+				return err;
+			break;
 		}
+		/* Extend with holes. Allocate the requested range below. */
+		credits = ntfs_attr_sparse_grow_log_credits(vol);
+		if (credits < 0)
+			return credits;
 		handle = ntfs_log_begin(vol, credits);
 		if (IS_ERR(handle))
 			return PTR_ERR(handle);
-		allocation_size = ntfs_cluster_to_bytes(vol,
-				old_clusters + grow_clusters);
+		allocation_size = round_up(end, vol->cluster_size);
 		mutex_lock(&mrec_ni->mrec_lock);
 		if (!!NInoSparse(ni) != was_sparse) {
 			mutex_unlock(&mrec_ni->mrec_lock);
@@ -12417,12 +12519,8 @@ static int ntfs_attr_fallocate_journaled(struct ntfs_inode *ni, loff_t start,
 				return err;
 			continue;
 		}
-		if (sparse)
-			err = __ntfs_attr_sparse_grow_transacted(handle, ni,
-					allocation_size, false, false);
-		else
-			err = ntfs_attr_physical_prealloc_transacted(handle, ni,
-					allocation_size, grow_clusters);
+		err = __ntfs_attr_sparse_grow_transacted(handle, ni,
+				allocation_size, false, false);
 		if (err) {
 			abort_err = ntfs_log_abort(handle);
 			mutex_unlock(&mrec_ni->mrec_lock);
@@ -12466,8 +12564,9 @@ static int ntfs_attr_fallocate_journaled(struct ntfs_inode *ni, loff_t start,
 		}
 		max_count = min_t(s64, vcn_end - vcn,
 				rl->length - (vcn - rl->vcn));
-		max_count = min_t(s64, max_count,
-				NTFS_ATTR_GROW_MAX_CLUSTERS);
+		/* Filling an initialized hole can issue synchronous zero I/O. */
+		max_count = min_t(s64, max_count, vcn < vcn_uninit ?
+				NTFS_ATTR_GROW_MAX_CLUSTERS : NTFS_ATTR_PREALLOC_MAX_CLUSTERS);
 		up_read(&ni->runlist.lock);
 		credits = ntfs_attr_map_cluster_log_credits(vol, max_count);
 		if (credits < 0)

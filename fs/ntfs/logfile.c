@@ -1970,12 +1970,17 @@ static int ntfs_redo_seed_stream_runlist(
 
 		for (i = 0; i < dirty_page->lcns_follow; i++) {
 			struct runlist_element *source;
+			s64 lcn;
 			s64 vcn;
 			u64 size;
 
 			if (!dirty_page->page_lcns[i])
 				continue;
 			vcn = dirty_page->vcn + i;
+			/* A larger bitmap update can overlap an earlier dirty range. */
+			lcn = ntfs_rl_vcn_to_lcn(ni->runlist.rl, vcn);
+			if (lcn >= 0 && (u64)lcn == dirty_page->page_lcns[i])
+				continue;
 			source = kmalloc_array(2, sizeof(*source), GFP_NOFS);
 			if (!source) {
 				up_write(&ni->runlist.lock);

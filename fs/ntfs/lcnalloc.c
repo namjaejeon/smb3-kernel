@@ -404,6 +404,7 @@ static s64 max_empty_bit_range(const unsigned char *buf, int start, int end)
  * @is_contig:		if true, require contiguous allocation
  * @is_dealloc:		if true, the allocation is for deallocation purposes
  * @max_runs:		maximum runs for partial allocation, or zero for no limit
+ * @max_bitmap_updates:	maximum logged bitmap ranges, or zero for no limit
  *
  * A transactional caller may set @min_count below @count to accept a shorter
  * allocation after the selected zones are exhausted.  If fewer than
@@ -470,7 +471,8 @@ static struct runlist_element *ntfs_cluster_alloc_core(
 		const bool is_extension,
 		const bool is_contig,
 		const bool is_dealloc,
-		const unsigned int max_runs)
+		const unsigned int max_runs,
+		const unsigned int max_bitmap_updates)
 {
 	s64 zone_start, zone_end, bmp_pos, bmp_initial_pos, last_read_pos, lcn;
 	s64 prev_lcn = 0, prev_run_len = 0, mft_zone_size;
@@ -484,6 +486,7 @@ static struct runlist_element *ntfs_cluster_alloc_core(
 	int err = 0, rlpos, rlsize, buf_size, pg_off, buf_first;
 	int run_len, run_limit, run_off;
 	u8 pass, done_zones, search_zone, need_writeback = 0, bit;
+	unsigned int bitmap_updates = max_bitmap_updates;
 	unsigned int memalloc_flags;
 	u8 has_guess, used_zone_pos;
 	pgoff_t index;
@@ -500,7 +503,8 @@ static struct runlist_element *ntfs_cluster_alloc_core(
 
 	/* Return NULL if @count is zero. */
 	if (count <= 0 || min_count <= 0 || min_count > count ||
-	    (max_runs && (!log_handle || min_count > max_runs)))
+	    (max_runs && (!log_handle || min_count > max_runs)) ||
+	    (max_bitmap_updates && (!log_handle || min_count > max_bitmap_updates)))
 		return ERR_PTR(-EINVAL);
 
 	memalloc_flags = memalloc_nofs_save();
@@ -752,6 +756,8 @@ static struct runlist_element *ntfs_cluster_alloc_core(
 						lcn + bmp_pos, run_len, 1);
 				if (err)
 					goto out;
+				if (max_bitmap_updates)
+					bitmap_updates--;
 			}
 			for (run_off = 0; run_off < run_len; run_off++) {
 				s64 next = lcn + run_off;
@@ -798,7 +804,7 @@ static struct runlist_element *ntfs_cluster_alloc_core(
 			}
 			/* Done? */
 			clusters -= run_len;
-			if (!clusters) {
+			if (!clusters || (max_bitmap_updates && !bitmap_updates)) {
 				s64 tc;
 
 				lcn += run_len - 1;
@@ -1326,14 +1332,14 @@ struct runlist_element *ntfs_cluster_alloc(struct ntfs_volume *vol,
 {
 	return ntfs_cluster_alloc_core(NULL, vol, start_vcn, count, count,
 			start_lcn, zone, is_extension, is_contig, is_dealloc,
-			0);
+			0, 0);
 }
 
 struct runlist_element *ntfs_cluster_alloc_data_partial(struct ntfs_volume *vol,
 		s64 start_vcn, s64 count, s64 start_lcn, bool is_dealloc)
 {
 	return ntfs_cluster_alloc_core(NULL, vol, start_vcn, count, 1,
-			start_lcn, DATA_ZONE, false, true, is_dealloc, 0);
+			start_lcn, DATA_ZONE, false, true, is_dealloc, 0, 0);
 }
 
 struct runlist_element *ntfs_cluster_alloc_transacted(
@@ -1346,7 +1352,7 @@ struct runlist_element *ntfs_cluster_alloc_transacted(
 		return ERR_PTR(!handle ? -EINVAL : -EOPNOTSUPP);
 	return ntfs_cluster_alloc_core(handle, vol, start_vcn, count,
 			count, start_lcn, zone, is_extension, is_contig, false,
-			0);
+			0, 0);
 }
 
 struct runlist_element *ntfs_cluster_alloc_transacted_partial(
@@ -1354,13 +1360,13 @@ struct runlist_element *ntfs_cluster_alloc_transacted_partial(
 		const s64 start_vcn, const s64 count, const s64 min_count,
 		const s64 start_lcn, const int zone, const bool is_extension,
 		const bool is_contig, const bool is_dealloc,
-		const unsigned int max_runs)
+		const unsigned int max_runs, const unsigned int max_bitmap_updates)
 {
 	if (!handle)
 		return ERR_PTR(-EINVAL);
 	return ntfs_cluster_alloc_core(handle, vol, start_vcn, count,
 			min_count, start_lcn, zone, is_extension, is_contig,
-			is_dealloc, max_runs);
+			is_dealloc, max_runs, max_bitmap_updates);
 }
 
 static int ntfs_cluster_free_from_rl_transaction(

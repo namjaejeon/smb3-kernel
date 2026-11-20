@@ -3091,7 +3091,7 @@ static int ntfs_mft_data_extend_allocation_transacted_nolock(
 		return err;
 	allocated_rl = ntfs_cluster_alloc_transacted_partial(handle, vol,
 			old_clusters, nr, min_nr, lcn_hint, MFT_ZONE, true,
-			false, false, max_runs);
+			false, false, max_runs, 0);
 	if (IS_ERR(allocated_rl)) {
 		return PTR_ERR(allocated_rl);
 	}

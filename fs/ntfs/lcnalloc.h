@@ -55,8 +55,9 @@ struct runlist_element *ntfs_cluster_alloc_transacted(
 /*
  * Try to allocate @count clusters, accepting a shorter runlist if at least
  * @min_count clusters are available.  A nonzero @max_runs bounds fragmentation
- * and must be at least @min_count. Zero leaves it unlimited.  An error still
- * requires aborting @handle because a partial allocation may have been logged.
+ * and a nonzero @max_bitmap_updates bounds the page-bounded bitmap records.
+ * Each limit must be at least @min_count to allow single-cluster runs. An error
+ * still requires aborting @handle because a partial allocation may be logged.
  * A DELALLOC allocation consumes its dirty-cluster charge when the bitmap
  * allocation is registered for undo; abort restores the charge.
  */
@@ -65,7 +66,7 @@ struct runlist_element *ntfs_cluster_alloc_transacted_partial(
 		const s64 start_vcn, const s64 count, const s64 min_count,
 		const s64 start_lcn, const int zone, const bool is_extension,
 		const bool is_contig, const bool is_dealloc,
-		const unsigned int max_runs);
+		const unsigned int max_runs, const unsigned int max_bitmap_updates);
 /*
  * Cluster-free bitmap changes become visible to allocators only at commit.
  * The caller must abort @handle if this helper returns an error.
