@@ -3233,7 +3233,6 @@ static int ntfs_redo_calc_highest_vcn(const struct attr_record *attr, u64 *highe
 	const u8 *buf;
 	const u8 *end;
 	u64 vcn;
-	bool seen = false;
 
 	if (!attr || !attr->non_resident || !highest_vcn)
 		return -EINVAL;
@@ -3260,19 +3259,12 @@ static int ntfs_redo_calc_highest_vcn(const struct attr_record *attr, u64 *highe
 
 		vcn += run_len;
 		buf += 1 + len_len + off_len;
-		seen = true;
 	}
 
 	if (buf >= end)
 		return -EINVAL;
 
-	if (!seen) {
-		if (le64_to_cpu(attr->data.non_resident.lowest_vcn))
-			return -EINVAL;
-		*highest_vcn = U64_MAX;
-		return 0;
-	}
-
+	/* An empty extent ends immediately before its lowest VCN. */
 	*highest_vcn = vcn - 1;
 	return 0;
 }
