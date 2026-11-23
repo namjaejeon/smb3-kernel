@@ -670,7 +670,7 @@ static int ntfs_deleted_mft_records_collect(struct ntfs_inode *ni,
 }
 
 static int ntfs_deleted_runlists_normalize(struct list_head *runlists,
-		struct runlist_element **normalized_out, u64 *credits_out)
+		struct runlist_element **normalized_out)
 {
 	struct ntfs_deleted_runlist *entry;
 	struct runlist_element *rl;
@@ -679,9 +679,8 @@ static int ntfs_deleted_runlists_normalize(struct list_head *runlists,
 	size_t nr_runs = 0;
 	size_t dst = 0;
 	size_t src;
-	int credits;
 
-	if (!runlists || !normalized_out || !credits_out)
+	if (!runlists || !normalized_out)
 		return -EINVAL;
 	*normalized_out = NULL;
 	list_for_each_entry(entry, runlists, link) {
@@ -691,10 +690,8 @@ static int ntfs_deleted_runlists_normalize(struct list_head *runlists,
 			nr_runs++;
 		}
 	}
-	if (!nr_runs) {
-		*credits_out = 0;
+	if (!nr_runs)
 		return 0;
-	}
 	if (nr_runs == SIZE_MAX)
 		return -E2BIG;
 	rl = kvmalloc_array(nr_runs + 1, sizeof(*rl), GFP_NOFS);
@@ -712,14 +709,14 @@ static int ntfs_deleted_runlists_normalize(struct list_head *runlists,
 		if (check_add_overflow(rl[src].lcn, rl[src].length, &end) ||
 		    (dst && rl[src].lcn < previous_end) ||
 		    check_add_overflow(clusters, rl[src].length, &clusters)) {
-			credits = -EIO;
-			goto out_free;
+			kvfree(rl);
+			return -EIO;
 		}
 		if (dst && rl[src].lcn == previous_end) {
 			if (check_add_overflow(rl[dst - 1].length,
 					rl[src].length, &rl[dst - 1].length)) {
-				credits = -EIO;
-				goto out_free;
+				kvfree(rl);
+				return -EIO;
 			}
 		} else {
 			rl[dst] = rl[src];
@@ -728,20 +725,78 @@ static int ntfs_deleted_runlists_normalize(struct list_head *runlists,
 		previous_end = end;
 	}
 	if (dst >= INT_MAX) {
-		credits = -E2BIG;
-		goto out_free;
+		kvfree(rl);
+		return -E2BIG;
 	}
 	rl[dst].vcn = clusters;
 	rl[dst].lcn = LCN_ENOENT;
 	rl[dst].length = 0;
-	credits = ntfs_cluster_free_from_rl_log_credits(rl);
-	if (credits < 0)
-		goto out_free;
 	*normalized_out = rl;
-	*credits_out = credits;
 	return 0;
-out_free:
-	kvfree(rl);
+}
+
+struct ntfs_inode_retirement {
+	struct list_head runlists;
+	struct runlist_element *normalized_rl;
+	struct ntfs_mft_retire_record *mft_records;
+	u64 nr_records;
+};
+
+static void ntfs_free_inode_retirement(struct ntfs_inode_retirement *retire)
+{
+	ntfs_deleted_runlists_free(&retire->runlists);
+	kvfree(retire->normalized_rl);
+	kvfree(retire->mft_records);
+}
+
+static int ntfs_deleted_inode_retire_credits(struct ntfs_inode *ni,
+					     struct ntfs_inode_retirement *retire)
+{
+	bool runlist_dirty = NInoRunlistDirty(ni);
+	struct runlist_element *rl;
+	int bitmap_credits = 0;
+	int credits;
+	int err;
+
+	INIT_LIST_HEAD(&retire->runlists);
+	if (runlist_dirty) {
+		down_write(&ni->runlist.lock);
+		err = ntfs_attr_map_whole_runlist(ni);
+		up_write(&ni->runlist.lock);
+		if (err)
+			return err;
+		err = ntfs_deleted_cached_runlist_collect(ni, &retire->runlists);
+		if (err)
+			return err;
+	}
+	err = ntfs_deleted_runlists_collect(ni, &retire->runlists,
+					    runlist_dirty);
+	if (err)
+		return err;
+	err = ntfs_deleted_runlists_normalize(&retire->runlists,
+					      &retire->normalized_rl);
+	if (err)
+		return err;
+	if (retire->normalized_rl) {
+		rl = retire->normalized_rl;
+		credits = ntfs_cluster_free_from_rl_log_credits(rl);
+		if (credits < 0)
+			return credits;
+		bitmap_credits = ntfs_log_bitmap_packed_credits(ni->vol,
+								credits - 1);
+		if (bitmap_credits < 0)
+			return bitmap_credits;
+	}
+	err = ntfs_deleted_mft_records_collect(ni, &retire->mft_records,
+					       &retire->nr_records);
+	if (err)
+		return err;
+	credits = ntfs_mft_records_retire_credits(ni->vol, retire->mft_records,
+						  retire->nr_records);
+	if (credits < 0)
+		return credits;
+	if (check_add_overflow(credits, bitmap_credits, &credits))
+		return -E2BIG;
 	return credits;
 }
 
@@ -753,7 +808,6 @@ static int ntfs_non_resident_dealloc_clusters(struct ntfs_inode *ni)
 	struct runlist_element *normalized_rl = NULL;
 	LIST_HEAD(runlists);
 	size_t new_rl_count;
-	u64 credits;
 	int walk_err;
 	int first_err = 0;
 	int err;
@@ -816,8 +870,7 @@ static int ntfs_non_resident_dealloc_clusters(struct ntfs_inode *ni)
 		first_err = walk_err;
 
 normalize_runlists:
-	err = ntfs_deleted_runlists_normalize(&runlists, &normalized_rl,
-			&credits);
+	err = ntfs_deleted_runlists_normalize(&runlists, &normalized_rl);
 	if (err) {
 		ntfs_error(sb,
 			   "Failed to normalize deleted runlists. Leaving inconsistent metadata.\n");
@@ -935,6 +988,29 @@ int ntfs_reclaim_deleted_attribute(struct inode *vi)
 	}
 }
 
+static void ntfs_reclaim_oversized_deleted_inode(struct inode *vi)
+{
+	struct ntfs_inode *ni = NTFS_I(vi);
+	struct ntfs_inode_retirement retire = { };
+	int limit;
+	int credits;
+
+	/* Shrink multi-extent data before eviction makes the base inode ungrabbable. */
+	if (!S_ISREG(vi->i_mode) || !NInoNonResident(ni) ||
+	    !NInoAttrList(ni) || !ni->allocated_size || current_work() ||
+	    !(vi->i_sb->s_flags & SB_ACTIVE))
+		return;
+	limit = ntfs_log_transaction_credits_limit(ni->vol);
+	if (limit < 0)
+		return;
+	mutex_lock(&ni->mrec_lock);
+	credits = ntfs_deleted_inode_retire_credits(ni, &retire);
+	mutex_unlock(&ni->mrec_lock);
+	ntfs_free_inode_retirement(&retire);
+	if (credits == -E2BIG || credits > limit)
+		ntfs_reclaim_deleted_attribute(vi);
+}
+
 int ntfs_drop_big_inode(struct inode *inode)
 {
 	struct ntfs_inode *ni = NTFS_I(inode);
@@ -970,6 +1046,7 @@ int ntfs_drop_big_inode(struct inode *inode)
 
 		atomic_inc(&inode->i_count);
 		spin_unlock(&inode->i_lock);
+		ntfs_reclaim_oversized_deleted_inode(inode);
 		/* Keep the MFT image available to writeback through eviction. */
 		err = ntfs_preserve_deleted_inode(ni, false);
 		if (err) {
@@ -3155,21 +3232,16 @@ static void ntfs_preserve_failed_retirement(struct ntfs_inode *ni)
 
 static int __ntfs_delete_base_inode(struct ntfs_inode *ni, bool recovery)
 {
+	struct ntfs_inode_retirement retire = { };
 	struct ntfs_deleted_runlist *runlist;
-	struct runlist_element *normalized_rl = NULL;
-	struct ntfs_mft_retire_record *mft_records = NULL;
 	struct super_block *sb = ni->vol->sb;
 	struct ntfs_log_handle *handle;
 	struct ntfs_inode *ext_ni;
-	LIST_HEAD(runlists);
-	u64 cluster_credits;
-	u64 credits64;
-	u64 records = 0;
 	s64 first_mismatch = -1;
 	int abort_err;
+	int credits;
 	unsigned int delayed_clusters;
 	int credit_limit;
-	int record_credits;
 	int err = -EOPNOTSUPP;
 	const char *retire_stage = "journal reservation";
 
@@ -3179,42 +3251,18 @@ static int __ntfs_delete_base_inode(struct ntfs_inode *ni, bool recovery)
 		if (!NInoBeingDeleted(ni))
 			return 0;
 		delayed_clusters = ni->i_dealloc_clusters;
-		cluster_credits = 0;
-		if (NInoRunlistDirty(ni)) {
-			err = ntfs_attr_map_whole_runlist(ni);
-			if (err)
-				goto retire_close;
-			err = ntfs_deleted_cached_runlist_collect(ni, &runlists);
-			if (err)
-				goto retire_close;
+		credits = ntfs_deleted_inode_retire_credits(ni, &retire);
+		if (credits < 0) {
+			err = credits;
+			goto retire_close;
 		}
-		err = ntfs_deleted_runlists_collect(ni, &runlists,
-				NInoRunlistDirty(ni));
-		if (!err)
-			err = ntfs_deleted_runlists_normalize(&runlists,
-					&normalized_rl, &cluster_credits);
-		if (!err)
-			err = ntfs_deleted_mft_records_collect(ni, &mft_records,
-					&records);
-		if (!err) {
-			record_credits = ntfs_mft_records_retire_credits(ni->vol,
-					mft_records, records);
-			if (record_credits < 0) {
-				err = record_credits;
-				goto retire_close;
-			}
-			if (check_add_overflow(cluster_credits,
-					(u64)record_credits,
-					&credits64) || credits64 > UINT_MAX) {
-				err = -E2BIG;
-				goto retire_close;
-			}
+		{
 			credit_limit = ntfs_log_transaction_credits_limit(ni->vol);
 			if (credit_limit < 0) {
 				err = credit_limit;
 				goto retire_close;
 			}
-			if (credits64 > (u64)credit_limit) {
+			if (credits > credit_limit) {
 				err = -E2BIG;
 				goto retire_close;
 			}
@@ -3223,23 +3271,23 @@ static int __ntfs_delete_base_inode(struct ntfs_inode *ni, bool recovery)
 			 * credit bound before the first bitmap or MFT record mutation.
 			 */
 			if (recovery)
-				handle = ntfs_log_begin_mount_full(ni->vol, credits64);
+				handle = ntfs_log_begin_mount_full(ni->vol, credits);
 			else
-				handle = ntfs_log_begin_full_reservation(ni->vol, credits64);
+				handle = ntfs_log_begin_full_reservation(ni->vol, credits);
 			if (IS_ERR(handle)) {
 				err = PTR_ERR(handle);
 				goto retire_close;
 			}
 			mutex_lock(&ni->mrec_lock);
 			retire_stage = "MFT preflight";
-			err = ntfs_mft_records_retire_preflight(ni, mft_records,
-					records);
-			list_for_each_entry(runlist, &runlists, link) {
+			err = ntfs_mft_records_retire_preflight(ni, retire.mft_records,
+								retire.nr_records);
+			list_for_each_entry(runlist, &retire.runlists, link) {
 				if (err)
 					break;
 				retire_stage = "cluster preflight";
-				err = ntfs_cluster_free_from_rl_preflight_with_mismatch(
-						ni->vol, runlist->rl,
+				err = ntfs_cluster_free_from_rl_preflight_with_mismatch(ni->vol,
+											runlist->rl,
 						&first_mismatch);
 				if (err && first_mismatch >= 0)
 					ntfs_error(sb,
@@ -3256,15 +3304,16 @@ static int __ntfs_delete_base_inode(struct ntfs_inode *ni, bool recovery)
 						(unsigned long long)
 							runlist->source_lowest_vcn);
 			}
-			if (!err && normalized_rl) {
+			if (!err && retire.normalized_rl) {
 				retire_stage = "cluster deallocation";
-				err = ntfs_cluster_free_from_rl_transacted(handle,
-						ni->vol, normalized_rl);
+				err = ntfs_cluster_free_from_rl_packed(handle,
+						ni->vol, retire.normalized_rl);
 			}
 			if (!err) {
 				retire_stage = "MFT retirement";
 				err = ntfs_mft_records_retire_transacted(handle,
-						ni, mft_records, records);
+								    ni, retire.mft_records,
+							    retire.nr_records);
 			}
 			mutex_unlock(&ni->mrec_lock);
 			if (err) {
@@ -3280,9 +3329,7 @@ static int __ntfs_delete_base_inode(struct ntfs_inode *ni, bool recovery)
 		}
 
 retire_close:
-		ntfs_deleted_runlists_free(&runlists);
-		kvfree(normalized_rl);
-		kvfree(mft_records);
+		ntfs_free_inode_retirement(&retire);
 		if (err == -E2BIG) {
 			if (recovery)
 				return err;
@@ -3312,7 +3359,7 @@ retire_close:
 			ntfs_error(sb,
 				"Failed to retire deleted inode 0x%llx (%llu MFT records, stage %s, error %d).",
 				(unsigned long long)ni->mft_no,
-				(unsigned long long)records, retire_stage, err);
+				(unsigned long long)retire.nr_records, retire_stage, err);
 		return err;
 	}
 	if (recovery || sb_rdonly(sb))
