@@ -3400,10 +3400,13 @@ static bool ntfs_log_skip_unchanged_checkpoint(struct ntfs_log *log)
 }
 
 static int ntfs_log_checkpoint_reason(struct ntfs_volume *vol, bool clean,
-		enum ntfs_log_recording_stat reason)
+		enum ntfs_log_recording_stat reason, bool *progress)
 {
 	struct ntfs_log *log;
 	u64 checkpoint_generation;
+	u64 oldest_lsn = 0;
+	u64 home_generation = 0;
+	u32 reserved_pages = 0;
 	unsigned int kind;
 	unsigned int passes = 0;
 	bool skip = false;
@@ -3425,6 +3428,11 @@ static int ntfs_log_checkpoint_reason(struct ntfs_volume *vol, bool clean,
 		return -EROFS;
 	}
 	checkpoint_generation = log->checkpoint_generation;
+	if (progress) {
+		oldest_lsn = log->oldest_lsn;
+		home_generation = atomic64_read(&log->home_generation);
+		reserved_pages = log->reserved_pages;
+	}
 	mutex_unlock(&log->append_lock);
 	mutex_lock(&log->checkpoint_lock);
 	up_read(&vol->journal_lock);
@@ -3433,7 +3441,8 @@ static int ntfs_log_checkpoint_reason(struct ntfs_volume *vol, bool clean,
 		skip = log->running && !log->aborted && !log->stopping &&
 			!NVolShutdown(vol) && !NVolErrors(vol) &&
 			!ntfs_log_has_deferred_free(log) &&
-			log->checkpoint_generation != checkpoint_generation;
+			log->checkpoint_generation != checkpoint_generation &&
+			(!progress || log->oldest_lsn != oldest_lsn);
 		mutex_unlock(&log->append_lock);
 	}
 	if (!clean && reason == NTFS_LOG_RECORDING_EXPLICIT_CHECKPOINT &&
@@ -3443,6 +3452,8 @@ static int ntfs_log_checkpoint_reason(struct ntfs_volume *vol, bool clean,
 		skip = true;
 	}
 	if (skip) {
+		if (progress)
+			*progress = true;
 		ntfs_log_recording_account(NTFS_LOG_RECORDING_CHECKPOINT_SKIP, 1);
 		ntfs_log_recording_account(reason, 1);
 		mutex_unlock(&log->checkpoint_lock);
@@ -3471,6 +3482,13 @@ static int ntfs_log_checkpoint_reason(struct ntfs_volume *vol, bool clean,
 		}
 		cond_resched();
 	}
+	if (!err && progress) {
+		mutex_lock(&log->append_lock);
+		*progress = log->oldest_lsn != oldest_lsn ||
+			    atomic64_read(&log->home_generation) != home_generation ||
+			    log->reserved_pages < reserved_pages;
+		mutex_unlock(&log->append_lock);
+	}
 	mutex_unlock(&log->checkpoint_lock);
 	if (!err)
 		ntfs_log_recording_account(reason, 1);
@@ -3480,7 +3498,7 @@ static int ntfs_log_checkpoint_reason(struct ntfs_volume *vol, bool clean,
 int ntfs_log_checkpoint(struct ntfs_volume *vol, bool clean)
 {
 	return ntfs_log_checkpoint_reason(vol, clean,
-			NTFS_LOG_RECORDING_EXPLICIT_CHECKPOINT);
+			NTFS_LOG_RECORDING_EXPLICIT_CHECKPOINT, NULL);
 }
 
 void ntfs_log_inode_writeback_deferred(struct ntfs_volume *vol)
@@ -3555,19 +3573,30 @@ out_journal:
 int ntfs_log_reclaim_locked(struct ntfs_volume *vol)
 {
 	return ntfs_log_checkpoint_reason(vol, false,
-			NTFS_LOG_RECORDING_SPACE_CHECKPOINT);
+			NTFS_LOG_RECORDING_SPACE_CHECKPOINT, NULL);
 }
 
-int ntfs_log_reclaim(struct ntfs_volume *vol)
+static int ntfs_log_reclaim_volume(struct ntfs_volume *vol, bool *progress)
 {
 	int err;
 
 	err = ntfs_log_pin_reclaim(vol);
 	if (err)
 		return err;
-	err = ntfs_log_reclaim_locked(vol);
+	err = ntfs_log_checkpoint_reason(vol, false,
+			NTFS_LOG_RECORDING_SPACE_CHECKPOINT, progress);
 	up_read(&vol->sb->s_umount);
 	return err;
+}
+
+int ntfs_log_reclaim(struct ntfs_volume *vol)
+{
+	return ntfs_log_reclaim_volume(vol, NULL);
+}
+
+int ntfs_log_reclaim_for_fsync(struct ntfs_volume *vol, bool *progress)
+{
+	return ntfs_log_reclaim_volume(vol, progress);
 }
 
 int ntfs_log_mount_checkpoint(struct ntfs_volume *vol)
@@ -3577,7 +3606,7 @@ int ntfs_log_mount_checkpoint(struct ntfs_volume *vol)
 	int err;
 
 	err = ntfs_log_checkpoint_reason(vol, false,
-					 NTFS_LOG_RECORDING_MOUNT_CHECKPOINT);
+					 NTFS_LOG_RECORDING_MOUNT_CHECKPOINT, NULL);
 	if (!err)
 		ntfs_log_recording_account(combined_stat, 1);
 	return err;
@@ -3676,7 +3705,7 @@ static void ntfs_log_reclaim_work(struct work_struct *work)
 		return;
 	}
 	err = ntfs_log_checkpoint_reason(vol, false,
-			NTFS_LOG_RECORDING_SPACE_CHECKPOINT);
+			NTFS_LOG_RECORDING_SPACE_CHECKPOINT, NULL);
 	up_read(&vol->sb->s_umount);
 	if (err && err != -EROFS)
 		ntfs_error(vol->sb,
@@ -5357,7 +5386,7 @@ retry:
 		if (!mount_locked)
 			down_read(&vol->sb->s_umount);
 		err = ntfs_log_checkpoint_reason(vol, false,
-				NTFS_LOG_RECORDING_SPACE_CHECKPOINT);
+				NTFS_LOG_RECORDING_SPACE_CHECKPOINT, NULL);
 		if (!mount_locked)
 			up_read(&vol->sb->s_umount);
 		if (!err)

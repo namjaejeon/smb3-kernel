@@ -355,6 +355,26 @@ struct ntfs_fsync_attr {
 	struct inode *inode;
 };
 
+static int ntfs_fsync_write_inode(struct inode *vi)
+{
+	struct ntfs_volume *vol = NTFS_I(vi)->vol;
+	bool progress = true;
+	int err;
+
+	for (;;) {
+		err = __ntfs_write_inode(vi, 0);
+		if (err != -EAGAIN)
+			return err;
+		/* The last attempt can use space freed by another transaction. */
+		if (!progress)
+			return -ENOSPC;
+		err = ntfs_log_reclaim_for_fsync(vol, &progress);
+		if (err)
+			return err;
+		cond_resched();
+	}
+}
+
 /*
  * ntfs_file_fsync - sync a file to disk
  * @filp:	file to be synced
@@ -513,12 +533,7 @@ int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 
 	if (vol->journal) {
 		/* Log inode changes after attribute writeback and defer home I/O. */
-		err = __ntfs_write_inode(vi, 0);
-		if (err == -EAGAIN) {
-			err = ntfs_log_reclaim(vol);
-			if (!err)
-				err = __ntfs_write_inode(vi, 0);
-		}
+		err = ntfs_fsync_write_inode(vi);
 	} else {
 		err = write_inode_now(vi, 1);
 	}

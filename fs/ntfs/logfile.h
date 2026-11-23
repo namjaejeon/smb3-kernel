@@ -272,6 +272,8 @@ void ntfs_log_inode_writeback_deferred(struct ntfs_volume *vol);
  * metadata/folio/invalidate/s_umount locks or sb_start_pagefault protection.
  */
 int ntfs_log_reclaim(struct ntfs_volume *vol);
+/* Report log space or home writeback progress under the same lock rules. */
+int ntfs_log_reclaim_for_fsync(struct ntfs_volume *vol, bool *progress);
 /* Caller pins s_umount. No metadata/folio/invalidate/pagefault locks. */
 int ntfs_log_reclaim_locked(struct ntfs_volume *vol);
 /* Wait for checkpoint gates, with the same unlocked/thaw contract as reclaim. */
