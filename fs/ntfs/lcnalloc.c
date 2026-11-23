@@ -516,9 +516,14 @@ static struct runlist_element *ntfs_cluster_alloc_core(
 
 		if (!is_dealloc)
 			available = ntfs_available_clusters(vol);
+		/*
+		 * A one-cluster minimum can use any free run.  Wait for
+		 * pending frees when space is short or when a multi-cluster
+		 * contiguous request might need a larger free run.
+		 */
 		err = ntfs_log_reclaim_deferred(vol,
 				NTFS_LOG_DEFERRED_CLUSTERS, available, min_count,
-				is_contig);
+				is_contig && min_count > 1);
 		if (err)
 			goto out_memalloc;
 	}
