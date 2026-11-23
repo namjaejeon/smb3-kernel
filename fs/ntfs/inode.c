@@ -1148,6 +1148,7 @@ void __ntfs_init_inode(struct super_block *sb, struct ntfs_inode *ni)
 	atomic_set(&ni->stream_open_count, 0);
 	ntfs_init_runlist(&ni->runlist);
 	mutex_init(&ni->mrec_lock);
+	mutex_init(&ni->mrec_writeback_lock);
 	if (ni->type == AT_ATTRIBUTE_LIST) {
 		lockdep_set_class(&ni->mrec_lock,
 				  &attr_list_inode_mrec_lock_class);
@@ -4645,14 +4646,16 @@ int ntfs_extend_delalloc_vfs(struct inode *vi, loff_t new_size)
 
 /*
  * ntfs_inode_sync_standard_information - update standard information attribute
+ * @handle:	journal transaction for an update
  * @vi:	inode to update standard information
  * @m:	mft record
+ * @changed:	if set, report whether an update is needed
  *
  * Return 0 on success or -errno on error.
  */
 static int ntfs_inode_sync_standard_information(
 		struct ntfs_log_handle *handle, struct inode *vi,
-		struct mft_record *m)
+		struct mft_record *m, bool *changed)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_attr_search_ctx *ctx;
@@ -4731,6 +4734,11 @@ static int ntfs_inode_sync_standard_information(
 				le64_to_cpu(nt));
 		si->last_access_time = nt;
 		modified = true;
+	}
+
+	if (changed) {
+		*changed = modified;
+		goto out;
 	}
 
 	/*
@@ -5065,7 +5073,7 @@ static int ntfs_inode_filename_log_credits(struct ntfs_inode *ni,
 
 /* Journal inode metadata, serializing each filename update with its parent. */
 static int ntfs_inode_journal_metadata(struct inode *vi,
-		bool filename_dirty, struct ntfs_log **deferred_log)
+		struct ntfs_log **deferred_log)
 {
 	struct ntfs_inode *ni = NTFS_I(vi);
 	struct ntfs_log_handle *parent = NULL;
@@ -5077,31 +5085,58 @@ static int ntfs_inode_journal_metadata(struct inode *vi,
 	int link_credits = 0;
 	int abort_err;
 	int err;
+	bool filename_dirty, changed;
 
 	*deferred_log = NULL;
 	if (!ni->vol->journal)
 		return 0;
+
+	/*
+	 * Serialize the dirty check and transaction so concurrent fsyncs of
+	 * this inode do not reserve space for the same metadata update.
+	 * Writeback transactions defer reclamation while this lock is held.
+	 */
+	mutex_lock(&ni->mrec_writeback_lock);
+	filename_dirty = (vi->i_sb->s_flags & SB_ACTIVE) &&
+			 NInoTestClearFileNameDirty(ni);
+	if (!filename_dirty) {
+		mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
+		err = ntfs_inode_sync_standard_information(NULL, vi, NULL,
+				&changed);
+		mutex_unlock(&ni->mrec_lock);
+		if (err || !changed)
+			goto out;
+	}
+
 	standard_credits = ntfs_log_mft_attribute_credits(ni->vol,
 			sizeof(struct standard_information),
 			sizeof(struct standard_information));
-	if (standard_credits < 0)
-		return standard_credits;
+	if (standard_credits < 0) {
+		err = standard_credits;
+		goto out;
+	}
 	credits = standard_credits;
 	first_credits = credits;
 	if (filename_dirty) {
 		filename_credits = ntfs_inode_filename_log_credits(ni,
 				&link_credits);
-		if (filename_credits < 0)
-			return filename_credits;
+		if (filename_credits < 0) {
+			err = filename_credits;
+			goto out;
+		}
 		if (check_add_overflow(credits, (unsigned int)filename_credits,
 				&credits) ||
 		    check_add_overflow(first_credits, (unsigned int)link_credits,
-				&first_credits))
-			return -EOVERFLOW;
+				&first_credits)) {
+			err = -EOVERFLOW;
+			goto out;
+		}
 	}
 	handle = ntfs_log_begin_inode_writeback(ni->vol, credits, deferred_log);
-	if (IS_ERR(handle))
-		return PTR_ERR(handle);
+	if (IS_ERR(handle)) {
+		err = PTR_ERR(handle);
+		goto out;
+	}
 	mutex_lock_nested(&ni->mrec_lock, NTFS_INODE_MUTEX_NORMAL);
 	if (filename_dirty) {
 		parent = handle;
@@ -5113,7 +5148,7 @@ static int ntfs_inode_journal_metadata(struct inode *vi,
 			goto finish;
 		}
 	}
-	err = ntfs_inode_sync_standard_information(handle, vi, NULL);
+	err = ntfs_inode_sync_standard_information(handle, vi, NULL, NULL);
 	if (!err && filename_dirty)
 		err = __ntfs_inode_sync_filename(parent, &handle, link_credits,
 				ni);
@@ -5138,6 +5173,10 @@ finish:
 		}
 	}
 	mutex_unlock(&ni->mrec_lock);
+out:
+	if (err && filename_dirty)
+		NInoSetFileNameDirty(ni);
+	mutex_unlock(&ni->mrec_writeback_lock);
 	return err;
 }
 
@@ -5197,7 +5236,6 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 	bool need_iput = false;
 	struct ntfs_log *deferred_log = NULL;
 	bool home_deferred = false;
-	bool filename_dirty;
 
 	ntfs_debug("Entering for %sinode 0x%llx.", NInoAttr(ni) ? "attr " : "",
 			ni->mft_no);
@@ -5223,14 +5261,8 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 		ntfs_debug("Done.");
 		return 0;
 	}
-	filename_dirty = ni->vol->journal &&
-		(vi->i_sb->s_flags & SB_ACTIVE) &&
-		NInoTestClearFileNameDirty(ni);
-	err = ntfs_inode_journal_metadata(vi, filename_dirty,
-			&deferred_log);
+	err = ntfs_inode_journal_metadata(vi, &deferred_log);
 	if (err) {
-		if (filename_dirty)
-			NInoSetFileNameDirty(ni);
 		if (!deferred_log)
 			goto err_out;
 		/*
@@ -5270,7 +5302,7 @@ int __ntfs_write_inode(struct inode *vi, int sync)
 	}
 
 	err = ni->vol->journal ? 0 :
-		ntfs_inode_sync_standard_information(NULL, vi, m);
+		ntfs_inode_sync_standard_information(NULL, vi, m, NULL);
 	if (err)
 		goto unm_err_out;
 

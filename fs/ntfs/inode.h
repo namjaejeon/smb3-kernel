@@ -64,6 +64,7 @@ enum ntfs_inode_mutex_lock_class {
  * @mrec: MFT record
  * @mrec_lock: Lock for serializing access to the mft record belonging to
  *   this inode.
+ * @mrec_writeback_lock: Serializes the metadata check and journal transaction.
  * @folio: The folio containing the mft record of the inode.
  * @folio_ofs: Offset into the folio at which the mft record begins.
  * @mft_lcn: Number containing the mft record.
@@ -131,6 +132,7 @@ struct ntfs_inode {
 	struct timespec64 i_crtime;
 	void *mrec;
 	struct mutex mrec_lock;
+	struct mutex mrec_writeback_lock;
 	struct folio *folio;
 	int folio_ofs;
 	s64 mft_lcn[2];
