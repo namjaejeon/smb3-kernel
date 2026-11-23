@@ -3194,10 +3194,14 @@ static int __ntfs_log_checkpoint(struct ntfs_log *log, bool clean,
 			home_generation = atomic64_read(&log->home_generation);
 			mutex_lock(&log->append_lock);
 			/*
-			 * A restart page also seeds last_client_lsn. Only this
-			 * writer's pending tail belongs to the collection batch.
+			 * A concurrent flush may already have detached the batch.
+			 * Wait for its tail as well so the next pass can write
+			 * metadata covered by that batch. A restart page also seeds
+			 * last_client_lsn, so only use it while a flush is in flight.
 			 */
 			commit_lsn = log->pending_lsn;
+			if (!commit_lsn && log->flush_inflight)
+				commit_lsn = log->last_client_lsn;
 			if (!log->running || log->aborted ||
 			    (log->stopping && !allow_stopping)) {
 				err = -EROFS;
