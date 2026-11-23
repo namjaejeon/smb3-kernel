@@ -27,6 +27,7 @@ int ntfs_writeback_prepare_folio(struct inode *inode, struct folio *folio);
 struct ntfs_writepage_ctx {
 	struct iomap_writepage_ctx wpc;
 	struct ntfs_ordered_io *ordered;
+	bool metadata;
 };
 extern const struct iomap_writeback_ops ntfs_writeback_ops;
 extern const struct iomap_write_ops ntfs_iomap_folio_ops;

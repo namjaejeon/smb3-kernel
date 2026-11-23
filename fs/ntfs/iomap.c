@@ -1282,11 +1282,28 @@ int ntfs_writeback_prepare_folio(struct inode *inode, struct folio *folio)
 	return 0;
 }
 
+static void ntfs_metadata_writeback_end_io(struct bio *bio)
+{
+	struct iomap_ioend *ioend = iomap_ioend_from_bio(bio);
+	int error = blk_status_to_errno(bio->bi_status);
+
+	/* Record the failure before checkpoint writeback can finish waiting. */
+	if (error)
+		NVolSetErrors(NTFS_I(ioend->io_inode)->vol);
+	iomap_finish_ioends(ioend, error);
+}
+
 static int ntfs_writeback_submit(struct iomap_writepage_ctx *wpc, int error)
 {
 	struct ntfs_writepage_ctx *ntfs_wpc =
 		container_of(wpc, struct ntfs_writepage_ctx, wpc);
 
+	if (ntfs_wpc->metadata && !ntfs_wpc->ordered) {
+		struct iomap_ioend *ioend = wpc->wb_ctx;
+
+		bio_set_flag(&ioend->io_bio, BIO_COMPLETE_IN_TASK);
+		ioend->io_bio.bi_end_io = ntfs_metadata_writeback_end_io;
+	}
 	return ntfs_log_ordered_writeback_submit(ntfs_wpc->ordered, wpc, error);
 }
 

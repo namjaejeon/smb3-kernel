@@ -269,7 +269,7 @@ static int ntfs_writepages(struct address_space *mapping,
 	bool need_iput = false;
 	bool bitmap_locked = false;
 	bool metadata_deferred = false;
-	bool journal_metadata = NInoAttr(ni) || inode == ni->vol->lcnbmp_ino;
+	bool check_wal = NInoAttr(ni) || inode == ni->vol->lcnbmp_ino;
 	bool ordered_wb_user = false;
 	int ret;
 
@@ -277,6 +277,8 @@ static int ntfs_writepages(struct address_space *mapping,
 		return -EIO;
 
 	if (ni->vol->journal) {
+		ntfs_wpc.metadata = ni->type != AT_DATA ||
+				    ni->mft_no < FILE_first_user;
 		while (!ntfs_ordered_writeback_enter(ni, &ntfs_wpc.ordered)) {
 			if (wbc->sync_mode != WB_SYNC_ALL)
 				return 0;
@@ -315,7 +317,7 @@ static int ntfs_writepages(struct address_space *mapping,
 	 * Ordinary file data is allowed to reach disk before metadata commit, as
 	 * required by ordered-data semantics.
 	 */
-	if (journal_metadata) {
+	if (check_wal) {
 		int err = ntfs_log_writeback_inode(inode,
 				wbc->sync_mode == WB_SYNC_ALL);
 
@@ -352,7 +354,7 @@ static int ntfs_writepages(struct address_space *mapping,
 
 		while ((folio = writeback_iter(mapping, wbc, folio, &error))) {
 			/* A metadata writer may have advanced the WAL since entry. */
-			error = journal_metadata ?
+			error = check_wal ?
 				ntfs_log_writeback_inode(inode, false) : 0;
 			if (!error)
 				error = ntfs_writeback_prepare_folio(inode, folio);
@@ -361,7 +363,7 @@ static int ntfs_writepages(struct address_space *mapping,
 				iomap_dirty_folio(mapping, folio);
 				if (error == -EAGAIN) {
 					deferred = true;
-					metadata_deferred = journal_metadata;
+					metadata_deferred = ntfs_wpc.metadata;
 				} else if (error != -ENOMEM) {
 					mapping_set_error(mapping, error);
 				}
@@ -371,7 +373,7 @@ static int ntfs_writepages(struct address_space *mapping,
 					folio_redirty_for_writepage(wbc, folio);
 					iomap_dirty_folio(mapping, folio);
 					deferred = true;
-					metadata_deferred = journal_metadata;
+					metadata_deferred = ntfs_wpc.metadata;
 				}
 			}
 			if (error && error != -EAGAIN && !first_error)
@@ -403,7 +405,7 @@ out_bitmap:
 		ntfs_ordered_writeback_exit(ni);
 	if (bitmap_locked)
 		up_read(&ni->vol->lcnbmp_lock);
-	if (ret && journal_metadata && ni->vol->journal) {
+	if (ret && ntfs_wpc.metadata) {
 		metadata_deferred = true;
 		if (ret != -EAGAIN && ret != -ENOMEM)
 			NVolSetErrors(ni->vol);
