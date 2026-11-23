@@ -362,6 +362,8 @@ static int ntfs_writepages(struct address_space *mapping,
 				if (error == -EAGAIN) {
 					deferred = true;
 					metadata_deferred = journal_metadata;
+				} else if (error != -ENOMEM) {
+					mapping_set_error(mapping, error);
 				}
 			} else {
 				error = iomap_writeback_folio(wpc, folio);
@@ -377,9 +379,10 @@ static int ntfs_writepages(struct address_space *mapping,
 			folio_unlock(folio);
 		}
 		if (wpc->wb_ctx) {
-			int submit_err = wpc->ops->writeback_submit(wpc,
-					first_error ? first_error : 0);
+			int submit_err;
 
+			/* Submit the ranges already mapped for this ioend. */
+			submit_err = wpc->ops->writeback_submit(wpc, 0);
 			if (submit_err && !first_error)
 				first_error = submit_err;
 		}
