@@ -705,7 +705,6 @@ struct ntfs_log_handle {
 /* Immutable, MST-protected page owned by append or by one flush batch. */
 struct ntfs_log_sealed_page {
 	struct list_head list;
-	bool has_terminal;
 	u64 file_off;
 	u8 data[];
 };
@@ -778,7 +777,6 @@ struct ntfs_log {
 	void *pending_page;
 	u64 pending_page_off;
 	u32 pending_page_records;
-	bool pending_page_has_terminal;
 	u64 pending_bdev_start;
 	u64 pending_bdev_end;
 	bool pending_bdev_range_valid;

@@ -1625,7 +1625,7 @@ static int ntfs_log_reserve_pages(struct ntfs_log *log, u32 nr_pages,
 
 /* append_lock must be held. No page-cache access or I/O on the append path. */
 static int ntfs_log_queue_page(struct ntfs_log *log, u64 file_off,
-		const void *data, bool has_terminal)
+		const void *data)
 {
 	struct ntfs_log_sealed_page *page;
 
@@ -1633,7 +1633,6 @@ static int ntfs_log_queue_page(struct ntfs_log *log, u64 file_off,
 	if (!page)
 		return -ENOMEM;
 	page->file_off = file_off;
-	page->has_terminal = has_terminal;
 	memcpy(page->data, data, log->layout.page_size);
 	list_add_tail(&page->list, &log->sealed_pages);
 	log->sealed_bytes += log->layout.page_size;
@@ -1670,7 +1669,7 @@ static int ntfs_log_write_record_pages(struct ntfs_log *log, u64 lsn,
 		if (err)
 			return err;
 		file_off &= ~((u64)log->layout.page_mask);
-		err = ntfs_log_queue_page(log, file_off, page, false);
+		err = ntfs_log_queue_page(log, file_off, page);
 		if (err)
 			return err;
 		err = ntfs_log_advance_lsn(&log->layout, page_lsn, 1,
@@ -1750,8 +1749,7 @@ static int ntfs_log_seal_pending_page(struct ntfs_log *log)
 	err = ntfs_log_resequence_mst(log, page, log->layout.page_size);
 	if (err)
 		return err;
-	err = ntfs_log_queue_page(log, log->pending_page_off, page,
-				 log->pending_page_has_terminal);
+	err = ntfs_log_queue_page(log, log->pending_page_off, page);
 	if (err)
 		return err;
 
@@ -1771,7 +1769,6 @@ static int ntfs_log_seal_pending_page(struct ntfs_log *log)
 	log->pending_page = NULL;
 	log->pending_page_off = 0;
 	log->pending_page_records = 0;
-	log->pending_page_has_terminal = false;
 	ntfs_log_recording_account(NTFS_LOG_RECORDING_PAGE, 1);
 	return 0;
 }
@@ -2089,8 +2086,6 @@ static int ntfs_log_append_record(struct ntfs_log *log,
 				byte_off & log->layout.page_mask);
 		if (err)
 			return err;
-		if (redo_op == CommitTransaction || redo_op == ForgetTransaction)
-			log->pending_page_has_terminal = true;
 		if (packed)
 			ntfs_log_recording_account(
 					NTFS_LOG_RECORDING_PACKED_RECORD, 1);
@@ -2505,29 +2500,27 @@ static int ntfs_log_flush_group(struct ntfs_log *log, u64 required_lsn,
 	if (err)
 		goto out_io;
 	phase_started = ktime_get_ns();
+	/*
+	 * Readers that ignore batch markers may act on Commit records as soon
+	 * as they are stable, so make completed ordered data stable first.
+	 */
+	if (ordered) {
+		err = blkdev_issue_flush(log->vol->sb->s_bdev);
+		if (err)
+			goto out_io;
+	}
+	/*
+	 * Replay ignores every record after the last valid batch marker, and
+	 * home writeback waits for durable_lsn.  Write the whole generation
+	 * through the page cache; the marker's (or restart page's) final
+	 * PREFLUSH|FUA makes it durable with one device cache flush.
+	 */
 	list_for_each_entry(page, &pages, list) {
 		const void *data = page == marker_page ? incomplete_marker :
 			page->data;
 
-		if (page->has_terminal) {
-			bool buffered = log->pending_bdev_range_valid;
-			bool preflush = buffered || list_is_first(&page->list, &pages);
-
-			/*
-			 * Other readers can act on these records before the batch
-			 * marker. The first preflush orders any data writes, then
-			 * consecutive FUA writes keep the log prefix durable.
-			 */
-			if (buffered)
-				err = ntfs_log_sync_logfile_pages(log);
-			if (!err)
-				err = ntfs_log_raw_write_fua(log->vol, log->layout.log_size,
-					page->file_off, data, log->layout.page_size,
-					preflush);
-		} else {
-			err = ntfs_log_raw_write(log, page->file_off, data,
-						log->layout.page_size, false);
-		}
+		err = ntfs_log_raw_write(log, page->file_off, data,
+					log->layout.page_size, false);
 		if (err)
 			goto out_io;
 	}
