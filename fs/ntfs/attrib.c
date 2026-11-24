@@ -8234,7 +8234,7 @@ int ntfs_attr_preallocate_chunks(struct ntfs_inode *ni, s64 new_size)
 
 		if (allocated_size >= new_size)
 			return 0;
-		if (signal_pending(current))
+		if (fatal_signal_pending(current))
 			return -EINTR;
 		if (allocated_size < 0 || !IS_ALIGNED(allocated_size, vol->cluster_size))
 			return -EIO;
@@ -12438,7 +12438,7 @@ static int ntfs_attr_fallocate_journaled(struct ntfs_inode *ni, loff_t start,
 		return -EINVAL;
 	if (end > S64_MAX - vol->cluster_size_mask)
 		return -EFBIG;
-	if (signal_pending(current))
+	if (fatal_signal_pending(current))
 		return -EINTR;
 	if (end > ni->data_size && !keep_size) {
 		err = ntfs_truncate_vfs(VFS_I(ni), end,
@@ -12480,7 +12480,7 @@ static int ntfs_attr_fallocate_journaled(struct ntfs_inode *ni, loff_t start,
 		bool was_sparse;
 		bool sparse;
 
-		if (signal_pending(current))
+		if (fatal_signal_pending(current))
 			return -EINTR;
 		if (!NInoNonResident(ni) ||
 		    NInoCompressed(ni) || NInoEncrypted(ni))
@@ -12544,7 +12544,7 @@ static int ntfs_attr_fallocate_journaled(struct ntfs_inode *ni, loff_t start,
 			DIV_ROUND_UP_ULL(ni->initialized_size,
 				vol->cluster_size));
 	while (vcn < vcn_end) {
-		if (signal_pending(current))
+		if (fatal_signal_pending(current))
 			return -EINTR;
 		down_read(&ni->runlist.lock);
 		rl = ntfs_rl_find_vcn_nolock(ni->runlist.rl, vcn);

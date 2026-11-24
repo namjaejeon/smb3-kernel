@@ -4085,7 +4085,7 @@ static int ntfs_truncate_physical_grow_chunks(struct ntfs_inode *ni,
 	err = ntfs_attr_preallocate_chunks(ni, new_size);
 	if (err)
 		return err;
-	if (signal_pending(current))
+	if (fatal_signal_pending(current))
 		return -EINTR;
 
 	credits = ntfs_attr_logical_grow_log_credits(ni->vol, false);
