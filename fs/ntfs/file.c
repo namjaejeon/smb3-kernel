@@ -158,21 +158,38 @@ int ntfs_file_release(struct inode *vi, struct file *filp)
 	return 0;
 }
 
+/*
+ * Journaled WB_SYNC_ALL writeback defers with -EAGAIN when it cannot reserve
+ * log space or its metadata WAL is not yet durable.  A single checkpoint may
+ * not be enough while other transactions keep consuming the log, so keep
+ * reclaiming while checkpoints make progress.  After a checkpoint without
+ * progress, make one final attempt and report ENOSPC if it is still deferred.
+ */
+static int ntfs_write_and_wait_reclaim(struct file *filp,
+		struct address_space *mapping, loff_t start, loff_t end)
+{
+	struct ntfs_volume *vol = NTFS_I(mapping->host)->vol;
+	bool progress = true;
+	int err;
+
+	for (;;) {
+		err = filp ? file_write_and_wait_range(filp, start, end) :
+			filemap_write_and_wait_range(mapping, start, end);
+		if (err != -EAGAIN || !vol->journal)
+			return err;
+		if (!progress)
+			return -ENOSPC;
+		err = ntfs_log_reclaim_for_fsync(vol, &progress);
+		if (err)
+			return err;
+		cond_resched();
+	}
+}
+
 int ntfs_fsync_write_and_wait_range(struct file *filp, loff_t start,
 		loff_t end)
 {
-	struct ntfs_volume *vol = NTFS_I(filp->f_mapping->host)->vol;
-	int err;
-
-	err = file_write_and_wait_range(filp, start, end);
-	if (err != -EAGAIN || !vol->journal)
-		return err;
-
-	err = ntfs_log_reclaim(vol);
-	if (err)
-		return err;
-
-	return file_write_and_wait_range(filp, start, end);
+	return ntfs_write_and_wait_reclaim(filp, filp->f_mapping, start, end);
 }
 
 static int ntfs_sync_pending_empty_eof(struct ntfs_inode *ni)
@@ -518,7 +535,8 @@ int ntfs_file_fsync(struct file *filp, loff_t start, loff_t end,
 	list_for_each_entry_safe(attr, next, &attrs, list) {
 		struct inode *attr_vi = attr->inode;
 
-		err = filemap_write_and_wait(attr_vi->i_mapping);
+		err = ntfs_write_and_wait_reclaim(NULL, attr_vi->i_mapping, 0,
+				LLONG_MAX);
 		if (err && !ret)
 			ret = err;
 		if (ntfs_inode_is_named_stream(NTFS_I(attr_vi))) {
@@ -653,7 +671,8 @@ int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 	 */
 	if (stream) {
 		filemap_invalidate_lock(vi->i_mapping);
-		err = filemap_write_and_wait(vi->i_mapping);
+		err = ntfs_write_and_wait_reclaim(NULL, vi->i_mapping, 0,
+				LLONG_MAX);
 		if (err)
 			goto out_unlock_mapping;
 
@@ -673,7 +692,8 @@ int ntfs_setattr_size(struct inode *vi, struct iattr *attr)
 	    NInoNonResident(ni) && kept_size &&
 	    (NInoPendingEmptyEof(ni) ||
 	     ntfs_truncate_has_delalloc(ni, kept_size))) {
-		err = filemap_write_and_wait_range(vi->i_mapping, 0, kept_size - 1);
+		err = ntfs_write_and_wait_reclaim(NULL, vi->i_mapping, 0,
+				kept_size - 1);
 		if (err)
 			goto out_unlock_mapping;
 	}
