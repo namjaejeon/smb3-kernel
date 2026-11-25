@@ -329,6 +329,14 @@ static int ntfs_bitmap_set_bits_in_run_core(struct ntfs_log_handle *log_handle,
 	if (!cnt)
 		return 0;
 
+	/*
+	 * The initial free cluster scan locks each $Bitmap folio, so wait for
+	 * it before locking one here; ntfs_set_lcn_empty_bits() must not wait
+	 * for it with a folio locked.
+	 */
+	if (ni->mft_no == FILE_Bitmap && !NVolFreeClusterKnown(vol))
+		wait_event(vol->free_waitq, NVolFreeClusterKnown(vol));
+
 	if (!is_rollback && (vol->journal || log_handle)) {
 		log_err = ntfs_bitmap_validate_run(vi, start_bit, count,
 				value ? 0 : 1);
