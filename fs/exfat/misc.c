@@ -168,8 +168,12 @@ int exfat_update_bh(struct buffer_head *bh, int sync)
 	set_buffer_uptodate(bh);
 	mark_buffer_dirty(bh);
 
-	if (sync)
+	if (sync) {
 		err = sync_dirty_buffer(bh);
+		/* Writeback may have submitted the buffer before the sync. */
+		if (!err && buffer_write_io_error(bh))
+			err = -EIO;
+	}
 
 	return err;
 }
