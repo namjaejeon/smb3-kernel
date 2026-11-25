@@ -270,6 +270,7 @@ static ssize_t exfat_writeback_range(struct iomap_writepage_ctx *wpc,
 	    offset >= wpc->iomap.offset + wpc->iomap.length) {
 		int error;
 
+		/* Relocation relies on the mapping staying within this folio. */
 		error = __exfat_iomap_begin(inode, offset, len,
 				0, &wpc->iomap, false);
 		if (error)

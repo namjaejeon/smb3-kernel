@@ -9,6 +9,7 @@
 #include <linux/buffer_head.h>
 #include <linux/capability.h>
 #include <linux/file.h>
+#include <linux/folio_batch.h>
 #include <linux/mm.h>
 #include <linux/mount.h>
 #include <linux/pagemap.h>
@@ -16,7 +17,6 @@
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/sizes.h>
-#include <linux/swap.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/vmalloc.h>
@@ -211,6 +211,8 @@ unlock:
 struct exfat_move {
 	struct inode *inode;
 	struct exfat_entry_set_cache es;
+	struct folio **folios;
+	unsigned int nr_folios;
 	unsigned int *source;
 	unsigned int *sorted;
 	unsigned int count;
@@ -350,10 +352,6 @@ static int exfat_move_read_source(struct exfat_move *move,
 	unsigned int cluster, i;
 	int ret;
 
-	move->total = exfat_bytes_to_cluster(sbi, exfat_ondisk_size(inode));
-	if (req->start_vcn >= move->total ||
-	    req->cluster_count > move->total - req->start_vcn)
-		return -EINVAL;
 	ret = exfat_cluster_at(inode, req->start_vcn, &cluster);
 	if (ret)
 		return ret;
@@ -837,6 +835,50 @@ out:
 	return ret;
 }
 
+/*
+ * Iomap folios cache file contents by offset. Keep them attached and locked
+ * so writeback cannot resolve their blocks until the cluster move finishes.
+ */
+static int exfat_move_lock_folios(struct exfat_move *move, unsigned int vcn)
+{
+	struct inode *inode = move->inode;
+	struct address_space *mapping = inode->i_mapping;
+	struct exfat_sb_info *sbi = EXFAT_SB(inode->i_sb);
+	loff_t start = exfat_cluster_to_bytes(sbi, vcn);
+	loff_t end = min(start + exfat_cluster_to_bytes(sbi, move->count),
+			 i_size_read(inode));
+	pgoff_t index, last;
+	struct folio_batch fbatch;
+	unsigned int i, nr;
+
+	if (start >= end)
+		return 0;
+	index = start >> PAGE_SHIFT;
+	last = (end - 1) >> PAGE_SHIFT;
+	folio_batch_init(&fbatch);
+	while ((nr = filemap_get_folios(mapping, &index, last, &fbatch))) {
+		for (i = 0; i < nr; i++) {
+			struct folio *folio = fbatch.folios[i];
+
+			if (!folio_trylock(folio))
+				break;
+			if (folio->mapping != mapping || folio_test_writeback(folio) ||
+			    folio_test_dirty(folio) || folio_mapped(folio) ||
+			    folio_maybe_dma_pinned(folio)) {
+				folio_unlock(folio);
+				break;
+			}
+			folio_get(folio);
+			move->folios[move->nr_folios++] = folio;
+		}
+		folio_batch_release(&fbatch);
+		if (i < nr)
+			return -EBUSY;
+		cond_resched();
+	}
+	return 0;
+}
+
 static long exfat_ioctl_relocate(struct file *file, void __user *arg, bool convert)
 {
 	struct inode *inode = file_inode(file);
@@ -853,6 +895,9 @@ static long exfat_ioctl_relocate(struct file *file, void __user *arg, bool conve
 	if (!(file->f_mode & FMODE_WRITE))
 		return -EBADF;
 	if (!convert) {
+		unsigned int nr_pages;
+		loff_t bytes;
+
 		if (copy_from_user(&req, arg, sizeof(req)))
 			return -EFAULT;
 		if (req.flags || req.reserved || !req.cluster_count ||
@@ -863,10 +908,14 @@ static long exfat_ioctl_relocate(struct file *file, void __user *arg, bool conve
 
 		move.count = req.cluster_count;
 		move.target = req.target_lcn + EXFAT_RESERVED_CLUSTERS;
+		bytes = exfat_cluster_to_bytes(sbi, move.count);
+		/* A cluster range may start partway through a page. */
+		nr_pages = DIV_ROUND_UP_ULL(bytes + PAGE_SIZE - 1, PAGE_SIZE);
+		move.folios = kvmalloc_objs(*move.folios, nr_pages, GFP_KERNEL);
 		move.source = kvmalloc_objs(*move.source, move.count, GFP_KERNEL);
 		move.sorted = kvmalloc_objs(*move.sorted, move.count, GFP_KERNEL);
 		move.buffer = kmalloc(EXFAT_COPY_BYTES, GFP_KERNEL);
-		if (!move.source || !move.sorted || !move.buffer) {
+		if (!move.folios || !move.source || !move.sorted || !move.buffer) {
 			ret = -ENOMEM;
 			goto free;
 		}
@@ -877,21 +926,19 @@ static long exfat_ioctl_relocate(struct file *file, void __user *arg, bool conve
 	inode_lock(inode);
 	inode_dio_wait(inode);
 	filemap_invalidate_lock(mapping);
-	/* Revoke writable PTEs; new read/write faults wait on invalidate_lock. */
-	if (!convert)
+	if (!convert) {
+		move.total = exfat_bytes_to_cluster(sbi, exfat_ondisk_size(inode));
+		if (req.start_vcn >= move.total ||
+		    req.cluster_count > move.total - req.start_vcn) {
+			ret = -EINVAL;
+			goto unlock;
+		}
+		/* Revoke writable PTEs before flushing and locking the folios. */
 		unmap_mapping_range(mapping, 0, 0, 0);
+	}
 	ret = filemap_write_and_wait(mapping);
 	if (ret)
 		goto unlock;
-	/* Drop temporary LRU references before checking for external pins. */
-	if (!convert) {
-		lru_add_drain_all();
-		invalidate_mapping_pages(mapping, 0, -1);
-		if (mapping->nrpages) {
-			ret = -EBUSY;
-			goto unlock;
-		}
-	}
 	ret = write_inode_now(inode, 1);
 	if (ret)
 		goto unlock;
@@ -901,6 +948,11 @@ static long exfat_ioctl_relocate(struct file *file, void __user *arg, bool conve
 	ret = blkdev_issue_flush(inode->i_sb->s_bdev);
 	if (ret)
 		goto unlock;
+	if (!convert) {
+		ret = exfat_move_lock_folios(&move, req.start_vcn);
+		if (ret)
+			goto unlock;
+	}
 
 	mutex_lock(&sbi->s_lock);
 	ret = convert ? exfat_set_no_fat_chain_locked(&move) :
@@ -915,11 +967,18 @@ static long exfat_ioctl_relocate(struct file *file, void __user *arg, bool conve
 		exfat_put_dentry_set(&move.es, false);
 	mutex_unlock(&sbi->s_lock);
 unlock:
+	while (move.nr_folios) {
+		struct folio *folio = move.folios[--move.nr_folios];
+
+		folio_unlock(folio);
+		folio_put(folio);
+	}
 	filemap_invalidate_unlock(mapping);
 	inode_unlock(inode);
 	mnt_drop_write_file(file);
 free:
 	kfree(move.buffer);
+	kvfree(move.folios);
 	kvfree(move.sorted);
 	kvfree(move.source);
 	return ret;
