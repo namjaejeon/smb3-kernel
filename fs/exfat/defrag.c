@@ -129,8 +129,8 @@ long exfat_ioctl_get_retrieval_pointers(struct file *file, void __user *arg)
 	if (!extents)
 		return -ENOMEM;
 
+	/* The shared inode lock protects the regular file's allocation. */
 	inode_lock_shared(inode);
-	mutex_lock(&sbi->s_lock);
 	if (exfat_forced_shutdown(inode->i_sb)) {
 		ret = -EIO;
 		goto unlock;
@@ -184,20 +184,17 @@ long exfat_ioctl_get_retrieval_pointers(struct file *file, void __user *arg)
 		vcn++;
 		if (vcn == total)
 			break;
-		if (ei->flags == ALLOC_NO_FAT_CHAIN) {
-			cluster++;
-		} else {
-			ret = exfat_ent_get(inode->i_sb, cluster, &next, &fat_bh);
-			if (ret)
-				goto unlock;
-			cluster = next;
-		}
+		ret = exfat_ent_get(inode->i_sb, cluster, &next, &fat_bh);
+		if (ret)
+			goto unlock;
+		cluster = next;
 		cond_resched();
 	}
 	map.next_vcn = vcn;
 unlock:
 	brelse(fat_bh);
-	mutex_unlock(&sbi->s_lock);
+	if (!ret && exfat_forced_shutdown(inode->i_sb))
+		ret = -EIO;
 	inode_unlock_shared(inode);
 	if (!ret &&
 	    ((map.extent_count && copy_to_user(u64_to_user_ptr(map.extents),
@@ -797,30 +794,42 @@ static int exfat_set_no_fat_chain_locked(struct exfat_move *move)
 		return -EIO;
 	if (total > sbi->num_clusters - ei->start_clu)
 		return -EAGAIN;
+
+	/* The inode lock keeps the allocation fixed during the FAT scan. */
+	mutex_unlock(&sbi->s_lock);
 	for (i = 0; i < total; i++) {
 		if (signal_pending(current)) {
 			ret = -EINTR;
-			goto out;
+			break;
 		}
 		ret = exfat_ent_get(sb, ei->start_clu + i, &next, &bh);
 		if (ret)
-			goto out;
+			break;
 		expected = i + 1 < total ? ei->start_clu + i + 1 : EXFAT_EOF_CLUSTER;
 		if (next != expected) {
 			ret = -EAGAIN;
-			goto out;
+			break;
 		}
 		cond_resched();
 	}
+	brelse(bh);
+	mutex_lock(&sbi->s_lock);
+	if (ret)
+		return ret;
+	ret = exfat_move_check_inode(inode);
+	if (ret)
+		return ret;
 	ret = exfat_move_get_entries(move);
 	if (ret)
-		goto out;
+		return ret;
+	if (signal_pending(current))
+		return -EINTR;
 	exfat_set_volume_dirty(sb);
 	ret = buffer_write_io_error(sbi->boot_bh) ? -EIO :
 		blkdev_issue_flush(sb->s_bdev);
 	if (ret) {
 		move->metadata_error = true;
-		goto out;
+		return ret;
 	}
 	stream = exfat_get_dentry_cached(&move->es, ES_IDX_STREAM);
 	stream->dentry.stream.flags = ALLOC_NO_FAT_CHAIN;
@@ -830,8 +839,6 @@ static int exfat_set_no_fat_chain_locked(struct exfat_move *move)
 	exfat_cache_inval_inode(inode);
 	ei->hint_bmap.off = 0;
 	ei->hint_bmap.clu = ei->start_clu;
-out:
-	brelse(bh);
 	return ret;
 }
 
