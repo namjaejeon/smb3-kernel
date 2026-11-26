@@ -6335,8 +6335,16 @@ out:
 	return err;
 }
 
-int ntfs_attr_update_non_tail_mapping_pairs_transacted(
-		struct ntfs_log_handle *handle, struct ntfs_inode *ni)
+/*
+ * Rewrite the non-tail extents whose VCN range touches
+ * [@range_start, @range_end). A runlist change limited to that range only
+ * merges or splits runs at its edges, so extents ending before
+ * @range_start - 1 or starting after @range_end encode to the same mapping
+ * pairs and are skipped.
+ */
+static int ntfs_attr_update_non_tail_mapping_pairs_range_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni,
+		s64 range_start, s64 range_end)
 {
 	struct ntfs_attr_search_ctx *ctx = NULL;
 	struct ntfs_inode *base_ni;
@@ -6479,6 +6487,8 @@ restart:
 			continue;
 		/* The tail updater handles the extent overlapping the new end. */
 		if (highest_vcn + 1 >= end_vcn)
+			continue;
+		if (highest_vcn + 1 < range_start || lowest_vcn > range_end)
 			continue;
 
 		used = le32_to_cpu(mrec->bytes_in_use);
@@ -6624,6 +6634,13 @@ out:
 	kfree(old_pairs);
 	kfree(new_pairs);
 	return err;
+}
+
+int ntfs_attr_update_non_tail_mapping_pairs_transacted(
+		struct ntfs_log_handle *handle, struct ntfs_inode *ni)
+{
+	return ntfs_attr_update_non_tail_mapping_pairs_range_transacted(handle,
+			ni, 0, S64_MAX);
 }
 
 static int ntfs_attr_sync_sparse_flag_transacted(
@@ -11095,8 +11112,8 @@ int ntfs_attr_map_cluster_transacted(struct ntfs_log_handle *handle,
 	/* The tail updater only rewrites the last extent. A filled hole may be earlier. */
 	if (!err) {
 		mapping_stage = "non-tail mapping update";
-		err = ntfs_attr_update_non_tail_mapping_pairs_transacted(handle,
-				ni);
+		err = ntfs_attr_update_non_tail_mapping_pairs_range_transacted(
+				handle, ni, vcn, vcn + clu_count);
 	}
 	if (err) {
 		if (err != -ENOSPC || skip_holes)
